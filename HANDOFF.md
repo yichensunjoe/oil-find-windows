@@ -6,7 +6,9 @@
 
 - **Go 版保留**：`main` 分支完整保留 Go 实现，标签 `v0.1-go`；回退 `git checkout main`。
 - **Rust 版已跑通**：`rust` 分支（6 个提交）删除 `windows/`（Go），新增 `rust/` cargo workspace：`oilfind-core`（扫描/索引/查询/缓存）、`oilfind-win`（Win32 UI）、`oilfind-cli`。`Sources/`（macOS Swift）保留，仅本机验收。
-- **CI 全绿**（run 40069938323，Windows x64）：fmt → clippy `-D warnings` → test（60 项）→ 打包 → PE 校验（GUI 子系统 + asInvoker + Common-Controls v6 + PerMonitorV2）→ 上传产物（1.8MB）。
+- **CI 三平台全绿**（run 40074469573）：ubuntu 上 fmt/clippy/test，windows-latest 上打包 + PE 校验 + 产物，macos-latest 上构建打包 `Oil Find Rust.app`。
+- **性能优化（实测，$HOME + /Applications，1,506,961 条）**：扫描 2m13s → **25s**；JSON 缓存 305MB → 二进制 65MB；加载 1.5s → 0.72s；查询「报告」命中 149 条。实现：rayon 并行遍历子目录、二进制缓存（magic OILF1 + bincode，仍能读旧 JSON）。
+- **未解决**：常驻内存仍约 900MB（Entry 每条存 path/name/lower_path/pinyin 四个字符串），是下一个优化点。
 - **本地已验证**：`cargo test --workspace` 60 项通过；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、拼音 xmwd/hyjy、空引号报错）。
 - **与 Go 版的有意差异**：缓存仍是 JSON（可读 Go 版缓存），文件改名 `index.json`；`dm:` 改用**本地时区**（Go 版是 UTC，凌晨会差一天）；`appdata` 规则真正生效（Go 版实际未命中）；新增 `chrono` 依赖处理时区。
 - **未验证**：Windows 真机 UI 交互、DPI/多显示器、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。

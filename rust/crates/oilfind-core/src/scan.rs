@@ -16,6 +16,11 @@ pub const MAX_ENTRIES: usize = 2_000_000;
 /// Hard ceiling on the number of roots a single index may cover.
 pub const MAX_ROOTS: usize = 64;
 
+/// How many entries a worker accumulates before handing them to the shared
+/// collector. Batching keeps the per-worker copy small without locking per
+/// entry.
+const FLUSH_BATCH: usize = 4096;
+
 /// Minimum interval between progress callbacks, so a large scan does not flood
 /// the UI thread with events.
 const PROGRESS_INTERVAL_MS: u64 = 150;
@@ -69,8 +74,9 @@ const SYSTEM_ROOT_DIRS: &[&str] = &[
 /// read serially; every subdirectory found there is indexed immediately and put
 /// on a shared queue, and the rayon pool drains that queue one directory at a
 /// time. Splitting per directory matters because real trees are extremely
-/// unbalanced — on the reference machine one branch holds 43% of all entries,
-/// so a per-subtree split leaves most cores idle while that branch is walked.
+/// unbalanced: on the machine this was tuned for, a single branch of `$HOME`
+/// held 43% of all entries, so a per-subtree split left most cores idle while
+/// that branch was walked.
 ///
 /// Each directory is still read serially, so the pruning rules (a link or a
 /// skipped directory is never descended into, a package bundle is indexed but
@@ -98,8 +104,7 @@ pub fn scan(
         let mut pending: Vec<PathBuf> = Vec::new();
         // The root itself is not an entry, but everything below it is.
         read_directory(&shared, root, &mut entries, &mut pending)?;
-        let chunks = drain(&shared, pending)?;
-        entries.extend(chunks.into_iter().flatten());
+        drain(&shared, pending, &mut entries)?;
         check_stop(&shared)?;
     }
 
@@ -170,10 +175,10 @@ fn read_directory<F: Fn(Progress) + Sync>(
                 continue;
             }
             push_entry(shared, entries, &path, &metadata)?;
+            // A package bundle is indexed but never opened: a single .app can
+            // hold hundreds of thousands of files, and none of them is
+            // something a user searches for.
             if !is_package_dir(&path) {
-                // Index the bundle itself (so Xcode.app is findable) but never
-                // walk its internals: a single .app can hold hundreds of
-                // thousands of files.
                 pending.push(path);
             }
             continue;
@@ -187,24 +192,31 @@ fn read_directory<F: Fn(Progress) + Sync>(
     Ok(())
 }
 
-/// Drains the queue of pending directories on the rayon pool.
+/// Drains the queue of pending directories on the rayon pool, appending the
+/// entries it finds to `collected`.
 ///
 /// `active` counts the workers that currently hold a directory. A worker only
 /// leaves when the queue is empty *and* nobody is still reading a directory,
 /// which is what guarantees that the queue is not abandoned while a sibling is
 /// still producing work.
+///
+/// Workers hand their entries to the collector in batches instead of keeping a
+/// private vector for the whole scan: with a million entries a per-worker copy
+/// would double the peak memory of the scan.
 fn drain<F: Fn(Progress) + Sync>(
     shared: &Shared<'_, F>,
     pending: Vec<PathBuf>,
-) -> Result<Vec<Vec<Entry>>, Error> {
+    collected: &mut Vec<Entry>,
+) -> Result<(), Error> {
     let queue = Mutex::new(pending);
     let active = AtomicUsize::new(0);
     let workers = rayon::current_num_threads().max(1);
+    let sink = Mutex::new(std::mem::take(collected));
 
-    (0..workers)
+    let result = (0..workers)
         .into_par_iter()
-        .map(|_| -> Result<Vec<Entry>, Error> {
-            let mut entries: Vec<Entry> = Vec::new();
+        .try_for_each(|_| -> Result<(), Error> {
+            let mut entries: Vec<Entry> = Vec::with_capacity(FLUSH_BATCH);
             let mut next: Vec<PathBuf> = Vec::new();
             loop {
                 let directory = {
@@ -235,12 +247,25 @@ fn drain<F: Fn(Progress) + Sync>(
                         .unwrap_or_else(PoisonError::into_inner)
                         .append(&mut next);
                 }
+                if entries.len() >= FLUSH_BATCH {
+                    sink.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .append(&mut entries);
+                }
                 active.fetch_sub(1, Ordering::SeqCst);
                 result?;
             }
-            Ok(entries)
-        })
-        .collect()
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .append(&mut entries);
+            Ok(())
+        });
+
+    // The index is all-or-nothing, so a failed drain discards everything.
+    if result.is_ok() {
+        *collected = sink.into_inner().unwrap_or_else(PoisonError::into_inner);
+    }
+    result
 }
 
 /// Shared, thread-safe state of one scan.

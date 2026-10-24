@@ -31,6 +31,7 @@ use crate::platform;
 use crate::scan::{MAX_ENTRIES, MAX_ROOTS};
 use crate::time;
 use bincode::Options;
+use rayon::prelude::*;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
@@ -284,22 +285,33 @@ impl BinaryCache {
         for root in &self.roots {
             validate_root(root).map_err(|_| Error::CacheCorrupt("索引目录损坏".to_string()))?;
         }
-        let mut entries: Vec<Entry> = Vec::with_capacity(self.entries.len());
-        for stored in self.entries {
-            let directory = self
-                .directories
-                .get(stored.directory as usize)
-                .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
-            let entry = Entry::new(
-                directory.join(&stored.name),
-                stored.name,
-                stored.size,
-                stored.modified,
-                stored.is_dir,
-            );
-            validate_entry(&entry).map_err(|_| Error::CacheCorrupt("索引条目损坏".to_string()))?;
-            entries.push(entry);
-        }
+        // Rebuilding the derived search fields (lowercase + pinyin) costs more
+        // than decoding, and every entry is independent, so it runs on all
+        // cores. The results are written into a pre-sized vector in place:
+        // collecting into a fresh one would hold two copies of every entry at
+        // once, which is a few hundred megabytes on a large index.
+        let directories = self.directories;
+        let mut entries: Vec<Entry> =
+            vec![Entry::new(PathBuf::new(), String::new(), 0, 0, false); self.entries.len()];
+        entries
+            .par_iter_mut()
+            .zip(self.entries.into_par_iter())
+            .try_for_each(|(slot, stored)| -> Result<(), Error> {
+                let directory = directories
+                    .get(stored.directory as usize)
+                    .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
+                let entry = Entry::new(
+                    directory.join(&stored.name),
+                    stored.name,
+                    stored.size,
+                    stored.modified,
+                    stored.is_dir,
+                );
+                validate_entry(&entry)
+                    .map_err(|_| Error::CacheCorrupt("索引条目损坏".to_string()))?;
+                *slot = entry;
+                Ok(())
+            })?;
         Ok(Index {
             entries,
             roots: self.roots,
