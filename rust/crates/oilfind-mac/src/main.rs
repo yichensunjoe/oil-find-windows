@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const KINDS: [(&str, &str); 8] = [
     ("全部类型", ""),
@@ -59,7 +59,6 @@ struct App {
     cancel: Arc<AtomicBool>,
     rx: Option<Receiver<ScanMsg>>,
     progress: Progress,
-    last_edit: Option<Instant>,
     dirty: bool,
     focused_once: bool,
     config_path: Option<PathBuf>,
@@ -88,7 +87,6 @@ impl App {
                 skipped: 0,
                 current: PathBuf::new(),
             },
-            last_edit: None,
             dirty: false,
             focused_once: false,
             config_path,
