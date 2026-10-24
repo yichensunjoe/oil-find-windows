@@ -75,6 +75,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $ProjectDir "LICENSE") -Destination (Join-Path $OutputDir "LICENSE") -Force
     Copy-Item -LiteralPath (Join-Path $RustDir "THIRD_PARTY_NOTICES.txt") -Destination (Join-Path $OutputDir "THIRD_PARTY_NOTICES.txt") -Force
     Copy-Item -LiteralPath (Join-Path $RustDir "USAGE.txt") -Destination (Join-Path $OutputDir "USAGE.txt") -Force
+    Copy-Item -LiteralPath (Join-Path $RustDir "LICENSES") -Destination (Join-Path $OutputDir "LICENSES") -Recurse -Force
 
     Write-Host "Local Windows build completed: $OutputDir"
     Write-Host "No installation, publication, or runtime dependency download was performed."

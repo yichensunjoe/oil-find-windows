@@ -1,4 +1,4 @@
-Oil Find for Windows · 预览版 v0.1
+Oil Find for Windows · 预览版 v0.1（Rust 实现）
 
 适用范围
 Windows 10/11 64 位电脑上的本机文件名搜索。
@@ -7,7 +7,7 @@ Windows 10/11 64 位电脑上的本机文件名搜索。
 
 首次使用
 1. 将 ZIP 完整解压到普通用户可写的文件夹。
-2. 双击 OilFind.exe，无需安装 Python、Node、Go 或管理员权限。
+2. 双击 OilFind.exe，无需安装任何运行时或管理员权限。
 3. 添加你允许索引的本机目录，再点击“开始索引”。默认没有选择任何扫描范围，不会自动扫描全盘。
 4. 完成后在搜索框输入文件名、中文或拼音。双击结果打开；也可定位文件夹或复制路径。
 5. 新文件/重命名/删除通过索引同步反映；首版采用定期目录快照而不是 NTFS USN 日志即时索引。可暂停，退出后停止。
@@ -48,7 +48,7 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
 下载渠道与是否签名由分发者决定；不要为此关闭系统防护或绕过安全策略。
 
 当前验收范围
-已在 macOS 上执行跨平台引擎测试并交叉编译，Windows 原生测试在 GitHub Actions 的 windows-latest 上执行通过；
+核心引擎测试在本地与 GitHub Actions 的 windows-latest 上执行通过，Windows 产物由 CI 构建并做 PE/manifest 校验；
 界面交互、目录选择、DPI/多显示器、权限拒绝、取消/重启仍需在真机上逐项确认。
 如程序无法启动或索引异常，请保留错误文本、Windows 版本、目录类型和截图（不要附敏感文件正文）。
 
@@ -56,7 +56,7 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
 OilFind.exe              原生桌面客户端
 oilfind-cli.exe         诊断 CLI（默认只查缓存；扫描必须显式 -scan -root）
 LICENSE                 上游 MIT 许可
-THIRD_PARTY_NOTICES.txt  开源拼音及 Go 运行时许可
+THIRD_PARTY_NOTICES.txt  第三方 crate 许可证清单
 USAGE.txt               本说明
 
 CLI 示例（仅对显式授权的目录操作）
@@ -64,6 +64,6 @@ oilfind-cli.exe -scan -root "D:\Work" -query "ext:pdf" -limit 100
 oilfind-cli.exe -query "baogao"
 
 源码位置
-项目 windows/ 子目录；macOS 源码保留在 Sources/。
+Windows 实现在 rust/（cargo workspace：oilfind-core / oilfind-win / oilfind-cli）；macOS 源码保留在 Sources/。
 Windows 版重新实现了本地遍历/搜索与 Win32 界面，沿用上游公开功能和语法设计，不是把 Swift/AppKit 直接编译成 Windows。
-开发者构建需要 Go 1.24+ 和 Python 3（仅用于生成嵌入 manifest），运行端不需要。
+开发者构建需要 Rust 1.92（rust/rust-toolchain.toml 已固定），运行端不需要。

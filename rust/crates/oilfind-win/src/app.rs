@@ -1291,7 +1291,7 @@ impl App {
                         return;
                     }
                 }
-                let count = success.index.entries.len();
+                let count = success.index.len();
                 self.index = Some(Arc::new(success.index));
                 self.last_update = Some(success.updated);
                 self.storage_notice.clear();
@@ -1321,7 +1321,7 @@ impl App {
                 }
                 match outcome {
                     Ok((index, updated)) => {
-                        let count = index.entries.len();
+                        let count = index.len();
                         self.index = Some(Arc::new(index));
                         self.last_update = Some(updated);
                         self.last_notice = format!(
@@ -1500,7 +1500,7 @@ impl App {
         if self.cache_path.is_none() {
             mode = format!("仅内存 · 不持久化 · {mode}");
         }
-        let count = self.index.as_ref().map_or(0, |index| index.entries.len());
+        let count = self.index.as_ref().map_or(0, |index| index.len());
         let updated = match self.last_update {
             Some(updated) => format!(" · 快照 {}", system_time_label(updated)),
             None => String::new(),

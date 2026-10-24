@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{search_fixture, sorted_expected, TempDir};
+use common::{json_escape, search_fixture, sorted_expected, TempDir};
 use oilfind_core::{Entry, Error, Index, MAX_CACHE_BYTES};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,7 +109,7 @@ fn cache_loads_a_document_written_by_the_go_implementation() {
     let document = format!(
         r#"{{"version":1,"roots":["{root}"],"builtAt":"2023-11-15T06:13:20.123456789+08:00",
 "entries":[{{"path":"{root}/会议纪要.docx","name":"会议纪要.docx","size":7,"modified":200,"isDir":false}}]}}"#,
-        root = dir.path().to_string_lossy()
+        root = json_escape(&dir.path().to_string_lossy())
     );
     fs::write(&path, document).expect("write cache");
 
@@ -127,7 +127,7 @@ fn cache_accepts_a_numeric_timestamp_and_unknown_fields() {
     let document = format!(
         r#"{{"version":1,"roots":["{root}"],"builtAt":42,"future":"ignored",
 "entries":[{{"path":"{root}/a.txt","name":"a.txt","size":1,"modified":0,"isDir":false,"extra":true}}]}}"#,
-        root = dir.path().to_string_lossy()
+        root = json_escape(&dir.path().to_string_lossy())
     );
     fs::write(&path, document).expect("write cache");
     let loaded = Index::load(&path).expect("load");
@@ -142,7 +142,7 @@ fn cache_entries_default_missing_optional_fields() {
     fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
     let document = format!(
         r#"{{"version":1,"entries":[{{"path":"{root}/a.txt","name":"a.txt"}}]}}"#,
-        root = dir.path().to_string_lossy()
+        root = json_escape(&dir.path().to_string_lossy())
     );
     fs::write(&path, document).expect("write cache");
     let loaded = Index::load(&path).expect("load");
@@ -266,7 +266,7 @@ fn cache_rejects_corruption_and_incompatible_versions() {
     sample_index(dir.path()).save(&valid_path).expect("save");
     let valid = fs::read(&valid_path).expect("read valid cache");
 
-    let root = dir.path().to_string_lossy().to_string();
+    let root = json_escape(&dir.path().to_string_lossy()).to_string();
     let too_many_roots = format!(
         "[{}]",
         (0..65)

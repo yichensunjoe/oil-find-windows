@@ -20,7 +20,7 @@ const DRIVE_REMOTE: u32 = 4;
 
 /// 用户配置目录：`%LOCALAPPDATA%\OilFind`。
 ///
-/// 返回 `(config.json, index.bin, 启动提示)`；前两项为 `None` 表示降级为仅内存
+/// 返回 `(config.json, index.json, 启动提示)`；前两项为 `None` 表示降级为仅内存
 /// 模式，此时第三个元素带有面向用户的原因说明。
 pub fn config_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
     // 用 LOCALAPPDATA 而不是漫游配置目录：几百 MB 的索引绝不能被漫游配置
@@ -54,7 +54,7 @@ pub fn config_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
     }
     (
         Some(app_dir.join("config.json")),
-        Some(app_dir.join("index.bin")),
+        Some(app_dir.join("index.json")),
         None,
     )
 }

@@ -54,6 +54,8 @@ cp "$RELEASE_DIR/oilfind-cli.exe" "$OUTPUT_DIR/oilfind-cli.exe"
 cp "$PROJECT_DIR/LICENSE" "$OUTPUT_DIR/LICENSE"
 cp "$RUST_DIR/THIRD_PARTY_NOTICES.txt" "$OUTPUT_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$RUST_DIR/USAGE.txt" "$OUTPUT_DIR/USAGE.txt"
+rm -rf "$OUTPUT_DIR/LICENSES"
+cp -R "$RUST_DIR/LICENSES" "$OUTPUT_DIR/LICENSES"
 
 PYTHON="${PYTHON_BIN:-python3}"
 if ! command -v "$PYTHON" >/dev/null 2>&1; then

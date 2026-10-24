@@ -172,3 +172,11 @@ pub fn sorted_expected(expected: &[&str]) -> Vec<String> {
     expected.sort();
     expected
 }
+
+/// Escapes a path for embedding in a hand-written JSON document.
+///
+/// Windows fixtures contain backslashes, which are invalid JSON escapes unless
+/// doubled; the Unix-only tests never hit this, so it must be explicit.
+pub fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}

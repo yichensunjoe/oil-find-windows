@@ -170,7 +170,7 @@ fn print_usage() {
 
   -scan            为 -root 指定的目录建立元数据索引（必须显式开启）
   -root <目录>     要索引的本机目录，可重复
-  -cache <文件>    索引缓存文件（默认：应用配置目录下的 index.bin）
+  -cache <文件>    索引缓存文件（默认：应用配置目录下的 index.json）
   -query <文本>    在索引中搜索；可与 -scan 同时使用
   -limit <n>       最多返回多少条结果（默认 100）
   -h, --help       显示本帮助
@@ -180,20 +180,20 @@ fn print_usage() {
     let _ = write!(std::io::stdout(), "{text}");
 }
 
-/// 默认缓存路径：Windows 用 `%LOCALAPPDATA%\OilFind\index.bin`，
-/// 其它平台用 `$XDG_CACHE_HOME` 或 `~/.cache/oilfind/index.bin`。
+/// 默认缓存路径：Windows 用 `%LOCALAPPDATA%\OilFind\index.json`，
+/// 其它平台用 `$XDG_CACHE_HOME` 或 `~/.cache/oilfind/index.json`。
 fn default_cache_path() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
         if let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-            return Ok(PathBuf::from(base).join("OilFind").join("index.bin"));
+            return Ok(PathBuf::from(base).join("OilFind").join("index.json"));
         }
         Err("无法读取 LOCALAPPDATA；请用 -cache 显式指定缓存文件".to_string())
     }
     #[cfg(not(windows))]
     {
         if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-            return Ok(PathBuf::from(base).join("oilfind").join("index.bin"));
+            return Ok(PathBuf::from(base).join("oilfind").join("index.json"));
         }
         let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
@@ -201,7 +201,7 @@ fn default_cache_path() -> Result<PathBuf, String> {
         Ok(PathBuf::from(home)
             .join(".cache")
             .join("oilfind")
-            .join("index.bin"))
+            .join("index.json"))
     }
 }
 
@@ -317,7 +317,7 @@ mod tests {
                 "-limit",
                 "7",
                 "-cache",
-                "/tmp/index.bin",
+                "/tmp/index.json",
             ]
             .into_iter()
             .map(str::to_string),
@@ -330,6 +330,6 @@ mod tests {
         );
         assert_eq!(options.query, "报表");
         assert_eq!(options.limit, 7);
-        assert_eq!(options.cache, PathBuf::from("/tmp/index.bin"));
+        assert_eq!(options.cache, PathBuf::from("/tmp/index.json"));
     }
 }
