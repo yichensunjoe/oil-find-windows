@@ -1,13 +1,13 @@
 # Oil Find for Windows · 本机文件搜索
 
-> 私有仓库。CI（只跑 Windows）在 GitHub Actions 中运行，需登录仓库后查看。
-
 Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立本地元数据索引，按中文、拼音或语法筛选即时查找，双击打开、定位或复制路径。
 
 - **纯离线**：无网络请求、无遥测、无账号、无在线更新。
 - **只读**：只读取文件名、路径、大小、修改时间，不读文件正文，不删除/移动/重命名文件。
-- **不含闭源模块**：仅使用上游公开的 MIT 代码与自研 Windows 实现，不包含任何 Pro 或私有二进制。
+- **不含闭源模块**：仅使用上游公开的 MIT 代码与自研实现，不包含任何 Pro 或私有二进制。
 - **无管理员权限要求**：以当前用户身份运行（manifest `asInvoker`）。
+
+> 实现语言：**Rust**（1.92，原生 Win32，无 GC）。仓库的 `main` 分支保留同功能的 Go 实现（标签 `v0.1-go`），用于对照与回退。
 
 ## 功能
 
@@ -28,52 +28,50 @@ Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立�
 
 ## 构建
 
-需要 Go 1.24+ 与 Python 3（仅用于生成并校验内嵌 manifest）。
+需要 Rust 1.92（`rust/rust-toolchain.toml` 已固定）。
 
 ```powershell
-# Windows 原生构建（amd64）
-powershell -ExecutionPolicy Bypass -File windows\scripts\build.ps1 -GoBin C:\Go\bin\go.exe
+# Windows 原生构建（amd64），含测试、打包与 PE 校验
+powershell -ExecutionPolicy Bypass -File rust\scripts\build.ps1
 ```
 
 ```sh
-# 在 macOS/Linux 上交叉编译；ARCH 可选 amd64（默认）或 arm64
-cd windows
-bash scripts/build.sh /path/to/go
-ARCH=arm64 bash scripts/build.sh /path/to/go
+# macOS/Linux 上交叉编译（需 rustup target add x86_64-pc-windows-msvc）
+cd rust
+bash scripts/build.sh
 ```
 
-产物在 `outputs/windows-<arch>/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
+产物在 `outputs/windows-amd64/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
 
 ## 测试与校验
 
 ```sh
-cd windows
-go test ./...                                   # 索引/搜索/缓存，仅临时样例
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/oilfind
-python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFind.exe --arch amd64
+cd rust
+cargo test --workspace                 # 核心引擎，仅临时样例
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo check -p oilfind-win --target x86_64-pc-windows-msvc   # Windows 分支类型检查（不链接）
 ```
 
-CI 只跑 Windows（`.github/workflows/ci.yml`）：`windows-latest` 上执行测试、打包、PE 校验并上传未签名产物；`heavy-cache-limit` 为手动触发的重负载检查。开发机不是 Windows 时，CI 是唯一能真实执行 Windows 原生测试的通道。
+CI 只跑 Windows（`.github/workflows/ci.yml`）：`windows-latest` 上执行 fmt/clippy/test、打包、PE 校验并上传未签名产物。macOS 客户端（`Sources/`，Swift）仍由本机验收，不在 CI 中运行。
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
-| `windows/internal/index` | 扫描、索引、查询、缓存 |
-| `windows/internal/ui` | Win32 原生界面（user32/comctl32/shell32） |
-| `windows/cmd/` | GUI 与 CLI 入口 |
-| `windows/scripts/` | 构建、manifest 生成、PE 校验 |
-| `windows/USAGE.txt` | 终端用户说明 |
-| `Sources/`、`Package.swift` | 上游 macOS 基线源码（保留，见下） |
+| `rust/crates/oilfind-core` | 扫描、索引、查询、缓存（平台无关） |
+| `rust/crates/oilfind-win` | Win32 原生界面 |
+| `rust/crates/oilfind-cli` | 命令行诊断入口 |
+| `rust/scripts/` | 构建、manifest 嵌入、PE 校验 |
+| `rust/USAGE.txt` | 终端用户说明 |
+| `Sources/`、`Package.swift` | macOS 基线源码（本机验收） |
 | `site/` | 上游官网参考代码（未启用、未部署） |
 
 ## 上游来源与许可
 
-Windows 客户端是基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 公开部分的产品边界与搜索语法重新实现的独立平台版本，不包含上游闭源 Pro 模块。
+Windows 客户端基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 公开部分的产品边界与搜索语法重新实现，不包含上游闭源 Pro 模块；macOS 源码作为公开基线保留，已固定为纯开源构建并禁用上游在线更新。
 
-仓库同时保留上游 macOS 源码（`Sources/`、`Package.swift`）作为公开基线，已固定为纯开源构建并禁用上游在线更新；它不是本项目的交付目标，构建方式见 `docs/ARCHITECTURE.md`。
-
-代码采用 MIT 许可证，见 `LICENSE`；第三方组件声明见 `windows/THIRD_PARTY_NOTICES.txt`。
+代码采用 MIT 许可证，见 `LICENSE`；第三方组件声明见 `rust/THIRD_PARTY_NOTICES.txt`。
 
 ## 已知限制
 

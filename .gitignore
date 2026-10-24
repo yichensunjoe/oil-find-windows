@@ -8,8 +8,10 @@ node_modules/
 .env*
 !.env.example
 outputs/
+rust/target/
 *.syso
 *.exe
+*.pdb
 .workbuddy-ai/
 .codex/
 *.sqlite

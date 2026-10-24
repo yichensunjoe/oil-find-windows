@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/oilfind-core", "crates/oilfind-cli", "crates/oilfind-win"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

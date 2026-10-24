@@ -13,7 +13,7 @@
 - 来源：`https://github.com/oil-oil/oil-find`，基线 `e63c7150ccbd401a1375c08215d1386b56dd9471`（1.7.1）。保留完整历史、MIT 许可证和原作者声明。
 - 两个平台入口并存，共享同一公开功能边界：
   - macOS：`Sources/` + `Package.swift`，Swift 5 语言模式 / SwiftPM 5.10+、AppKit、SwiftUI、C；Apple 芯片，macOS 14+；无第三方 Swift 包。
-  - Windows：`windows/`，Go 1.24+、原生 Win32（user32/comctl32/shell32）；唯一第三方库 `github.com/mozillazg/go-pinyin`（MIT）。仅 Windows 10/11 x64。
+  - Windows：`rust/`，Rust 1.92（`rust/rust-toolchain.toml` 固定）+ `windows-sys` 原生 Win32；第三方 crate 见 `rust/Cargo.toml`（pinyin/serde/serde_json/regex/walkdir/rayon，均 MIT/Apache）。仅 Windows 10/11 x64。`main` 分支的 Go 实现打标签 `v0.1-go` 保留，仅作对照与回退，不再演进。
 - 永久只构建公开模块；不要恢复私有 target 自动检测，不导入 Pro，也不下载或分发上游含 Pro 的安装包。
 - `OILFIND_OFFLINE_BUILD` 固定用于 macOS 应用库；在线更新检查、下载安装、更新官网跳转均禁用，由用户手动获取新版本。Windows 版不实现任何在线更新/遥测。
 - 保留中性 `ApplicationExtension`，不要把它误当 Pro 实现。上游官网 `site/` 仅作来源参考，不安装/部署其支付、授权或分析服务。
@@ -42,20 +42,23 @@ scripts/package.sh            # archives this fork only; no upstream publication
 
 构建签名可访问钥匙串，不能不经确认生成证书、安装应用或运行全盘扫描。官网不是应用构建依赖，无需安装 pnpm / Stripe 等依赖。
 
-Windows（在 `windows/` 下；缓存必须用项目内绝对路径，避免污染用户环境）：
+Windows（在 `rust/` 下）：
 
 ```sh
-P=$(cd .. && pwd)
-GOCACHE=$P/outputs/go-cache GOPATH=$P/outputs/go-path GOMODCACHE=$P/outputs/go-mod-cache \
-  go test ./...
-bash scripts/build.sh /path/to/go            # 交叉编译到 outputs/windows-amd64
-python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFind.exe --arch amd64
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo check -p oilfind-win --target x86_64-pc-windows-msvc   # 只做类型检查，不链接
 ```
 
-- Windows 上 `t.TempDir()` 默认落在 `%LOCALAPPDATA%\Temp`，会被引擎的 AppData 安全排除拒绝；构建脚本在跑测试时把 `TEMP/TMP` 指向 `outputs/test-tmp`，不要为此放宽引擎排除。
-- manifest 由 `scripts/make-resource.py` 生成 `.syso` 后嵌入（`.syso` 已忽略），不要交付外置 manifest 冒充已嵌入。
-- 不启动 GUI 做“验证”（开发机为 macOS 时无 Windows 运行环境）；Windows 真机 UI/DPI/权限/SmartScreen 属人工验收项，未验收不得声称可交付。
-- `TestLoadRejectsStreamOverEntryLimit` 默认跳过（需 `OILFIND_HEAVY_TESTS=1`，约 950MB RSS）；它是唯一覆盖“流式解码在 200 万条处截断”的用例，改动 Load 限额逻辑时应手动跑一次。
+```powershell
+powershell -ExecutionPolicy Bypass -File rust\scripts\build.ps1   # Windows 上：测试→打包→PE 校验
+```
+
+- 开发机是 macOS 时无法链接 Windows 产物；用 `--target x86_64-pc-windows-msvc` 做类型检查，真正的构建与 PE 校验交给 CI 或 Windows 机器。
+- manifest 必须真的嵌入 exe（`rust/scripts/verify-pe.py` 会检查 GUI 子系统、`asInvoker`、Common-Controls v6、PerMonitorV2）；不要交付外置 manifest 冒充已嵌入。
+- 不启动 GUI 做“验证”；Windows 真机 UI/DPI/权限/SmartScreen 属人工验收项，未验收不得声称可交付。
+- 测试只允许在临时目录建样例，绝不访问真实用户目录；Windows 上临时目录若落在 AppData，引擎会按安全规则拒绝，构建脚本需把 TEMP/TMP 指到项目内目录，不要为此放宽排除规则。
 
 ## 复用与踩坑日志（双写）
 

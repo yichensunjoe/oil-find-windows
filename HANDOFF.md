@@ -2,7 +2,16 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-24 11:55）
+## 当前状态（2026-10-24 14:00，分支 `rust`：Rust 重写进行中）
+
+- **进度保留**：Go 实现完整留在 `main`，并打标签 `v0.1-go`（提交 `bbb4e43` 之后）。回退方式：`git checkout main`。
+- **重写分支**：`rust`。已删除 `windows/`（Go），新增 `rust/` Cargo workspace：`crates/oilfind-core`（扫描/索引/查询/缓存）、`crates/oilfind-win`（Win32 UI）、`crates/oilfind-cli`；`Sources/`（macOS Swift）保留，仅本机验收。
+- **工具链**：Rust 1.92 已固定于 `rust/rust-toolchain.toml`；本地已装 `x86_64-pc-windows-msvc` 目标用于类型检查（不链接）。
+- **CI**：改为 Windows-only（fmt → clippy → test → 打包 → PE 校验 → 上传产物）；仓库已重新设为 **public** 以使用免费 Windows runner。
+- 状态：核心引擎与 Win32 界面由两个 agent 并行实现中；尚未集成、未跑通 CI、未产出 Rust 二进制。
+- 下一步：合并两份实现 → `cargo test/clippy/fmt` → `cargo check --target x86_64-pc-windows-msvc` → 推送分支 → CI 绿 → 补文档与实测数据。
+
+## 历史状态（2026-10-24 11:55，Go 版，已冻结在 `main`）
 
 - 已完成（macOS 基线）：完整克隆 `oil-oil/oil-find` 1.7.1（`e63c7150`），保留历史与 MIT；固定纯公开 target，编译期禁用上游在线更新，离线打包不依赖 Pro/官网。
 - 已完成（Windows 首版）：产品名 Oil Find for Windows，`windows/` 独立客户端——Go 1.24+、原生 Win32、无 WebView/网络调用；显式目录范围 + 元数据索引 + 中文/拼音搜索 + 语法筛选 + 打开/定位/复制；缓存/配置在 `%LOCALAPPDATA%\OilFind`。
