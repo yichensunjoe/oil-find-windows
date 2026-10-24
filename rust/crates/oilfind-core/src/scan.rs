@@ -224,6 +224,17 @@ pub(crate) fn should_skip_dir(path: &Path) -> bool {
 }
 
 /// Validates, cleans and de-duplicates the requested roots.
+/// Removes the Windows verbatim prefix so `\\?\C:\dir` is treated as `C:\dir`.
+///
+/// `\\?\UNC\server\share` becomes `\\server\share` on purpose, so the caller
+/// still rejects it as a network path.
+fn strip_verbatim_prefix(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    text.strip_prefix(r"\\?\").map(str::to_string)
+}
+
 fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     if roots.is_empty() {
         return Err(Error::EmptyRoots);
@@ -234,7 +245,13 @@ fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
 
     let mut normalized: Vec<PathBuf> = Vec::with_capacity(roots.len());
     for root in roots {
-        let text = root.to_string_lossy();
+        let original = root.to_string_lossy().into_owned();
+        if original.trim().is_empty() {
+            return Err(Error::EmptyRoot);
+        }
+        // `fs::canonicalize` returns a verbatim path on Windows ("\\?\C:\..."),
+        // which is still a local drive; unwrap it before the lexical checks.
+        let text = strip_verbatim_prefix(&original).unwrap_or(original);
         if text.trim().is_empty() {
             return Err(Error::EmptyRoot);
         }
@@ -243,10 +260,11 @@ fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
         if text.starts_with(r"\\") || text.starts_with("//") {
             return Err(Error::NetworkRoot);
         }
+        let root = PathBuf::from(&text);
         if !root.is_absolute() {
             return Err(Error::RelativeRoot);
         }
-        let cleaned = platform::clean_path(root);
+        let cleaned = platform::clean_path(&root);
         platform::validate_local_volume(&cleaned)?;
         let metadata = fs::symlink_metadata(&cleaned).map_err(Error::RootUnreadable)?;
         if !metadata.is_dir() {
