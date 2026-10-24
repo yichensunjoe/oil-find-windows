@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/oilfind-core", "crates/oilfind-cli", "crates/oilfind-win"]
+members = ["crates/oilfind-core", "crates/oilfind-cli", "crates/oilfind-win", "crates/oilfind-mac"]
 
 [workspace.package]
 version = "0.1.0"
