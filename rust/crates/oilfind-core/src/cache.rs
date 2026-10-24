@@ -53,7 +53,7 @@ const CACHE_VERSION: u32 = 1;
 const MAGIC: [u8; 8] = *b"OILF1\0\0\0";
 
 const MAX_PATH_LEN: usize = 32_767;
-const MAX_NAME_LEN: usize = 1_024;
+use crate::entry::MAX_NAME_LEN;
 
 /// Buffered I/O size for the cache file: one megabyte keeps the encoder from
 /// issuing a syscall per varint without holding a large copy of the index.
@@ -229,7 +229,7 @@ impl Serialize for EntriesRef<'_> {
             let directory = self.index.get(parent).copied().unwrap_or_default();
             seq.serialize_element(&BinaryEntry {
                 directory,
-                name: &entry.name,
+                name: entry.name(),
                 size: entry.size,
                 modified: entry.modified,
                 is_dir: entry.is_dir,
@@ -452,11 +452,11 @@ impl Serialize for Rfc3339 {
 fn validate_entry(entry: &Entry) -> Result<(), Error> {
     let path = entry.path.to_string_lossy();
     let invalid = path.is_empty()
-        || entry.name.is_empty()
+        || entry.name().is_empty()
         || path.len() > MAX_PATH_LEN
-        || entry.name.len() > MAX_NAME_LEN
+        || entry.name().len() > MAX_NAME_LEN
         || path.contains('\0')
-        || entry.name.contains('\0');
+        || entry.name().contains('\0');
     if invalid {
         return Err(Error::InvalidEntry);
     }

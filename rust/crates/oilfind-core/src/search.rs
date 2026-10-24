@@ -329,7 +329,7 @@ fn term_predicate(token: &str, now: i64) -> Result<(Predicate, String), Error> {
                 let regex =
                     Regex::new(&pattern).map_err(|err| Error::InvalidRegex(err.to_string()))?;
                 return Ok((
-                    Box::new(move |entry: &Entry| regex.is_match(&entry.name)),
+                    Box::new(move |entry: &Entry| regex.is_match(entry.name())),
                     String::new(),
                 ));
             }
@@ -347,7 +347,7 @@ fn term_predicate(token: &str, now: i64) -> Result<(Predicate, String), Error> {
                 }
                 return Ok((
                     Box::new(move |entry: &Entry| {
-                        !entry.is_dir && extensions.iter().any(|x| extension_of(&entry.name) == *x)
+                        !entry.is_dir && extensions.iter().any(|x| extension_of(entry.name()) == *x)
                     }),
                     String::new(),
                 ));
@@ -360,7 +360,7 @@ fn term_predicate(token: &str, now: i64) -> Result<(Predicate, String), Error> {
                     .ok_or_else(|| Error::UnsupportedKind(value.to_string()))?;
                 return Ok((
                     Box::new(move |entry: &Entry| {
-                        !entry.is_dir && extensions.iter().any(|x| extension_of(&entry.name) == *x)
+                        !entry.is_dir && extensions.iter().any(|x| extension_of(entry.name()) == *x)
                     }),
                     String::new(),
                 ));

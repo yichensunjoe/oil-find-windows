@@ -426,7 +426,7 @@ impl App {
                 for position in range {
                     let entry = &self.rows[position];
                     let selected = self.selected == Some(position);
-                    let label = format!("{}\t{}", entry.name, entry.path.display());
+                    let label = format!("{}\t{}", entry.name(), entry.path.display());
                     let response = ui.selectable_label(selected, label);
                     if response.clicked() {
                         self.selected = Some(position);

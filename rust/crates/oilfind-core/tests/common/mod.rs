@@ -174,7 +174,10 @@ pub fn filtered_names(index: &Index, query: &str, kind: &str) -> Vec<String> {
 }
 
 pub fn sorted_names(entries: &[Entry]) -> Vec<String> {
-    let mut names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let mut names: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.name().to_owned())
+        .collect();
     names.sort();
     names
 }

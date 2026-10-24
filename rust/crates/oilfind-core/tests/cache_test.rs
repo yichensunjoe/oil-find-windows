@@ -46,13 +46,13 @@ fn cache_round_trip_rebuilds_search_metadata() {
     // Derived fields are rebuilt, so pinyin and filters still work.
     let (results, total) = loaded.search("HUIYI", None, 100).expect("search");
     assert_eq!(total, 1);
-    assert_eq!(results[0].name, "会议纪要.docx");
+    assert_eq!(results[0].name(), "会议纪要.docx");
     assert_eq!(loaded.search("hyjy", None, 100).expect("search").1, 1);
     let (results, total) = loaded
         .search("report !archive ext:pdf", None, 100)
         .expect("search");
     assert_eq!(total, 1);
-    assert_eq!(results[0].name, "Report Final.PDF");
+    assert_eq!(results[0].name(), "Report Final.PDF");
 
     // No temporary file may survive a successful save.
     let names: Vec<String> = fs::read_dir(path.parent().expect("parent"))
@@ -443,11 +443,11 @@ fn cache_rejects_corruption_and_incompatible_versions() {
                 .into_bytes(),
         ),
         (
+            // The stored name is derived from the path, so the NUL has to be in
+            // the path to be rejected.
             "nul-name",
-            format!(
-                r#"{{"version":1,"entries":[{{"path":"{root}/a.txt","name":"bad\u0000name"}}]}}"#
-            )
-            .into_bytes(),
+            format!(r#"{{"version":1,"entries":[{{"path":"{root}/bad\u0000name","name":"bad\u0000name"}}]}}"#)
+                .into_bytes(),
         ),
         (
             "entries-not-an-array",
@@ -538,15 +538,22 @@ fn cache_save_validates_entries_and_roots() {
     };
     assert!(empty_path.save(&path).is_err());
 
+    // The root directory has no file name, which is what an empty name means.
     let empty_name = Index {
-        entries: vec![Entry::new(dir.join("a.txt"), String::new(), 1, 0, false)],
+        entries: vec![Entry::new(PathBuf::from("/"), String::new(), 1, 0, false)],
         roots: Vec::new(),
         built_at: 0,
     };
     assert!(empty_name.save(&path).is_err());
 
     let long_name = Index {
-        entries: vec![Entry::new(dir.join("a.txt"), "n".repeat(1025), 1, 0, false)],
+        entries: vec![Entry::new(
+            dir.join(&"n".repeat(1025)),
+            String::new(),
+            1,
+            0,
+            false,
+        )],
         roots: Vec::new(),
         built_at: 0,
     };

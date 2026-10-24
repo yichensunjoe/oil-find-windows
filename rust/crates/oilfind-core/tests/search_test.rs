@@ -376,9 +376,9 @@ fn ranking_prefers_name_over_extension_and_pinyin() {
     // hit scores 30, so the extension-exact names always come first.
     let (results, total) = index.search("报告", None, 100).expect("search");
     assert_eq!(total, 3);
-    assert_eq!(results[0].name, "报告.txt");
-    assert_eq!(results[1].name, "报告.txt");
-    assert_eq!(results[2].name, "其他报告.txt");
+    assert_eq!(results[0].name(), "报告.txt");
+    assert_eq!(results[1].name(), "报告.txt");
+    assert_eq!(results[2].name(), "其他报告.txt");
     // Pinyin initials and full pinyin both reach the same entries.
     assert_eq!(names(&index, "bg").len(), 3);
     assert_eq!(names(&index, "qitabaogao"), vec!["其他报告.txt"]);
@@ -406,7 +406,7 @@ fn limit_caps_results_but_not_the_total() {
         assert_eq!(total, COUNT, "limit {limit}");
         assert_eq!(results.len(), expected, "limit {limit}");
         for (position, entry) in results.iter().enumerate() {
-            assert_eq!(entry.name, format!("record-{position:05}.txt"));
+            assert_eq!(entry.name(), format!("record-{position:05}.txt"));
         }
     }
     // The default and the ceiling both keep the total intact.
@@ -472,10 +472,7 @@ fn category_limit_and_validation() {
     assert_eq!(total, 2);
     assert_eq!(results.len(), 1);
     assert!(!results[0].is_dir);
-    assert!(matches!(
-        results[0].name.as_str(),
-        "photo.jpg" | "IMG_001.PNG"
-    ));
+    assert!(matches!(results[0].name(), "photo.jpg" | "IMG_001.PNG"));
 
     let (plain, plain_total) = index.search("report | photo", None, 100).expect("search");
     let (filtered, filtered_total) = index
@@ -544,17 +541,16 @@ fn path_filters_accept_backslashes() {
 }
 
 #[test]
-fn entries_without_prepared_metadata_still_match() {
-    // An entry that arrived through serde (not through `Index::load`) has no
-    // derived fields; the search path must prepare it on the fly.
+fn entries_from_serde_arrive_prepared() {
+    // Deserializing rebuilds the derived fields immediately, so an entry that
+    // did not come from `Index::load` still searches.
     let entry: Entry = serde_json::from_str(
         r#"{"path":"/x/会议纪要.docx","name":"会议纪要.docx","size":1,"modified":0,"isDir":false}"#,
     )
     .expect("deserialize entry");
-    assert!(
-        entry.lower_name().is_empty(),
-        "fixture must stay unprepared"
-    );
+    assert_eq!(entry.name(), "会议纪要.docx");
+    assert_eq!(entry.lower_name(), "会议纪要.docx");
+    assert_eq!(entry.full_pinyin(), "huiyijiyao.docx");
     let index = Index {
         entries: vec![entry],
         roots: vec![Path::new("/x").to_path_buf()],

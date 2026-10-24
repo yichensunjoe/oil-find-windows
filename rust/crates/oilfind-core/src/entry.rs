@@ -1,88 +1,169 @@
 //! The indexed unit of data: file system metadata plus search metadata.
 
 use pinyin::ToPinyin;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, Deserializer},
+    Deserialize, Serialize, Serializer,
+};
 use std::path::{Path, PathBuf};
+
+/// Longest file name accepted from a cache document.
+pub(crate) const MAX_NAME_LEN: usize = 1_024;
 
 /// One indexed file or directory.
 ///
-/// Only metadata is stored: file contents are never opened. The four
-/// pre-computed search fields are derived from `name`/`path` and are not part
-/// of the serialized form, so they are rebuilt whenever an index is loaded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Only metadata is stored: file contents are never opened. `name` and the
+/// lowercase forms are **derived** from `path` instead of being stored, and the
+/// pinyin forms only exist for names that actually contain Han text. A 1.5M
+/// entry index saves roughly 130 bytes per entry this way.
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub path: PathBuf,
-    pub name: String,
-    #[serde(default)]
     pub size: u64,
-    #[serde(default)]
     pub modified: i64,
-    #[serde(default)]
     pub is_dir: bool,
-    #[serde(skip)]
-    pub(crate) lower_name: String,
-    #[serde(skip)]
-    pub(crate) lower_path: String,
-    #[serde(skip)]
-    pub(crate) full_pinyin: String,
-    #[serde(skip)]
-    pub(crate) initials: String,
+    pub(crate) lower_path: Box<str>,
+    pub(crate) pinyin: Option<Box<Pinyin>>,
+}
+
+/// Pinyin forms of a name that contains Han text.
+#[derive(Debug, Clone)]
+pub(crate) struct Pinyin {
+    pub(crate) full: Box<str>,
+    pub(crate) initials: Box<str>,
+}
+
+/// Wire form of an entry. The persisted shape keeps `name` so caches written by
+/// the earlier implementation stay readable. Reading and writing use separate
+/// shapes because the reader cannot borrow from a stream.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EntryWire<'a> {
+    path: &'a str,
+    name: &'a str,
+    size: u64,
+    modified: i64,
+    is_dir: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EntryOwned {
+    path: String,
+    // Required: a document without a name is treated as corrupt, exactly like
+    // the previous implementation did.
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    modified: i64,
+    #[serde(default)]
+    is_dir: bool,
+}
+
+impl Serialize for Entry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = self.path.to_string_lossy();
+        EntryWire {
+            path: &text,
+            name: self.name(),
+            size: self.size,
+            modified: self.modified,
+            is_dir: self.is_dir,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Entry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = EntryOwned::deserialize(deserializer)?;
+        if wire.name.len() > MAX_NAME_LEN {
+            return Err(de::Error::custom("index entry name is too long"));
+        }
+        let mut entry = Entry {
+            path: PathBuf::from(wire.path),
+            size: wire.size,
+            modified: wire.modified,
+            is_dir: wire.is_dir,
+            lower_path: String::new().into_boxed_str(),
+            pinyin: None,
+        };
+        entry.prepare();
+        Ok(entry)
+    }
 }
 
 impl Entry {
     /// Builds an entry and immediately prepares its search metadata.
+    ///
+    /// `name` is accepted for source compatibility and ignored: the stored name
+    /// always comes from `path`, which is the single source of truth.
     pub fn new(path: PathBuf, name: String, size: u64, modified: i64, is_dir: bool) -> Self {
         let mut entry = Entry {
             path,
-            name,
             size,
             modified,
             is_dir,
-            lower_name: String::new(),
-            lower_path: String::new(),
-            full_pinyin: String::new(),
-            initials: String::new(),
+            lower_path: String::new().into_boxed_str(),
+            pinyin: None,
         };
+        let _ = name;
         entry.prepare();
         entry
     }
 
-    /// Lowercased name, used for case-insensitive matching and ranking.
-    pub fn lower_name(&self) -> &str {
-        &self.lower_name
+    /// File name, sliced out of `path` without another allocation.
+    pub fn name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
     }
 
-    /// Lowercased full path, used for deterministic ordering.
+    /// Lowercased name, used for case-insensitive matching and ranking.
+    ///
+    /// `lower_path` is the lowercased full path, so its last segment is exactly
+    /// the lowercased name: one slice, no allocation, no second string.
+    pub fn lower_name(&self) -> &str {
+        let path = &*self.lower_path;
+        match path.rfind(['/', '\\']) {
+            Some(index) => &path[index + 1..],
+            None => path,
+        }
+    }
+
+    /// Lowercased full path, used for matching and deterministic ordering.
     pub fn lower_path(&self) -> &str {
         &self.lower_path
     }
 
     /// Lowercased full pinyin of the name (empty when the name has no Han text).
     pub fn full_pinyin(&self) -> &str {
-        &self.full_pinyin
+        self.pinyin.as_ref().map(|p| &*p.full).unwrap_or_default()
     }
 
-    /// Lowercased pinyin initials of the name (empty when the name has no Han text).
+    /// Lowercased pinyin initials of the name (empty when there is no Han text).
     pub fn initials(&self) -> &str {
-        &self.initials
+        self.pinyin
+            .as_ref()
+            .map(|p| &*p.initials)
+            .unwrap_or_default()
     }
 
     /// Rebuilds the derived search metadata. Must run after deserialization.
     pub(crate) fn prepare(&mut self) {
-        self.lower_name = self.name.to_lowercase();
-        self.lower_path = self.path.to_string_lossy().to_lowercase();
-        self.full_pinyin.clear();
-        self.initials.clear();
-        if !self.name.chars().any(is_han) {
+        self.lower_path = self.path.to_string_lossy().to_lowercase().into_boxed_str();
+        self.pinyin = None;
+        if !self.name().chars().any(is_han) {
             return;
         }
         // `to_pinyin` yields one item per character; Han characters contribute
         // their pinyin and everything else contributes itself lowercased, so
         // that "报告2024" is found by both "baogao2024" and "bg2024".
-        let mut full = String::with_capacity(self.name.len());
-        let mut initials = String::with_capacity(self.name.len());
-        for ch in self.name.chars() {
+        let mut full = String::with_capacity(self.name().len());
+        let mut initials = String::with_capacity(self.name().len());
+        for ch in self.name().chars() {
             match ch.to_pinyin() {
                 Some(pinyin) => {
                     let plain = pinyin.plain();
@@ -99,8 +180,10 @@ impl Entry {
                 }
             }
         }
-        self.full_pinyin = full;
-        self.initials = initials;
+        self.pinyin = Some(Box::new(Pinyin {
+            full: full.into_boxed_str(),
+            initials: initials.into_boxed_str(),
+        }));
     }
 }
 
@@ -108,7 +191,6 @@ impl PartialEq for Entry {
     /// Compares only the persisted metadata, never the derived search fields.
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
-            && self.name == other.name
             && self.size == other.size
             && self.modified == other.modified
             && self.is_dir == other.is_dir

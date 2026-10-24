@@ -1368,7 +1368,7 @@ impl App {
         api::send_message(self.results, style::LVM_DELETEALLITEMS, 0, 0);
         self.rows = entries;
         for (position, entry) in self.rows.iter().enumerate() {
-            let name = api::wide(&entry.name);
+            let name = api::wide(entry.name());
             let mut item = LVITEMW {
                 mask: LVIF_TEXT,
                 iItem: position as i32,

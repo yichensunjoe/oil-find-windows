@@ -70,7 +70,7 @@ fn scan_reports_metadata_and_deduplicates_overlapping_roots() {
     let paths = indexed_paths(&index);
     let entry = paths.get(&file).expect("selected file was not indexed");
     let metadata = fs::metadata(&file).expect("fixture metadata");
-    assert_eq!(entry.name, "会议纪要.PDF");
+    assert_eq!(entry.name(), "会议纪要.PDF");
     assert!(!entry.is_dir);
     assert_eq!(entry.size, metadata.len());
     assert_eq!(entry.modified, modified_secs(&metadata));
@@ -387,9 +387,9 @@ fn scanned_entries_are_searchable_immediately() {
     let index = run_scan(&[dir.path().to_path_buf()]).expect("scan");
     let (results, total) = index.search("jidubaogao", None, 10).expect("search");
     assert_eq!(total, 1);
-    assert_eq!(results[0].name, "季度报告.docx");
+    assert_eq!(results[0].name(), "季度报告.docx");
     let (results, _) = index.search("jd", None, 10).expect("search");
-    assert_eq!(results[0].name, "季度报告.docx");
+    assert_eq!(results[0].name(), "季度报告.docx");
 }
 
 #[test]
