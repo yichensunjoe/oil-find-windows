@@ -13,6 +13,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Drops the Windows verbatim prefix (`\\?\C:\...`) so fixture paths compare
+/// equal to the paths the scanner reports.
+fn plain_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
+}
+
 /// A temporary directory that cleans itself up.
 pub struct TempDir {
     path: PathBuf,
@@ -40,7 +50,9 @@ impl TempDir {
                     // symlink (/var -> /private/var on macOS); scanning rejects
                     // linked ancestors, so resolve it first.
                     let path = fs::canonicalize(&candidate).expect("canonicalize fixture");
-                    return TempDir { path };
+                    return TempDir {
+                        path: plain_path(path),
+                    };
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => panic!("cannot create fixture directory: {err}"),
