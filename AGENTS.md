@@ -1,4 +1,4 @@
-# AGENTS.md — Oil Find Intranet (Windows) 项目级规则
+# AGENTS.md — Oil Find for Windows 项目级规则
 
 本文件是本仓库的项目级规则，独立生效。共享安全、授权与现场保护底线适用于所有改动。
 
@@ -6,7 +6,7 @@
 
 1. 接力或实质修改读取 `HANDOFF.md` 当前状态及相关实现；简单问答不全读历史。
 2. 经验按 `REUSE_AND_PITFALL_LOG.md` 的索引/主题读取，已读未变内容不重复加载。
-3. 用户本轮要求建立开源改造底座，不代表已授权部署、推送、安装或扫描真实个人/公司文件。
+3. 用户本轮要求建立开源改造底座，不代表已授权部署、推送、安装或扫描真实用户文件。
 
 ## 项目约束
 
@@ -15,10 +15,10 @@
   - macOS：`Sources/` + `Package.swift`，Swift 5 语言模式 / SwiftPM 5.10+、AppKit、SwiftUI、C；Apple 芯片，macOS 14+；无第三方 Swift 包。
   - Windows：`windows/`，Go 1.24+、原生 Win32（user32/comctl32/shell32）；唯一第三方库 `github.com/mozillazg/go-pinyin`（MIT）。仅 Windows 10/11 x64。
 - 永久只构建公开模块；不要恢复私有 target 自动检测，不导入 Pro，也不下载或分发上游含 Pro 的安装包。
-- `OILFIND_INTRANET_BUILD` 固定用于 macOS 应用库；在线更新检查、下载安装、更新官网跳转均禁用，管理员自行分发。Windows 版不实现任何在线更新/遥测。
+- `OILFIND_OFFLINE_BUILD` 固定用于 macOS 应用库；在线更新检查、下载安装、更新官网跳转均禁用，由用户手动获取新版本。Windows 版不实现任何在线更新/遥测。
 - 保留中性 `ApplicationExtension`，不要把它误当 Pro 实现。上游官网 `site/` 仅作来源参考，不安装/部署其支付、授权或分析服务。
 - macOS 热路径保持 Unsafe 指针 / SoA 设计；代码注释用英文；界面文案维护 `L10n.swift` 的中英文对应项。
-- Windows 版硬边界：只读元数据（不读正文）；无删除/移动/重命名入口；默认不扫描任何目录，必须用户显式选择范围并点击开始索引；跳过 reparse/symlink、系统/AppData/依赖/私人运行器目录；拒绝 UNC、设备路径与网络映射盘；缓存/配置在 `%APPDATA%\OilFindIntranet`，缓存不得是链接。
+- Windows 版硬边界：只读元数据（不读正文）；无删除/移动/重命名入口；默认不扫描任何目录，必须用户显式选择范围并点击开始索引；跳过 reparse/symlink、系统/AppData/依赖/私人运行器目录；拒绝 UNC、设备路径与网络映射盘；缓存/配置在 `%LOCALAPPDATA%\OilFind`，缓存不得是链接。
 - Windows 版首版只做本机搜索：不支持 SMB/NAS 共享盘、多人服务、正文检索。改变平台或共享索引架构先确认用户需求。
 - 现有 Bundle ID、数据路径和全局快捷键仍与上游一致，安装前必须进行隔离改造；不得覆盖已有 Oil Find。
 
@@ -26,7 +26,7 @@
 
 ```sh
 swift build -c release
-CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.IntranetUpdateTests/'
+CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.OfflineUpdateTests/'
 python3 Tests/Scripts/test_open_core.py
 bash -n scripts/build-app.sh scripts/package.sh
 ```
@@ -49,7 +49,7 @@ P=$(cd .. && pwd)
 GOCACHE=$P/outputs/go-cache GOPATH=$P/outputs/go-path GOMODCACHE=$P/outputs/go-mod-cache \
   go test ./...
 bash scripts/build.sh /path/to/go            # 交叉编译到 outputs/windows-amd64
-python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFindIntranet.exe --arch amd64
+python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFind.exe --arch amd64
 ```
 
 - Windows 上 `t.TempDir()` 默认落在 `%LOCALAPPDATA%\Temp`，会被引擎的 AppData 安全排除拒绝；构建脚本在跑测试时把 `TEMP/TMP` 指向 `outputs/test-tmp`，不要为此放宽引擎排除。

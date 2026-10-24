@@ -31,14 +31,14 @@ final class UpdateManager: ObservableObject {
     private var readyToRelaunch = false
     var preventsTermination: Bool { state.installing && !readyToRelaunch }
     static var onlineUpdatesAllowed: Bool {
-        #if OILFIND_INTRANET_BUILD
+        #if OILFIND_OFFLINE_BUILD
         return false
         #else
         return true
         #endif
     }
     var canCheck: Bool {
-        #if DEBUG || OILFIND_INTRANET_BUILD
+        #if DEBUG || OILFIND_OFFLINE_BUILD
         return false
         #else
         return !state.busy
@@ -50,7 +50,7 @@ final class UpdateManager: ObservableObject {
         automatic = Self.onlineUpdatesAllowed && (snapshot ? true : preferences.automatic)
     }
     func start() {
-        #if !DEBUG && !OILFIND_INTRANET_BUILD
+        #if !DEBUG && !OILFIND_OFFLINE_BUILD
         started = true; schedule(delay: 30)
         #endif
     }
@@ -63,7 +63,7 @@ final class UpdateManager: ObservableObject {
         }
     }
     func check(manual: Bool = true) {
-        #if !DEBUG && !OILFIND_INTRANET_BUILD
+        #if !DEBUG && !OILFIND_OFFLINE_BUILD
         guard !snapshot, !state.busy else { return }
         setState(.checking)
         Task { @MainActor in
@@ -95,7 +95,7 @@ final class UpdateManager: ObservableObject {
         self.manifest = nil; setState(.idle); dismiss()
     }
     func install() {
-        #if !DEBUG && !OILFIND_INTRANET_BUILD
+        #if !DEBUG && !OILFIND_OFFLINE_BUILD
         guard let manifest, !state.busy, !snapshot else { return }
         readyToRelaunch = false
         setState(.downloading(0))

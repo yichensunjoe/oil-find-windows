@@ -1,4 +1,4 @@
-module oilfind-intranet/windows
+module oilfind
 
 go 1.24.0
 

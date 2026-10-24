@@ -2,7 +2,7 @@ import XCTest
 import OilFindCore
 @testable import OilFindApp
 
-final class IntranetUpdateTests: XCTestCase {
+final class OfflineUpdateTests: XCTestCase {
     func testOnlineUpdatesAreDisallowed() {
         XCTAssertFalse(UpdateManager.onlineUpdatesAllowed)
         let model = UpdateManager(snapshot: true)
@@ -11,7 +11,7 @@ final class IntranetUpdateTests: XCTestCase {
     }
 
     func testPreviouslyEnabledPreferenceCannotEnableTheUpdater() throws {
-        let suite = "OilFindIntranetTests-" + UUID().uuidString
+        let suite = "OilFindOfflineTests-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let preferences = UpdatePreferences(defaults: defaults)

@@ -13,7 +13,7 @@ fi
 OUTPUT_DIR="$PROJECT_DIR/outputs/windows-$ARCH"
 TEST_TMP_DIR="$PROJECT_DIR/outputs/test-tmp"
 MANIFEST_SYSO="$MODULE_DIR/cmd/oilfind/resource_windows_$ARCH.syso"
-GUI_EXE="$OUTPUT_DIR/OilFindIntranet.exe"
+GUI_EXE="$OUTPUT_DIR/OilFind.exe"
 CLI_EXE="$OUTPUT_DIR/oilfind-cli.exe"
 
 if ! command -v "$GO_BIN" >/dev/null 2>&1; then

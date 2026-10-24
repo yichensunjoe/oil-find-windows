@@ -10,7 +10,7 @@ import (
 	"time"
 	"unsafe"
 
-	"oilfind-intranet/windows/internal/index"
+	"oilfind/internal/index"
 )
 
 func TestNativeStructureLayouts(t *testing.T) {

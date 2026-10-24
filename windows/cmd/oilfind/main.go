@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"oilfind-intranet/windows/internal/ui"
+	"oilfind/internal/ui"
 )
 
 func main() {

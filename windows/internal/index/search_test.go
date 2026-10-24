@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	index "oilfind-intranet/windows/internal/index"
+	index "oilfind/internal/index"
 )
 
 func searchFixture(t *testing.T) *index.Index {

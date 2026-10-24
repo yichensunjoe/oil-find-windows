@@ -1,4 +1,4 @@
-# Oil Find Intranet · Windows 本机文件搜索
+# Oil Find for Windows · 本机文件搜索
 
 > 私有仓库。CI（只跑 Windows）在 GitHub Actions 中运行，需登录仓库后查看。
 
@@ -23,7 +23,7 @@ Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立�
 - 跳过依赖与版本库目录（`node_modules`、`.git` 等）和私人运行器目录（`.claude`、`.codex`、`.workbuddy` 等），任意层级生效。
 - `C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`$RECYCLE.BIN` 等系统目录只在磁盘根一级跳过；`D:\code\myproject\windows` 这类普通项目目录仍可搜索。
 - 拒绝 UNC、设备路径与网络映射盘；跳过符号链接与目录联接。
-- 索引与配置存放在 `%LOCALAPPDATA%\OilFindIntranet`（不使用漫游目录）。
+- 索引与配置存放在 `%LOCALAPPDATA%\OilFind`（不使用漫游目录）。
 - 不支持：SMB/NAS 共享盘检索、多人服务、文件正文检索、删除操作。
 
 ## 构建
@@ -42,7 +42,7 @@ bash scripts/build.sh /path/to/go
 ARCH=arm64 bash scripts/build.sh /path/to/go
 ```
 
-产物在 `outputs/windows-<arch>/`：`OilFindIntranet.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
+产物在 `outputs/windows-<arch>/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
 
 ## 测试与校验
 
@@ -50,7 +50,7 @@ ARCH=arm64 bash scripts/build.sh /path/to/go
 cd windows
 go test ./...                                   # 索引/搜索/缓存，仅临时样例
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/oilfind
-python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFindIntranet.exe --arch amd64
+python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFind.exe --arch amd64
 ```
 
 CI 只跑 Windows（`.github/workflows/ci.yml`）：`windows-latest` 上执行测试、打包、PE 校验并上传未签名产物；`heavy-cache-limit` 为手动触发的重负载检查。开发机不是 Windows 时，CI 是唯一能真实执行 Windows 原生测试的通道。
@@ -80,5 +80,5 @@ Windows 客户端是基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-fin
 - 索引同步为用户启动后每 30 秒全量快照，不是 NTFS USN 实时索引。
 - 索引常驻内存，上限 200 万条；大目录首次索引较慢。
 - 结果最多显示 2000 条。
-- 可执行文件未签名，Windows SmartScreen 或企业杀软可能提示未知发布者。
+- 可执行文件未签名，Windows SmartScreen 或安全软件可能提示未知发布者。
 - 界面交互、DPI/多显示器、ACL 拒绝等仍需在 Windows 真机验收。

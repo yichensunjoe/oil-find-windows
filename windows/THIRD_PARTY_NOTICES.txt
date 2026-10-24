@@ -1,4 +1,4 @@
-Oil Find Intranet - Windows preview
+Oil Find for Windows - preview
 
 The upstream Oil Find project is licensed under MIT.
 Copyright (c) 2026 Lin Zhihuang. See the distributed LICENSE file.

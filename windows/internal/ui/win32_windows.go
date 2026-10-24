@@ -235,7 +235,7 @@ func enabled(h uintptr, yes bool) {
 }
 
 func warn(owner uintptr, s string) {
-	textPtr, titlePtr := wide(s), wide("Oil Find 内网版")
+	textPtr, titlePtr := wide(s), wide("Oil Find for Windows")
 	messageBox.Call(owner, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), 0x30)
 	runtime.KeepAlive(textPtr)
 	runtime.KeepAlive(titlePtr)

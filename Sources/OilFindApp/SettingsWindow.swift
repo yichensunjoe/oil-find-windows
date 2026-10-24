@@ -238,7 +238,7 @@ private struct UpdateSettingsRow: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Toggle(L10n.text("update.auto"), isOn: $update.automatic)
                         .disabled(!UpdateManager.onlineUpdatesAllowed)
-                    Text(L10n.text(UpdateManager.onlineUpdatesAllowed ? "update.autoHint" : "update.intranetHint")).font(.footnote).foregroundStyle(.secondary)
+                    Text(L10n.text(UpdateManager.onlineUpdatesAllowed ? "update.autoHint" : "update.offlineHint")).font(.footnote).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()

@@ -24,7 +24,7 @@ jobs:
         run: ./windows/scripts/build.ps1 -GoBin go
       - name: Verify PE subsystem and embedded manifest
         shell: pwsh
-        run: python ./windows/scripts/verify-pe.py ./outputs/windows-amd64/OilFindIntranet.exe --arch amd64
+        run: python ./windows/scripts/verify-pe.py ./outputs/windows-amd64/OilFind.exe --arch amd64
       - name: Upload unsigned preview artifacts
         uses: actions/upload-artifact@v7
         with:

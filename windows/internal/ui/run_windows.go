@@ -16,7 +16,7 @@ import (
 	"time"
 	"unsafe"
 
-	"oilfind-intranet/windows/internal/index"
+	"oilfind/internal/index"
 )
 
 const (
@@ -121,7 +121,7 @@ func Run() (runErr error) {
 		return nativeError("加载应用程序模块", err)
 	}
 	a.instance = instance
-	className := wide("OilFindIntranetNativeWindow")
+	className := wide("OilFindNativeWindow")
 	cursor, _, _ := loadCursor.Call(0, 32512)
 	brush, _, _ := getSysColorBrush.Call(5)
 	class := wndClass{Size: uint32(unsafe.Sizeof(wndClass{})), Style: 3, WndProc: windowCallback, Instance: instance, Cursor: cursor, Background: brush, ClassName: className}
@@ -141,7 +141,7 @@ func Run() (runErr error) {
 	if available := int(screenHeight) - a.px(48); available > 0 && height > available {
 		height = available
 	}
-	title := wide("Oil Find 内网版 · Windows 预览版")
+	title := wide("Oil Find for Windows")
 	hwnd, _, err := createWindowEx.Call(wsExControl, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(title)), wsOverlapped|wsClipChildren, 0x80000000, 0x80000000, uintptr(width), uintptr(height), 0, 0, instance, 0)
 	runtime.KeepAlive(title)
 	if hwnd == 0 {
@@ -1088,7 +1088,7 @@ func (a *application) loadConfiguration() {
 		a.startupNotice = "当前用户配置目录实际位于网络位置；本次仅使用内存。"
 		return
 	}
-	base = filepath.Join(base, "OilFindIntranet")
+	base = filepath.Join(base, "OilFind")
 	if err := os.MkdirAll(base, 0700); err != nil {
 		a.startupNotice = "无法创建当前用户配置目录；本次仅使用内存：" + err.Error()
 		return

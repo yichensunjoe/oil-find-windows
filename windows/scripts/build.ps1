@@ -91,12 +91,12 @@ try {
     $env:GOOS = "windows"
     $env:GOARCH = "amd64"
     # GUI binary: Windows GUI subsystem. CLI binary: console subsystem, no -H.
-    Invoke-Go -GoArguments @("build", "-trimpath", "-ldflags", "-H windowsgui -s -w", "-o", (Join-Path $OutputDir "OilFindIntranet.exe"), "./cmd/oilfind")
+    Invoke-Go -GoArguments @("build", "-trimpath", "-ldflags", "-H windowsgui -s -w", "-o", (Join-Path $OutputDir "OilFind.exe"), "./cmd/oilfind")
     if (Test-Path -LiteralPath (Join-Path $ModuleDir "cmd/oilfind-cli") -PathType Container) {
         Invoke-Go -GoArguments @("build", "-trimpath", "-ldflags", "-s -w", "-o", (Join-Path $OutputDir "oilfind-cli.exe"), "./cmd/oilfind-cli")
     }
 
-    & $PythonExe (Join-Path $PSScriptRoot "verify-pe.py") --arch amd64 (Join-Path $OutputDir "OilFindIntranet.exe")
+    & $PythonExe (Join-Path $PSScriptRoot "verify-pe.py") --arch amd64 (Join-Path $OutputDir "OilFind.exe")
     if ($LASTEXITCODE -ne 0) {
         throw "PE verification failed: the GUI binary is not an amd64 GUI executable with an embedded asInvoker manifest."
     }

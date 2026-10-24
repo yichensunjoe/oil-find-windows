@@ -1,13 +1,13 @@
-Oil Find 内网版 · Windows 预览版 v0.1
+Oil Find for Windows · 预览版 v0.1
 
 适用范围
-员工 Windows 10/11 64 位电脑上的本机文件名搜索。
-不包含 Pro；不连接云端、不上传索引、无在线更新、无账号或激活。
+Windows 10/11 64 位电脑上的本机文件名搜索。
+不含 Pro 功能；不连接云端、不上传索引、无在线更新、无账号或激活。
 不是共享盘/NAS 搜索工具，不搜索文件正文或 AI 会话。
 
 首次使用
 1. 将 ZIP 完整解压到普通用户可写的文件夹。
-2. 双击 OilFindIntranet.exe，无需安装 Python、Node、Go 或管理员权限。
+2. 双击 OilFind.exe，无需安装 Python、Node、Go 或管理员权限。
 3. 添加你允许索引的本机目录，再点击“开始索引”。默认没有选择任何扫描范围，不会自动扫描全盘。
 4. 完成后在搜索框输入文件名、中文或拼音。双击结果打开；也可定位文件夹或复制路径。
 5. 新文件/重命名/删除通过索引同步反映；首版采用定期目录快照而不是 NTFS USN 日志即时索引。可暂停，退出后停止。
@@ -38,28 +38,32 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
   因此 D:\code\myproject\windows 或 D:\work\tmp 这类普通项目目录仍可搜索。
 - 跳过符号链接与目录联接；不支持 UNC/网络映射盘。OneDrive 占位文件如果带 reparse 属性会被跳过。
 - 无法读取的路径会跳过并计数；管理员权限不是使用前提。
-- 缓存和配置在 %LOCALAPPDATA%\OilFindIntranet（不使用漫游配置目录，避免把大索引同步到域服务器）。
+- 缓存和配置在 %LOCALAPPDATA%\OilFind（不使用漫游配置目录，避免把大索引同步到服务器）。
 - 搜索结果最多显示 2000 条，但同时展示总命中；索引上限 200 万条，超限会报错，不覆盖已有完整索引。
 - 不保证达到上游 Mac SIMD/Everything 的性能，建议先索引工作目录，不要一开始选择整盘。
-- 文件由员工明确操作后交给 Windows 关联程序打开；请勿打开不可信文件。
+- 文件由你明确操作后交给 Windows 关联程序打开；请勿打开不可信文件。
 
-企业试点验收
-当前已在 macOS 上执行跨平台引擎测试并跨编译 Windows PE 文件，Windows 真机 UI、目录权限、中文长路径、DPI、多显示器、SmartScreen/杀软兼容性仍需试点验收。
-EXE 尚未企业代码签名，下载渠道或公司安全软件可能提示未知发布者。请由公司 IT 审核哈希并按公司制度签名/分发，不要关闭防护或绕过策略。
-如程序无法启动或索引异常，请保留错误文本、Windows版本、目录类型和截图（不要附敏感文件正文）。
+安装与签名
+预览版可执行文件未代码签名，Windows SmartScreen 或安全软件可能提示未知发布者。
+下载渠道与是否签名由分发者决定；不要为此关闭系统防护或绕过安全策略。
+
+当前验收范围
+已在 macOS 上执行跨平台引擎测试并交叉编译，Windows 原生测试在 GitHub Actions 的 windows-latest 上执行通过；
+界面交互、目录选择、DPI/多显示器、权限拒绝、取消/重启仍需在真机上逐项确认。
+如程序无法启动或索引异常，请保留错误文本、Windows 版本、目录类型和截图（不要附敏感文件正文）。
 
 离线包包含
-OilFindIntranet.exe      原生桌面客户端
+OilFind.exe              原生桌面客户端
 oilfind-cli.exe         诊断 CLI（默认只查缓存；扫描必须显式 -scan -root）
 LICENSE                 上游 MIT 许可
 THIRD_PARTY_NOTICES.txt  开源拼音及 Go 运行时许可
 USAGE.txt               本说明
 
-CLI 示例（管理员/研发，仅对显式授权的目录操作）
+CLI 示例（仅对显式授权的目录操作）
 oilfind-cli.exe -scan -root "D:\Work" -query "ext:pdf" -limit 100
 oilfind-cli.exe -query "baogao"
 
 源码位置
-项目 windows/ 子目录；原 Mac 源码未被覆盖。
+项目 windows/ 子目录；macOS 源码保留在 Sources/。
 Windows 版重新实现了本地遍历/搜索与 Win32 界面，沿用上游公开功能和语法设计，不是把 Swift/AppKit 直接编译成 Windows。
 开发者构建需要 Go 1.24+ 和 Python 3（仅用于生成嵌入 manifest），运行端不需要。

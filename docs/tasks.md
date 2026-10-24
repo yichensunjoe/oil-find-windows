@@ -13,7 +13,7 @@
 
 ### Windows 分支（第二阶段，进行中）
 
-- [x] 确认公司以 Windows 为主、首版只做员工本机搜索。
+- [x] 确认首版只做 Windows 本机文件搜索。
 - [x] Go 索引/搜索/缓存实现：显式范围、跳过 reparse/系统/依赖/私人目录、拒绝网络路径。
 - [x] 原生 Win32 界面：目录管理、去抖搜索、结果列表、打开/定位/复制、状态与进度。
 - [x] 隔离测试（临时样例）与 CLI 端到端冒烟。
@@ -27,7 +27,7 @@
 ## 验证
 
 - [x] `swift build -c release`。
-- [x] `CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.IntranetUpdateTests/'`：30/30。
+- [x] `CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.OfflineUpdateTests/'`：30/30。
 - [x] `python3 Tests/Scripts/test_open_core.py`：2/2；构建/打包脚本语法检查通过。
 - [x] Windows `go test ./...`（索引/搜索/缓存，仅临时样例）：97 用例通过，含 `-race`、`vet`。
 - [x] Windows `GOOS=windows GOARCH=amd64/arm64 go build ./cmd/oilfind`（跨编译）。
@@ -38,7 +38,7 @@
 ## 后续
 
 - [ ] Windows 真机验收：目录选择、双击打开/定位/复制、不同 DPI 与多显示器、ACL 拒绝、取消与重启、SmartScreen/杀软。
-- [ ] 公司管理员确认代码签名与离线分发策略后试点；未授权不得安装或部署。
+- [ ] 确认代码签名与分发方式后再分发；未授权不得安装或部署。
 - [ ] 视需要改独立应用名/AppId/缓存路径；评估是否加 NTFS USN 增量索引。
 - [ ] 如需要 SMB/NAS 共享检索：单独设计服务端与权限模型，不复用本机索引假设。
-- [ ] 用户决定是否配置公司私有远端及异机备份。
+- [ ] 决定是否配置额外远端与异机备份。

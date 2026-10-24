@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"oilfind-intranet/windows/internal/index"
+	"oilfind/internal/index"
 )
 
 type rootsFlag []string
@@ -37,7 +37,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		*output = filepath.Join(base, "OilFindIntranet", "index.json")
+		*output = filepath.Join(base, "OilFind", "index.json")
 	}
 	var idx *index.Index
 	var err error

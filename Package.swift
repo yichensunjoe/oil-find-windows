@@ -1,7 +1,7 @@
 // swift-tools-version:5.10
 import PackageDescription
 
-// This company-intranet fork only builds the public, open-source targets.
+// This fork only builds the public, open-source targets.
 let package = Package(
     name: "OilFind",
     platforms: [.macOS(.v14)],
@@ -10,7 +10,7 @@ let package = Package(
         .target(name: "COilFind", publicHeadersPath: "include"),
         .target(name: "OilFindCore", dependencies: ["COilFind"]),
         .target(name: "OilFindApp", dependencies: ["OilFindCore"], resources: [.copy("Resources")],
-                swiftSettings: [.define("OILFIND_INTRANET_BUILD")]),
+                swiftSettings: [.define("OILFIND_OFFLINE_BUILD")]),
         .executableTarget(name: "OilFind", dependencies: ["OilFindApp"],
                           swiftSettings: [.define("OILFIND_FREE_BUILD")]),
         .executableTarget(name: "oilfind-cli", dependencies: ["OilFindCore"]),

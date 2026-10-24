@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"testing"
 
-	index "oilfind-intranet/windows/internal/index"
+	index "oilfind/internal/index"
 )
 
 func testTempDir(t *testing.T) string {
