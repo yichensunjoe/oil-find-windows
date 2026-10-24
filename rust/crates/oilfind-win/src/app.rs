@@ -12,17 +12,21 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use oilfind_core::{scan, Entry, Index, Progress};
+use oilfind_core::{compare_entries, scan, Entry, Index, Progress};
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+// ClientToScreen / ScreenToClient 在 Gdi 模块（user32 转发），与绘制用同一组。
 use windows_sys::Win32::Graphics::Gdi::{
-    GetSysColorBrush, InvalidateRect, UpdateWindow, COLOR_WINDOW, HFONT,
+    ClientToScreen, GetSysColorBrush, InvalidateRect, ScreenToClient, SetBkColor, SetTextColor,
+    UpdateWindow, COLOR_WINDOW, HDC, HFONT,
 };
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+// 表头排序、命中测试与进度条类所需的常量与结构。
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCOLUMNW,
-    LVIF_TEXT, LVITEMW, LVN_ITEMCHANGED, NMHDR, NMITEMACTIVATE, NM_DBLCLK,
+    InitCommonControlsEx, HDITEMW, HDI_TEXT, HDN_ITEMCLICK, ICC_LISTVIEW_CLASSES,
+    ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT,
+    LVITEMW, LVN_ITEMCHANGED, NMHDR, NMHEADERW, NMITEMACTIVATE, NM_DBLCLK,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -30,13 +34,14 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetSystemMetrics, IsDialogMessageW, KillTimer, LoadCursorW, MoveWindow, PostQuitMessage,
-    RegisterClassExW, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    IDC_ARROW, MINMAXINFO, MSG, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GetClientRect, GetMessageW, GetSystemMetrics, IsDialogMessageW, KillTimer,
+    LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, IDC_ARROW, MF_STRING, MINMAXINFO,
+    MSG, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_LEFTALIGN,
+    TPM_RETURNCMD, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
+    WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::api::{self, SendHwnd};
@@ -107,6 +112,22 @@ mod style {
     pub const EM_SETCUEBANNER: u32 = 0x1501;
     pub const EM_SETSEL: u32 = 0x00B1;
     pub const WM_SETREDRAW: u32 = 0x000B;
+    // 结果列表：表头、命中测试、选中状态。
+    pub const LVM_GETHEADER: u32 = LVM_FIRST + 31;
+    pub const LVM_HITTEST: u32 = LVM_FIRST + 18;
+    pub const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43;
+    pub const LVIS_SELECTED: u32 = 0x0002;
+    // 表头消息（HDM_FIRST = 0x1200）与排序点击通知。
+    pub const HDM_FIRST: u32 = 0x1200;
+    pub const HDM_SETITEMW: u32 = HDM_FIRST + 12;
+    // 进度条：marquee 动画（PBM_SETMARQUEE = WM_USER + 10）。
+    pub const PBS_MARQUEE: u32 = 0x0000_0008;
+    pub const PBM_SETMARQUEE: u32 = 0x0400 + 10;
+    // 静态控件：居中文本；默认按钮（“开始索引”）。
+    pub const SS_CENTER: u32 = 0x0000_0001;
+    pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+    // 静态控件颜色通知：wParam 是 HDC，lParam 是控件句柄。
+    pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 }
 
 // UI 线程持有的 App 指针。
@@ -201,6 +222,15 @@ struct App {
     reveal: HWND,
     copy: HWND,
     labels: Vec<HWND>,
+    /// 扫描进度条（marquee），仅扫描期间可见。
+    progress: HWND,
+    /// 结果列表上覆盖的空状态提示，仅在没有任何行时可见。
+    empty: HWND,
+    /// 结果列表的表头控件，用于排序点击与排序箭头。
+    header: HWND,
+    /// 当前排序列；None 表示按搜索相关度顺序，不显示箭头。
+    sort_column: Option<usize>,
+    sort_descending: bool,
     config: Config,
     config_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
@@ -239,7 +269,8 @@ pub fn run() -> Result<(), String> {
     }
     let controls = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES,
+        // 列表视图（结果列表）与进度条（扫描指示）都要注册。
+        dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS,
     };
     if unsafe { InitCommonControlsEx(&controls) } == 0 {
         unsafe { CoUninitialize() };
@@ -404,6 +435,11 @@ impl App {
             reveal: std::ptr::null_mut(),
             copy: std::ptr::null_mut(),
             labels: Vec::new(),
+            progress: std::ptr::null_mut(),
+            empty: std::ptr::null_mut(),
+            header: std::ptr::null_mut(),
+            sort_column: None,
+            sort_descending: false,
             config: Config::default(),
             config_path,
             cache_path,
@@ -483,6 +519,19 @@ impl App {
             WM_COMMAND => {
                 self.command(wparam & 0xFFFF, ((wparam >> 16) & 0xFFFF) as u32);
                 Some(0)
+            }
+            WM_CONTEXTMENU => {
+                self.context_menu(wparam as HWND, lparam);
+                Some(0)
+            }
+            // 空状态提示用灰色文字、窗口底色；其余静态控件走默认处理。
+            style::WM_CTLCOLORSTATIC if lparam == self.empty as isize && !self.empty.is_null() => {
+                let device = wparam as HDC;
+                unsafe {
+                    SetTextColor(device, 0x0080_8080);
+                    SetBkColor(device, 0x00FF_FFFF);
+                }
+                Some(unsafe { GetSysColorBrush(COLOR_WINDOW) } as LRESULT)
             }
             WM_NOTIFY => {
                 self.notify(lparam);
@@ -571,7 +620,13 @@ impl App {
             ("资源管理器定位", ID_REVEAL),
             ("复制路径", ID_COPY),
         ] {
-            let handle = make("BUTTON", label, style::WS_TABSTOP, 0, id)?;
+            // “开始索引”是默认按钮：回车可达，边框加粗以突出主操作。
+            let emphasis = if id == ID_START {
+                style::BS_DEFPUSHBUTTON
+            } else {
+                0
+            };
+            let handle = make("BUTTON", label, style::WS_TABSTOP | emphasis, 0, id)?;
             match id {
                 ID_ADD_ROOT => self.add = handle,
                 ID_REMOVE_ROOT => self.remove = handle,
@@ -629,6 +684,8 @@ impl App {
             (style::LVS_EX_FULLROWSELECT | style::LVS_EX_GRIDLINES | style::LVS_EX_DOUBLEBUFFER)
                 as isize,
         );
+        // 表头句柄：排序点击通知由列表视图转发给父窗口。
+        self.header = api::send_message(self.results, style::LVM_GETHEADER, 0, 0) as HWND;
         for (position, label) in ["文件名", "完整路径", "大小", "修改日期"]
             .iter()
             .enumerate()
@@ -654,6 +711,14 @@ impl App {
         }
         self.status = make("STATIC", "", style::SS_LEFT, 0, 0)?;
 
+        // 扫描进度条：indeterminate marquee，平时隐藏，扫描时显示。
+        self.progress = make("msctls_progress2", "", style::PBS_MARQUEE, 0, 0)?;
+        unsafe { ShowWindow(self.progress, SW_HIDE) };
+
+        // 空状态提示：覆盖在结果列表上方，仅在没有行时显示（后创建 = 上层）。
+        self.empty = make("STATIC", "", style::SS_CENTER, 0, 0)?;
+        unsafe { ShowWindow(self.empty, SW_HIDE) };
+
         self.refresh_roots();
         self.selection_buttons();
         api::enable(self.stop, false);
@@ -662,6 +727,8 @@ impl App {
             self.last_notice = self.startup_notice.clone();
         }
         self.render_status();
+        self.refresh_header();
+        self.refresh_empty_state();
         self.layout();
         Ok(())
     }
@@ -753,7 +820,17 @@ impl App {
         y += row + gap;
 
         let bottom = height - self.px(112);
+        let results_y = y;
+        let results_height = bottom - y;
         move_control(self.results, padding, y, width - 2 * padding, bottom - y);
+        // 空状态提示：垂直落在结果区约 2/5 处，单行居中。
+        move_control(
+            self.empty,
+            padding,
+            results_y + results_height * 2 / 5,
+            width - 2 * padding,
+            self.px(40),
+        );
         move_control(self.open, padding, bottom + gap, self.px(115), row);
         move_control(
             self.reveal,
@@ -783,6 +860,8 @@ impl App {
             width - 2 * padding,
             self.px(24),
         );
+        // 底部细进度条：贴客户区下边缘，扫描时显示。
+        move_control(self.progress, 0, height - self.px(6), width, self.px(6));
 
         for (position, mut column_width) in [
             self.px(220),
@@ -830,9 +909,15 @@ impl App {
             self.open,
             self.reveal,
             self.copy,
+            self.progress,
+            self.empty,
         ]);
         for handle in controls {
             api::set_font(handle, font);
+        }
+        // 表头不继承列表视图字体，显式设置。
+        if !self.header.is_null() {
+            api::set_font(self.header, font);
         }
         // 按系统建议矩形重建窗口；随后的 WM_SIZE 仍会重新布局。
         unsafe {
@@ -860,6 +945,14 @@ impl App {
             unsafe { SetFocus(self.search) };
             api::send_message(self.search, style::EM_SETSEL, 0, -1);
             return true;
+        }
+        if message.wParam == 'C' as usize && control < 0 {
+            // Ctrl+C：焦点在结果列表时复制所选路径。
+            let focus = unsafe { GetFocus() };
+            if focus == self.results {
+                self.file_action(ID_COPY);
+                return true;
+            }
         }
         if message.wParam == 0x1B {
             // Esc：清空搜索并丢弃当前结果。
@@ -942,6 +1035,14 @@ impl App {
             return;
         }
         let header = unsafe { &*(lparam as *const NMHDR) };
+        // 表头点击通知由列表视图转发给父窗口：切换排序列或方向。
+        if !self.header.is_null() && header.hwndFrom == self.header {
+            if header.code as i32 == HDN_ITEMCLICK as i32 {
+                let clicked = unsafe { &*(lparam as *const NMHEADERW) };
+                self.sort_by_column(clicked.iItem as usize);
+            }
+            return;
+        }
         if header.hwndFrom != self.results {
             return;
         }
@@ -953,6 +1054,58 @@ impl App {
             }
         } else if code == LVN_ITEMCHANGED as i32 {
             self.selection_buttons();
+        }
+    }
+
+    /// 点击表头：新列默认升序，重复点击同一列反转方向。
+    fn sort_by_column(&mut self, column: usize) {
+        if column >= 4 {
+            return;
+        }
+        if self.sort_column == Some(column) {
+            self.sort_descending = !self.sort_descending;
+        } else {
+            self.sort_column = Some(column);
+            self.sort_descending = false;
+        }
+        // set_rows 会按当前排序列重排，随后刷新表头箭头。
+        let rows = std::mem::take(&mut self.rows);
+        self.set_rows(rows);
+        self.refresh_header();
+    }
+
+    /// 重画表头文字：排序列带 ▲/▼，其余列显示纯名称。
+    fn refresh_header(&self) {
+        if self.header.is_null() {
+            return;
+        }
+        const LABELS: [&str; 4] = ["文件名", "完整路径", "大小", "修改日期"];
+        for (position, label) in LABELS.iter().enumerate() {
+            let mut text = (*label).to_string();
+            if self.sort_column == Some(position) {
+                text.push(if self.sort_descending { '▼' } else { '▲' });
+            }
+            let buffer = api::wide(&text);
+            let item = HDITEMW {
+                mask: HDI_TEXT,
+                cxy: 0,
+                pszText: buffer.as_ptr() as *mut u16,
+                hbm: std::ptr::null_mut(),
+                cchTextMax: buffer.len() as i32,
+                fmt: 0,
+                lParam: 0,
+                iImage: 0,
+                iOrder: 0,
+                r#type: 0,
+                pvFilter: std::ptr::null_mut(),
+                state: 0,
+            };
+            api::send_message(
+                self.header,
+                style::HDM_SETITEMW,
+                position,
+                &item as *const HDITEMW as isize,
+            );
         }
     }
 
@@ -1059,6 +1212,7 @@ impl App {
         api::enable(self.stop, true);
         self.last_notice = "正在建立本机元数据快照；界面仍可操作。".to_string();
         self.render_status();
+        self.set_scan_progress(true);
 
         let sender = self.events_tx.clone();
         let hwnd = SendHwnd(self.hwnd);
@@ -1146,6 +1300,7 @@ impl App {
             cancel.store(true, Ordering::SeqCst);
         }
         self.scanning = false;
+        self.set_scan_progress(false);
         api::enable(self.start, !self.config.roots.is_empty());
         api::enable(self.stop, false);
     }
@@ -1264,6 +1419,8 @@ impl App {
                 if generation != self.scan_generation {
                     return;
                 }
+                // 无论成功、失败还是保存未提交，扫描都已结束。
+                self.set_scan_progress(false);
                 self.scanning = false;
                 self.scan_cancel = None;
                 api::enable(self.start, !self.config.roots.is_empty());
@@ -1319,6 +1476,7 @@ impl App {
                 if generation != self.scan_generation || self.index.is_some() {
                     return;
                 }
+                self.set_scan_progress(false);
                 match outcome {
                     Ok((index, updated)) => {
                         let count = index.len();
@@ -1332,6 +1490,7 @@ impl App {
                     }
                     Err(err) => {
                         self.last_notice = format!("未加载索引缓存：{err}。请手动开始索引。");
+                        self.refresh_empty_state();
                         self.render_status();
                     }
                 }
@@ -1363,7 +1522,11 @@ impl App {
         }
     }
 
-    fn set_rows(&mut self, entries: Vec<Entry>) {
+    fn set_rows(&mut self, mut entries: Vec<Entry>) {
+        // 有排序列时结果按列呈现；否则保持搜索相关度顺序。
+        if let Some(column) = self.sort_column {
+            sort_rows(&mut entries, column, self.sort_descending);
+        }
         api::send_message(self.results, style::WM_SETREDRAW, 0, 0);
         api::send_message(self.results, style::LVM_DELETEALLITEMS, 0, 0);
         self.rows = entries;
@@ -1408,6 +1571,147 @@ impl App {
             InvalidateRect(self.results, std::ptr::null(), 1);
         }
         self.selection_buttons();
+        self.refresh_empty_state();
+    }
+
+    /// 扫描期间显示底部 indeterminate 进度条；其余时间隐藏。
+    fn set_scan_progress(&self, active: bool) {
+        if self.progress.is_null() {
+            return;
+        }
+        unsafe {
+            ShowWindow(self.progress, if active { SW_SHOW } else { SW_HIDE });
+        }
+        // PBM_SETMARQUEE：wParam 开关，lParam 为动画帧间隔（毫秒）。
+        api::send_message(self.progress, style::PBM_SETMARQUEE, active as usize, 30);
+    }
+
+    /// 没有任何结果行时，在结果区显示引导文案；有行则隐藏。
+    fn refresh_empty_state(&self) {
+        if self.empty.is_null() {
+            return;
+        }
+        let text = if self.index.is_none() {
+            "还没有可用索引。请添加本机目录，然后点击“开始索引”。"
+        } else if self.rows.is_empty() {
+            if api::text(self.search).trim().is_empty() {
+                "索引中没有条目。请检查索引范围，然后重新索引。"
+            } else {
+                "没有匹配的结果。试试拼音首字母（如 hyjy）、ext:pdf 或 size:>1mb。"
+            }
+        } else {
+            ""
+        };
+        if text.is_empty() {
+            unsafe { ShowWindow(self.empty, SW_HIDE) };
+        } else {
+            api::put_text(self.empty, text);
+            unsafe { ShowWindow(self.empty, SW_SHOW) };
+        }
+    }
+
+    /// 窗口标题反映索引规模，便于在多窗口间辨认。
+    fn refresh_title(&self) {
+        if self.hwnd.is_null() {
+            return;
+        }
+        let count = self.index.as_ref().map_or(0, |index| index.len());
+        let title = if count == 0 {
+            "Oil Find for Windows".to_string()
+        } else {
+            format!("Oil Find for Windows · 索引 {} 项", group_digits(count))
+        };
+        let buffer = api::wide(&title);
+        unsafe { SetWindowTextW(self.hwnd, buffer.as_ptr()) };
+    }
+
+    /// 结果列表右键菜单：打开 / 资源管理器定位 / 复制路径。
+    ///
+    /// 右键落到哪一项就先选中哪一项（与资源管理器行为一致）；
+    /// 键盘唤出（Shift+F10）时菜单出现在列表可见区域中央。
+    fn context_menu(&mut self, control: HWND, lparam: LPARAM) {
+        if control != self.results || self.results.is_null() {
+            return;
+        }
+        let mut point = POINT {
+            x: (lparam & 0xFFFF) as i16 as i32,
+            y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+        };
+        if point.x >= 0 && point.y >= 0 {
+            let mut client = point;
+            unsafe { ScreenToClient(self.results, &mut client) };
+            let hit = LVHITTESTINFO {
+                pt: client,
+                flags: 0,
+                iItem: -1,
+                iSubItem: -1,
+                iGroup: -1,
+            };
+            let item = api::send_message(
+                self.results,
+                style::LVM_HITTEST,
+                0,
+                &hit as *const LVHITTESTINFO as isize,
+            );
+            if item < 0 {
+                return;
+            }
+            let selection = LVITEMW {
+                state: style::LVIS_SELECTED,
+                stateMask: style::LVIS_SELECTED,
+                iItem: item as i32,
+                ..Default::default()
+            };
+            api::send_message(
+                self.results,
+                style::LVM_SETITEMSTATE,
+                item as usize,
+                &selection as *const LVITEMW as isize,
+            );
+            self.selection_buttons();
+        } else {
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(self.results, &mut rect) } == 0 {
+                return;
+            }
+            point.x = (rect.left + rect.right) / 2;
+            point.y = (rect.top + rect.bottom) / 2;
+            let mut screen = point;
+            unsafe { ClientToScreen(self.results, &mut screen) };
+            point = screen;
+        }
+        let menu = unsafe { CreatePopupMenu() };
+        if menu.is_null() {
+            return;
+        }
+        // 标签缓冲区必须活到 AppendMenuW 返回，故先统一准备好。
+        let items: Vec<(usize, Vec<u16>)> = [
+            (ID_OPEN, "打开"),
+            (ID_REVEAL, "资源管理器定位"),
+            (ID_COPY, "复制路径"),
+        ]
+        .into_iter()
+        .map(|(id, label)| (id, api::wide(label)))
+        .collect();
+        for (id, label) in &items {
+            unsafe { AppendMenuW(menu, MF_STRING, *id, label.as_ptr()) };
+        }
+        // TPM_RETURNCMD：同步返回所选条目 ID，取消时为 0。
+        let chosen = unsafe {
+            TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN,
+                point.x,
+                point.y,
+                0,
+                self.hwnd,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { DestroyMenu(menu) };
+        if chosen > 0 {
+            self.file_action(chosen as usize);
+        }
     }
 
     fn selected_entry(&self) -> Option<Entry> {
@@ -1507,11 +1811,16 @@ impl App {
         };
         let notice =
             format!("{} {}", self.last_notice, self.storage_notice).replace(['\r', '\n'], " ");
-        let text = format!("{mode} · 索引 {count} 项{updated} · {notice}");
+        let text = format!(
+            "{} · 索引 {} 项{updated} · {notice}",
+            mode,
+            group_digits(count)
+        );
         let buffer = api::wide(&text);
         unsafe {
             SetWindowTextW(self.status, buffer.as_ptr());
         }
+        self.refresh_title();
     }
 
     fn load_configuration(&mut self) {
@@ -1597,6 +1906,8 @@ impl App {
             return;
         }
         let generation = self.scan_generation;
+        // 大缓存加载可能要几秒：同样用底部进度条提示。
+        self.set_scan_progress(true);
         let sender = self.events_tx.clone();
         let hwnd = SendHwnd(self.hwnd);
         let roots: Vec<PathBuf> = self.config.roots.iter().map(PathBuf::from).collect();
@@ -1630,6 +1941,7 @@ impl App {
             return;
         }
         self.closing = true;
+        self.set_scan_progress(false);
         unsafe {
             KillTimer(self.hwnd, TIMER_SEARCH);
             KillTimer(self.hwnd, TIMER_SYNC);
@@ -1656,6 +1968,42 @@ fn send_event(sender: &Sender<Event>, hwnd: SendHwnd, event: Event) {
     if sender.send(event).is_ok() {
         hwnd.post(WM_APP_EVENT);
     }
+}
+
+/// 按列排序结果行。列：0 文件名、1 完整路径、2 大小、3 修改日期；
+/// descending 时反转比较结果。排序稳定，同列值保持原顺序。
+fn sort_rows(rows: &mut [Entry], column: usize, descending: bool) {
+    rows.sort_by(|a, b| {
+        let order = match column {
+            0 => a.lower_name().cmp(b.lower_name()),
+            // 与索引顺序一致：先比目录再比文件名，不分配完整路径。
+            1 => compare_entries(a, b),
+            2 => a.size.cmp(&b.size),
+            _ => a.modified.cmp(&b.modified),
+        };
+        if descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
+}
+
+/// 千分位分组：标题与状态栏的大数字更易读。
+fn group_digits(value: usize) -> String {
+    let digits = value.to_string();
+    // 从末位向前每 3 位插一个逗号，最后整体反转回来。
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    let mut since_separator = 0;
+    for ch in digits.chars().rev() {
+        if since_separator == 3 {
+            grouped.push(',');
+            since_separator = 0;
+        }
+        grouped.push(ch);
+        since_separator += 1;
+    }
+    grouped.chars().rev().collect()
 }
 
 fn lparam_is_null(lparam: LPARAM) -> bool {
@@ -1693,5 +2041,57 @@ mod tests {
         assert_eq!(month_day_label("2024-01-05", "08:09:10"), "01-05 08:09:10");
         // 无法解析的日期原样保留，不吞掉信息。
         assert_eq!(month_day_label("bad", "08:09:10"), "bad 08:09:10");
+    }
+
+    fn fixture() -> Vec<Entry> {
+        vec![
+            Entry::new(PathBuf::from("/x/b.txt"), String::new(), 10, 200, false),
+            Entry::new(PathBuf::from("/x/A.txt"), String::new(), 30, 100, false),
+            Entry::new(PathBuf::from("/y/c.txt"), String::new(), 20, 300, false),
+        ]
+    }
+
+    fn names(rows: &[Entry]) -> Vec<&str> {
+        rows.iter().map(|entry| entry.name()).collect()
+    }
+
+    #[test]
+    fn sort_by_name_ignores_case_in_both_directions() {
+        let mut rows = fixture();
+        sort_rows(&mut rows, 0, false);
+        assert_eq!(names(&rows), vec!["A.txt", "b.txt", "c.txt"]);
+        sort_rows(&mut rows, 0, true);
+        assert_eq!(names(&rows), vec!["c.txt", "b.txt", "A.txt"]);
+    }
+
+    #[test]
+    fn sort_by_path_orders_directories_before_names() {
+        let mut rows = fixture();
+        sort_rows(&mut rows, 1, false);
+        assert_eq!(names(&rows), vec!["A.txt", "b.txt", "c.txt"]);
+        sort_rows(&mut rows, 1, true);
+        assert_eq!(names(&rows), vec!["c.txt", "b.txt", "A.txt"]);
+    }
+
+    #[test]
+    fn sort_by_size_and_date_uses_numbers_not_text() {
+        let mut rows = fixture();
+        sort_rows(&mut rows, 2, false);
+        let sizes: Vec<u64> = rows.iter().map(|entry| entry.size).collect();
+        assert_eq!(sizes, vec![10, 20, 30]);
+        sort_rows(&mut rows, 2, true);
+        let sizes: Vec<u64> = rows.iter().map(|entry| entry.size).collect();
+        assert_eq!(sizes, vec![30, 20, 10]);
+        sort_rows(&mut rows, 3, false);
+        let stamps: Vec<i64> = rows.iter().map(|entry| entry.modified).collect();
+        assert_eq!(stamps, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn group_digits_inserts_thousand_separators() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(1_532_419), "1,532,419");
     }
 }
