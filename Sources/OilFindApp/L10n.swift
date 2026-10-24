@@ -90,6 +90,7 @@ enum L10n {
         "update.menuAvailable": ("安装更新 %@…", "Install Update %@…"),
         "update.auto": ("自动检查更新", "Check for Updates Automatically"),
         "update.autoHint": ("每天检查一次，只读取版本信息。", "Checks once a day and only reads version info."),
+        "update.intranetHint": ("内网开源版已禁用在线更新，请由公司管理员分发更新。", "Online updates are disabled in this open-source intranet build. Updates are distributed by your administrator."),
         "update.reason.network": ("网络连接失败", "the network connection failed"),
         "update.reason.integrity": ("下载的文件校验没有通过", "the downloaded file didn't pass verification"),
         "update.reason.signature": ("新版本的签名不是 Oil Find 的", "the new version isn't signed by Oil Find"),

@@ -1,0 +1,62 @@
+Oil Find 内网版 · Windows 预览版 v0.1
+
+适用范围
+员工 Windows 10/11 64 位电脑上的本机文件名搜索。
+不包含 Pro；不连接云端、不上传索引、无在线更新、无账号或激活。
+不是共享盘/NAS 搜索工具，不搜索文件正文或 AI 会话。
+
+首次使用
+1. 将 ZIP 完整解压到普通用户可写的文件夹。
+2. 双击 OilFindIntranet.exe，无需安装 Python、Node、Go 或管理员权限。
+3. 添加你允许索引的本机目录，再点击“开始索引”。默认没有选择任何扫描范围，不会自动扫描全盘。
+4. 完成后在搜索框输入文件名、中文或拼音。双击结果打开；也可定位文件夹或复制路径。
+5. 新文件/重命名/删除通过索引同步反映；首版采用定期目录快照而不是 NTFS USN 日志即时索引。可暂停，退出后停止。
+
+搜索示例
+报告              文件名/路径包含中文
+baogao / bg       中文文件名全拼 / 首字母（不含声调，多音字首读音可能不准）
+report budget     同时匹配
+report | budget   任一匹配
+report !draft     排除 draft（可匹配路径）
+"年度 报告"       带空格的词组
+*.pdf             整个文件名的通配符
+ext:pdf;docx       扩展名筛选
+kind:image        图片；也有 doc/code/folder/video/audio/archive/app
+file:report       仅文件；folder:项目 仅文件夹
+size:>10mb        大小；size:1mb..5mb 为范围
+size:>=1kb        支持 >、>=、<、<=、=
+dm:today          今天；dm:week 为最近7个日历日
+dm:2026-10-01     指定日期；dm:2026-10-01..2026-10-24 为闭日期范围
+path:设计         路径包含
+regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则与其他 OR 条件
+
+安全与索引
+- 只读取文件名、路径、大小、修改时间，不读取文件内容。
+- 不删除、不移动、不重命名文件，不更改文件权限。
+- 跳过系统/AppData/依赖/私人运行器目录、符号链接和目录联接；不支持 UNC/网络映射盘。OneDrive 占位文件如果带 reparse 属性会被跳过。
+- 无法读取的路径会跳过并计数；管理员权限不是使用前提。
+- 缓存和配置使用当前用户目录 OilFindIntranet，与上游 Mac 应用隔离。
+- 搜索结果最多显示 2000 条，但同时展示总命中；索引上限 200 万条，超限会报错，不覆盖已有完整索引。
+- 不保证达到上游 Mac SIMD/Everything 的性能，建议先索引工作目录，不要一开始选择整盘。
+- 文件由员工明确操作后交给 Windows 关联程序打开；请勿打开不可信文件。
+
+企业试点验收
+当前已在 macOS 上执行跨平台引擎测试并跨编译 Windows PE 文件，Windows 真机 UI、目录权限、中文长路径、DPI、多显示器、SmartScreen/杀软兼容性仍需试点验收。
+EXE 尚未企业代码签名，下载渠道或公司安全软件可能提示未知发布者。请由公司 IT 审核哈希并按公司制度签名/分发，不要关闭防护或绕过策略。
+如程序无法启动或索引异常，请保留错误文本、Windows版本、目录类型和截图（不要附敏感文件正文）。
+
+离线包包含
+OilFindIntranet.exe      原生桌面客户端
+oilfind-cli.exe         诊断 CLI（默认只查缓存；扫描必须显式 -scan -root）
+LICENSE                 上游 MIT 许可
+THIRD_PARTY_NOTICES.txt  开源拼音及 Go 运行时许可
+USAGE.txt               本说明
+
+CLI 示例（管理员/研发，仅对显式授权的目录操作）
+oilfind-cli.exe -scan -root "D:\Work" -query "ext:pdf" -limit 100
+oilfind-cli.exe -query "baogao"
+
+源码位置
+项目 windows/ 子目录；原 Mac 源码未被覆盖。
+Windows 版重新实现了本地遍历/搜索与 Win32 界面，沿用上游公开功能和语法设计，不是把 Swift/AppKit 直接编译成 Windows。
+开发者构建需要 Go 1.24+ 和 Python 3（仅用于生成嵌入 manifest），运行端不需要。

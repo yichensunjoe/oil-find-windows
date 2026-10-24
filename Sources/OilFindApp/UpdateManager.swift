@@ -30,8 +30,15 @@ final class UpdateManager: ObservableObject {
     private var started = false
     private var readyToRelaunch = false
     var preventsTermination: Bool { state.installing && !readyToRelaunch }
+    static var onlineUpdatesAllowed: Bool {
+        #if OILFIND_INTRANET_BUILD
+        return false
+        #else
+        return true
+        #endif
+    }
     var canCheck: Bool {
-        #if DEBUG
+        #if DEBUG || OILFIND_INTRANET_BUILD
         return false
         #else
         return !state.busy
@@ -40,10 +47,10 @@ final class UpdateManager: ObservableObject {
     init(snapshot: Bool = false, preferences: UpdatePreferences = UpdatePreferences(), current: UpdateVersion = UpdateManager.current) {
         self.snapshot = snapshot; self.preferences = preferences
         runningVersion = current
-        automatic = snapshot ? true : preferences.automatic
+        automatic = Self.onlineUpdatesAllowed && (snapshot ? true : preferences.automatic)
     }
     func start() {
-        #if !DEBUG
+        #if !DEBUG && !OILFIND_INTRANET_BUILD
         started = true; schedule(delay: 30)
         #endif
     }
@@ -56,7 +63,7 @@ final class UpdateManager: ObservableObject {
         }
     }
     func check(manual: Bool = true) {
-        #if !DEBUG
+        #if !DEBUG && !OILFIND_INTRANET_BUILD
         guard !snapshot, !state.busy else { return }
         setState(.checking)
         Task { @MainActor in
@@ -88,7 +95,7 @@ final class UpdateManager: ObservableObject {
         self.manifest = nil; setState(.idle); dismiss()
     }
     func install() {
-        #if !DEBUG
+        #if !DEBUG && !OILFIND_INTRANET_BUILD
         guard let manifest, !state.busy, !snapshot else { return }
         readyToRelaunch = false
         setState(.downloading(0))
@@ -121,7 +128,10 @@ final class UpdateManager: ObservableObject {
         }
         #endif
     }
-    func openWebsite() { NSWorkspace.shared.open(URL(string: "https://find.oiloil.org")!) }
+    func openWebsite() {
+        guard Self.onlineUpdatesAllowed else { return }
+        NSWorkspace.shared.open(URL(string: "https://find.oiloil.org")!)
+    }
     func reportLaunchFailure(_ failure: UpdateFailure) { setState(.failed(failure)); present() }
     private func setState(_ value: UpdateState) { state = value; onChange?() }
     var menuTitle: String {

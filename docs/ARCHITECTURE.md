@@ -1,5 +1,59 @@
 # Oil Find 架构
 
+## Windows 客户端（P088 第二阶段，2026-10-24）
+
+### 方案概述
+
+上游 macOS 实现依赖 AppKit/FSEvents/Apple 芯片 NEON，无法编译到 Windows。Windows 版是**独立平台实现**，复用上游公开搜索语法与产品边界，不复制闭源 Pro，也不把 Swift 硬塞进 Windows。
+
+### 组件与边界
+
+- `windows/internal/index`：Go 索引与查询。`Scan` 并行/串行遍历用户显式选择的本机根，只取 name/path/size/mtime；`Index` 为只读快照（SoA 未沿用，改用结构体切片 + 预计算小写/拼音键）；`SearchFiltered` 在解析后的 OR 组之外施加 UI 类别过滤；`SaveContext`/`Load` 原子 JSON 缓存并做版本、条数、体积、链接校验。
+- `windows/internal/ui`：Win32 原生界面（user32/comctl32/shell32）。UI 线程 `runtime.LockOSThread` + 消息循环；扫描/搜索在 goroutine，通过 channel + `PostMessage(WM_APP)` 回到 UI 线程，所有控件状态只在 UI 线程读写；generation 号防止过期结果覆盖。
+- `windows/cmd/oilfind`：GUI 入口；`cmd/oilfind-cli`：诊断/批量查询入口，扫描必须显式 `-scan -root`。
+- `windows/scripts`：`build.sh`/`build.ps1` 构建与测试；`make-resource.py` 生成内嵌 manifest 的 COFF；`verify-pe.py` 校验 PE 架构、GUI 子系统与 manifest 内容。
+
+### 数据流
+
+用户选择目录 → 配置 JSON（`%APPDATA%\OilFindIntranet`）→ 显式“开始索引” → 后台遍历（跳过 reparse/系统/依赖/私人目录）→ 完成快照 → 原子写缓存 → UI 展示计数 → 搜索框去抖 250ms → 单 worker 合并最新请求 → `SearchFiltered` → 结果列表（2000 条上限 + 总命中）。用户启动索引后每 30 秒重新快照；停止即取消并暂停同步。
+
+### 外部依赖与安全边界
+
+- 唯一第三方库 `github.com/mozillazg/go-pinyin`（MIT）；GUI 全部走系统 DLL，无 WebView、无 HTTP 客户端、无遥测。
+- 只读元数据；无删除/移动/重命名入口；打开/定位前校验仍在当前范围、非重解析点、实际路径为本机卷。
+- 拒绝 UNC、设备路径、网络映射盘；配置目录若被重定向到网络则降级为仅内存。
+- 缓存文件拒绝 symlink/reparse，加载时校验版本、条数上限与体积上限。
+
+### 关键取舍
+
+- 首版用定期全量快照，不用 NTFS USN：实现简单、可解释、无管理员权限；代价是大目录重扫开销与秒级延迟。后续可加 USN 增量，但必须先保留现有取消/原子提交语义。
+- 索引常驻内存（每条含路径/名称/拼音键），上限 200 万条；未做磁盘 mmap，内存占用高于上游 SoA。
+- UI 用原生控件而非 WebView：离线、体积小、无浏览器内核依赖；代价是布局与 DPI 需手工处理。
+
+以下保留上游 macOS 架构参考。
+
+## P088 内网开源分支（2026-10-24）
+
+### 方案概述与组件边界
+
+保留上游 macOS 原生桌面客户端与本机内存索引，不改索引不变量。`COilFind` 批量扫描/匹配，`OilFindCore` 管理扫描、SoA 索引、查询与 FSEvents，`OilFindApp` 提供原生界面，`OilFind` 仅调用 `Application.run()`。
+
+### 数据流与外部依赖
+
+文件元信息 → 本机扫描器 → 内存索引/本机缓存 → 查询解析与匹配 → 原生结果 UI。桌面应用只有 Apple 系统框架，无外部 Swift 包；未提供中央索引、用户认证、共享权限过滤或网络卷支持。公开 AI 话题子系统能读取本机对话，公司部署前需明确是否关闭或移除。
+
+### 本分支覆盖上游的取舍
+
+- `Package.swift` 已移除 Pro 目录自动发现与私有 target，永久只构建公开部分。
+- 应用库固定定义 `OILFIND_INTRANET_BUILD`；应用在线检查、下载、安装和更新官网跳转编译期关闭。`OilFindCore/Update/` 保留为来源参考，不表示存在公司更新服务。
+- 中性 `ApplicationExtension` 保留但没有 Pro 实现。
+- `site/` 是营销官网/静态演示及支付授权接口，仅留作来源参考，不是内网搜索服务，也不部署。
+- `scripts/package.sh` 改为本分支离线包，不要求私有仓库、不发布至官网；应用包携带 MIT 许可证。
+- Bundle ID、名称、快捷键和缓存路径暂沿用上游，安装前必须隔离，避免原版冲突。
+- 测试使用默认 debug 模式，因为上游 UI 测试依赖 DEBUG-only helper；应用正式编译单独执行 release build。安全测试白名单只访问临时样例，`CI=true` 并非安全沙箱。
+
+以下保留上游架构参考；其中 Pro 条件构建与上游更新描述不再适用于本分支。
+
 ## 目标
 
 | 维度 | 要求 |

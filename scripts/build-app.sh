@@ -18,6 +18,7 @@ if [[ "$CONFIGURATION" == release ]]; then
     strip -S "$APP_PATH/Contents/MacOS/OilFind"
 fi
 cp "Resources/Info.plist" "$APP_PATH/Contents/Info.plist"
+cp "LICENSE" "$APP_PATH/Contents/Resources/LICENSE"
 if [[ -f "Resources/AppIcon.icns" ]]; then
     cp "Resources/AppIcon.icns" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi

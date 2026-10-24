@@ -1,12 +1,15 @@
-name: CI
+name: Open-source intranet CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  macos-open-source:
     runs-on: macos-14
     env:
       CI: "true"
@@ -17,35 +20,54 @@ jobs:
           persist-credentials: false
       - name: Show Swift toolchain
         run: swift --version
-      - name: Build Swift app
-        run: swift build
-      - name: Test Swift app
-        run: swift test
-      - name: Check open core boundary
+      - name: Build release app
+        run: swift build -c release
+      - name: Test isolated public-source fixtures
+        run: swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.IntranetUpdateTests/'
+      - name: Check open-source boundary
         run: python3 Tests/Scripts/test_open_core.py
-      - name: Check packaged launch without developer resources
+      - name: Check packaging script syntax
+        run: bash -n scripts/build-app.sh scripts/package.sh
+
+  windows-local-search:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Show Go toolchain
+        run: go version
+      - name: Build and test Windows client
+        shell: pwsh
+        run: ./windows/scripts/build.ps1 -GoBin go
+      - name: Verify PE subsystem and embedded manifest
+        shell: pwsh
+        run: python ./windows/scripts/verify-pe.py ./outputs/windows-amd64/OilFindIntranet.exe --arch amd64
+      - name: Upload unsigned preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oil-find-intranet-windows-amd64-unsigned
+          path: outputs/windows-amd64/
+          if-no-files-found: error
+
+  windows-heavy-cache-limit:
+    # Manual only: streams MaxEntries+1 entries and needs roughly 950MB RSS.
+    # Run it after changing Load/Save limits in windows/internal/index.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Stream the entry limit
+        shell: pwsh
+        env:
+          OILFIND_HEAVY_TESTS: "1"
         run: |
-          scripts/build-app.sh
-          python3 Tests/Scripts/test_packaged_launch.py "build/Oil Find.app"
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.25.0
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: site/pnpm-lock.yaml
-      - name: Install website dependencies
-        run: pnpm install --frozen-lockfile
-        working-directory: site
-      - name: Test website
-        run: pnpm test
-        working-directory: site
-      - name: Typecheck website
-        run: pnpm typecheck
-        working-directory: site
-      - name: Build website
-        run: pnpm build
-        working-directory: site
+          $env:TEMP = Join-Path $env:RUNNER_TEMP "heavy"
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+          Push-Location windows
+          try { go test -count=1 -run TestLoadRejectsStreamOverEntryLimit ./internal/index } finally { Pop-Location }

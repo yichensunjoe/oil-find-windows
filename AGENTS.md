@@ -1,57 +1,76 @@
-# Oil Find
+# AGENTS.md — P088-oil-find-intranet 项目级规则
 
-免费开源的 macOS 原生文件搜索工具（苹果版的 Everything），按 ⇧⌘F 唤起搜索面板。架构与索引不变量见 `docs/ARCHITECTURE.md`。
+本项目继承工作区根 `../../../AGENTS.md` 的共享安全、授权和现场保护底线；单独克隆时以本文件为准。
 
-## 目录
+## 会话开始
 
-- `Sources/COilFind/`：C 批量目录读取、名称比较与搜索评分。
-- `Sources/OilFindCore/`：扫描、索引、查询、实时更新、持久化和应用更新。
-- `Sources/OilFindApp/`：AppKit 应用库与 SwiftUI 设置；免费界面文案集中在 `L10n.swift`，中性扩展点为 `ApplicationExtension`。
-- `Sources/OilFind/main.swift`：可执行应用的组装入口。
-- `Sources/oilfind-cli/`：命令行验证工具。
-- `Tests/`：核心引擎、应用界面与脚本测试。
-- `Resources/`：应用元数据和图标。
-- `scripts/`：构建、打包、安装与卸载。
-- `site/`：Next.js App Router 官网、搜索演示、更新日志与静态更新清单。
+1. 接力或实质修改读取 `HANDOFF.md` 当前状态及相关实现；简单问答不全读历史。
+2. 经验按 `REUSE_AND_PITFALL_LOG.md` 的索引/主题读取，已读未变内容不重复加载。
+3. 用户本轮要求建立开源改造底座，不代表已授权部署、推送、安装或扫描真实个人/公司文件。
 
-## 构建与测试
+## 项目约束
 
-部署目标 macOS 14，面向 Apple 芯片。
+- 来源：`https://github.com/oil-oil/oil-find`，基线 `e63c7150ccbd401a1375c08215d1386b56dd9471`（1.7.1）。保留完整历史、MIT 许可证和原作者声明。
+- 两个平台入口并存，共享同一公开功能边界：
+  - macOS：`Sources/` + `Package.swift`，Swift 5 语言模式 / SwiftPM 5.10+、AppKit、SwiftUI、C；Apple 芯片，macOS 14+；无第三方 Swift 包。
+  - Windows：`windows/`，Go 1.24+、原生 Win32（user32/comctl32/shell32）；唯一第三方库 `github.com/mozillazg/go-pinyin`（MIT）。仅 Windows 10/11 x64。
+- 永久只构建公开模块；不要恢复私有 target 自动检测，不导入 Pro，也不下载或分发上游含 Pro 的安装包。
+- `OILFIND_INTRANET_BUILD` 固定用于 macOS 应用库；在线更新检查、下载安装、更新官网跳转均禁用，管理员自行分发。Windows 版不实现任何在线更新/遥测。
+- 保留中性 `ApplicationExtension`，不要把它误当 Pro 实现。上游官网 `site/` 仅作来源参考，不安装/部署其支付、授权或分析服务。
+- macOS 热路径保持 Unsafe 指针 / SoA 设计；代码注释用英文；界面文案维护 `L10n.swift` 的中英文对应项。
+- Windows 版硬边界：只读元数据（不读正文）；无删除/移动/重命名入口；默认不扫描任何目录，必须用户显式选择范围并点击开始索引；跳过 reparse/symlink、系统/AppData/依赖/私人运行器目录；拒绝 UNC、设备路径与网络映射盘；缓存/配置在 `%APPDATA%\OilFindIntranet`，缓存不得是链接。
+- Windows 版首版只做本机搜索：不支持 SMB/NAS 共享盘、多人服务、正文检索。改变平台或共享索引架构先确认用户需求。
+- 现有 Bundle ID、数据路径和全局快捷键仍与上游一致，安装前必须进行隔离改造；不得覆盖已有 Oil Find。
+
+## 构建与必要验证
 
 ```sh
 swift build -c release
-swift test
-python3 Tests/Scripts/test_uninstall.py
+CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.IntranetUpdateTests/'
 python3 Tests/Scripts/test_open_core.py
-scripts/build-app.sh
+bash -n scripts/build-app.sh scripts/package.sh
+```
+
+工作区执行 Python 时使用已配置的托管 Python 绝对路径。
+`CI=true` 不是安全沙箱；不直接运行全量测试。部分上游测试会读写真实 Desktop、访问本地 AI 会话缓存或挂载卷。白名单仅使用临时样例或内存数据；更大测试集先审查副作用。
+
+```sh
+scripts/build-app.sh          # builds build/Oil Find.app; does not install
 scripts/build-app.sh --debug
-scripts/package.sh
+scripts/package.sh            # archives this fork only; no upstream publication
 ```
 
-`Pro/` 是工作区内可选的独立私有仓库，不属于本公开仓库，由 `/Pro/` 忽略规则排除。缺少私有模块时构建免费版；本机存在私有模块时可强制验证免费版：
+构建签名可访问钥匙串，不能不经确认生成证书、安装应用或运行全盘扫描。官网不是应用构建依赖，无需安装 pnpm / Stripe 等依赖。
+
+Windows（在 `windows/` 下；缓存必须用项目内绝对路径，避免污染用户环境）：
 
 ```sh
-OILFIND_FREE=1 swift build
-OILFIND_FREE=1 swift test --filter '<受影响的测试>'
+P=$(cd .. && pwd)
+GOCACHE=$P/outputs/go-cache GOPATH=$P/outputs/go-path GOMODCACHE=$P/outputs/go-mod-cache \
+  go test ./...
+bash scripts/build.sh /path/to/go            # 交叉编译到 outputs/windows-amd64
+python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFindIntranet.exe --arch amd64
 ```
 
-官网使用 Node.js 22 与 pnpm：
+- Windows 上 `t.TempDir()` 默认落在 `%LOCALAPPDATA%\Temp`，会被引擎的 AppData 安全排除拒绝；构建脚本在跑测试时把 `TEMP/TMP` 指向 `outputs/test-tmp`，不要为此放宽引擎排除。
+- manifest 由 `scripts/make-resource.py` 生成 `.syso` 后嵌入（`.syso` 已忽略），不要交付外置 manifest 冒充已嵌入。
+- 不启动 GUI 做“验证”（开发机为 macOS 时无 Windows 运行环境）；Windows 真机 UI/DPI/权限/SmartScreen 属人工验收项，未验收不得声称可交付。
+- `TestLoadRejectsStreamOverEntryLimit` 默认跳过（需 `OILFIND_HEAVY_TESTS=1`，约 950MB RSS）；它是唯一覆盖“流式解码在 200 万条处截断”的用例，改动 Load 限额逻辑时应手动跑一次。
 
-```sh
-cd site
-pnpm install --frozen-lockfile
-pnpm dev
-pnpm test
-pnpm build
-```
+## 复用与踩坑日志（双写）
 
-## 约定
+- 项目内明细写入 `REUSE_AND_PITFALL_LOG.md`，最新记录置顶。
+- 有跨项目价值的结论同步到工作区根 `../../../REUSE_AND_PITFALL_LOG.md` 并注明 P088；单独克隆时先保留项目内记录。
+- 总库暂时不可写时标明待同步；不记录密钥、个人数据或无复用价值的一次性操作。
 
-- 应用使用 Swift 5 语言模式与一个 C target，只用系统框架，不引入第三方包。
-- 公开应用库与核心不得依赖私有模块，只通过中性的 `ApplicationExtension` 接入。仅 `Package.swift` 和 `Sources/OilFind/main.swift` 可提及私有 target，分别用于条件构建与组装；入口不解析私有功能状态或参数。扩展提供启动、退出、设置分区、URL、语言接口，DEBUG 下可预处理并移除自身参数。
-- 扫描、搜索、事件处理热路径使用 Unsafe 指针和 SoA 布局，不创建 String，不逐项堆分配。
-- 代码注释用英文。修改界面文案时维护 `L10n.swift` 中的中英文对应项。
-- 索引文件只保留一份，临时文件用完即删。没有完全磁盘访问权限时静默跳过 EPERM 目录。
-- 界面验证使用调试版 `--snapshot`；正式版不包含该入口。
-- 官网使用 TypeScript、React 和 Next.js，运行时依赖为 `next`、`react`、`react-dom`、`@vercel/analytics`、`stripe`（授权接口用）；npm 与 pnpm 锁文件保持一致。
-- 不提交环境文件、密钥、下载包、索引或构建产物。CI 通过 `CI=true` 跳过时间敏感或依赖本机真实索引的测试，本地照常运行。
+## HANDOFF 交接规则
+
+1. `HANDOFF.md` 当前状态为项目事实源；近期轮次置顶保留历史，每轮不超过 8 行。
+2. 有实质进展更新工作区根 `../../../HANDOFF.md` 中 P088 的一行动态，不覆盖其他项目。
+3. 使用 `YYYY-MM-DD：完成了……；下一步……` 格式，只读任务不制造交接提交。
+
+## Git 与备份
+
+- 独立仓库，分支 `main`；`upstream` 保留来源，仅供拉取，推送地址已禁用。
+- 本轮不创建公司远端、不推送、不发布。自有修改仅本机，尚未异机备份。
+- 密钥、索引、依赖、构建产物、应用安装包、个人会话数据不提交。保留上游历史，不改写已发布提交。
