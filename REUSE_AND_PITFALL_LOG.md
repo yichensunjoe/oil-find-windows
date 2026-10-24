@@ -2,6 +2,17 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
+## 2026-10-24 · Rust 缓存加载器：一个"静默丢字段"的 bug 与两种内存测量口径（Oil Find for Windows）
+
+- 场景：内存优化第二轮（`Entry` 改 `Arc<str>` 共享目录）stash 恢复后 7 个 cache_test 失败，交接记录怀疑是 TempFile 原子替换交互。实际根因：`Entry::with_dir(dir, lower_dir, path, ...)` 被传入**父目录**而非文件路径，`file_name()` 取出目录末段，`stored.name` 被完全丢弃——所有加载条目的名字都变成所在目录名。
+- 教训 1（先看断言再找原因）：7 个失败断言的 left/right 全是"名字=目录名 vs 名字=文件名"，与原子替换无关。大型 debug dump 要先截取（`sed -n`）或对单条用例重跑，别被 300KB 输出淹没后凭印象下结论。
+- 教训 2（构造器参数意义变了=全调用点审查）：把 `with_dir` 从收 `&Path` 改为收 `&str`（名字），scan.rs 与 cache.rs 两个调用点都必须显式传 `file_name()`/`stored.name`；这类重构先 `grep` 全部调用点，再用真实数据往返验证。
+- 教训 3（峰值 ≠ 稳态）：`/usr/bin/time -l` 只给峰值 RSS。lower_name 零副本优化在峰值上看不出（解码瞬时内存主导），"后台跑 + `ps -o rss=`"才测到稳态 363→324MiB；A/B 对照要临时改回旧实现同机测量，不要信估算。
+- 复用 1（bincode 流式加载）：手工 `Deserialize` + `visit_seq` 按位置读字段；条目经 `DeserializeSeed` 分 8192 条一批，边解码边 `par_iter().map().collect::<Result<Vec<_>,_>>()` 并行转换，loader 不再同时持有解码行与成品索引（省 ~113MB 峰值）。要点：`size_hint` 返回声明长度可预分配；bincode 的 `deserialize_struct` 就是定长位置 seq；声明数超限必须先于 `with_capacity` 拒绝。
+- 复用 2（名字小写快路径）：`lowercases_to_itself()` 逐字符判断 `to_lowercase()` 是否恒等（ASCII 无大写、汉字无大小写都命中）；`Option<Box<str>>` 有空指针 niche 仍占 16B，命中即省一条堆字符串。实测 89.6% 条目命中。
+- 验证：72 测试 + clippy `-D warnings` + fmt + msvc target check；旧缓存（重构前代码写入）加载结果一致；全量扫描 1,532,419 条后端到端查询正确。
+- 适用边界：任何"解码→转换"两阶段且数据量大的加载路径；serde/bincode 位置格式的手动 Visitor 改造。
+
 ## 2026-10-24 · Go→Rust 重写：四个只在真实 Windows 上暴露的坑（Oil Find for Windows）
 
 - 场景：把已跑通的 Go + Win32 客户端重写为 Rust（windows-sys 原生控件），开发机是 macOS，只能靠 `cargo check --target x86_64-pc-windows-msvc` 与 GitHub Actions 的 windows-latest 验证。

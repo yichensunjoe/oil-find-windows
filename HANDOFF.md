@@ -2,18 +2,13 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-24 14:25，分支 `rust`）
+## 当前状态（2026-10-24 21:00，分支 `rust`）
 
-- **Go 版保留**：`main` 分支完整保留 Go 实现，标签 `v0.1-go`；回退 `git checkout main`。
-- **Rust 版已跑通**：`rust` 分支（6 个提交）删除 `windows/`（Go），新增 `rust/` cargo workspace：`oilfind-core`（扫描/索引/查询/缓存）、`oilfind-win`（Win32 UI）、`oilfind-cli`。`Sources/`（macOS Swift）保留，仅本机验收。
-- **CI 三平台全绿**（run 40074469573）：ubuntu 上 fmt/clippy/test，windows-latest 上打包 + PE 校验 + 产物，macos-latest 上构建打包 `Oil Find Rust.app`。
-- **性能优化（实测，$HOME + /Applications，1,506,961 条）**：扫描 2m13s → **25s**；JSON 缓存 305MB → 二进制 65MB；加载 1.5s → 0.72s；查询「报告」命中 149 条。实现：rayon 并行遍历子目录、二进制缓存（magic OILF1 + bincode，仍能读旧 JSON）。
-- **未解决**：常驻内存仍约 900MB（Entry 每条存 path/name/lower_path/pinyin 四个字符串），是下一个优化点。
-- **本地已验证**：`cargo test --workspace` 60 项通过；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、拼音 xmwd/hyjy、空引号报错）。
-- **与 Go 版的有意差异**：缓存仍是 JSON（可读 Go 版缓存），文件改名 `index.json`；`dm:` 改用**本地时区**（Go 版是 UTC，凌晨会差一天）；`appdata` 规则真正生效（Go 版实际未命中）；新增 `chrono` 依赖处理时区。
+- **内存优化第二轮完成**：恢复 stash 后 7 个 cache_test 失败，根因是加载侧把父目录传给 `Entry::with_dir`，`stored.name` 被丢弃（加载条目名字全部变成目录末段）；`with_dir` 改为直接收名字，20/20 通过。叠加 lower_name 零副本快路径与二进制缓存分批流式转换，提交 `24a90aa`。
+- **实测**（$HOME + /Applications，1,532,419 条）：加载峰值 RSS 786MB → **272MB**；稳态 ~261MiB；扫描峰值 ~360MiB（此前 402MiB）；缓存 69.9MB；加载 ~0.6s、扫描 ~7.2s（热缓存）。
+- **本地已验证**：`cargo test --workspace` 72 项通过；clippy `-D warnings` 干净；fmt 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；全量扫描 + 加载 + 查询端到端正确（报告 149 条 / 会议纪要 ext:docx 52 条）；旧缓存（stash 前代码写入）仍可正确加载。
 - **未验证**：Windows 真机 UI 交互、DPI/多显示器、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。
 - **仓库**：公开 https://github.com/yichensunjoe/oil-find-windows （默认分支仍是 `main`＝Go 版）。
-- 下一步：真机验收 → 通过后把 `rust` 合入 `main` 并切换默认分支 → 再补图标/USN 增量。
 
 ## 历史状态（2026-10-24 11:55，Go 版，已冻结在 `main`）
 
@@ -31,6 +26,7 @@
 
 ## 近期轮次（最新在上，保留全部）
 
+- 2026-10-24（第四轮）：恢复第二轮 stash 后定位 7 个 cache_test 失败根因——加载侧丢弃 `stored.name`（传给 `with_dir` 的是父目录而非名字），非 TempFile 交互；修复后叠加 lower_name 零副本快路径（89.6% 条目命中）与二进制缓存 8192 条/批流式转换。实测加载峰值 786MB → 272MB、稳态 ~261MiB、扫描峰值 ~360MiB；72 测试 + clippy + fmt + msvc 检查全绿，旧缓存兼容。提交 `24a90aa`，未推真机验收。
 - 2026-10-24（第三轮）：派独立 agent 只读审查约 2200 行生产代码；无阻断缺陷，但确认 3 项 HIGH（长路径、黑名单过宽、GC 指针）与 7 项 MEDIUM/LOW，已全部修复并补回归；双架构重新打包与 PE 校验通过。真机项仍未验收。
 - 2026-10-24（第二轮）：完成 Windows 本机文件搜索客户端与离线包；97 用例 + race + vet + PE 校验通过；缓存提交改为可取消（SaveContext），保存失败保留旧索引；引擎加固 Load 流式限额 / Save 体积上限 / CLI 取消不提交；README、AGENTS、需求/架构/任务、CI 同步双平台。未在 Windows 真机运行。
 - 2026-10-24（第一轮）：完成公开源码克隆、纯开源构建/更新边界、macOS 离线打包与项目治理；release 编译及 30+2 项隔离测试通过。未安装/部署，未扫描真实文件，未获取 Pro。
@@ -44,32 +40,12 @@
 
 ---
 
-## 下一步（内存优化第二轮，接续点）
+## 下一步（真机验收优先，内存第三轮可选）
 
-**现状**：HEAD = `96943af`，工作区干净，65 测试 / clippy 0 / fmt 干净，三平台 CI 绿。
-内存仍约 786MB（1.5M 条目）。第一轮（去掉 name/lower_name 冗余字符串）已落地并推送。
+**真机验收（最高优先级）**：在 Windows 10/11 上按 `rust/USAGE.txt` 实测：UI 交互、DPI/多显示器、目录选择对话框、打开/定位/复制路径、ACL 拒绝目录、取消扫描、SmartScreen 行为。EXE 未签名，需确认签名/分发方式。通过后再把 `rust` 合入 `main` 并切换默认分支，最后补图标 / NTFS USN 增量。
 
-**未完成的改动在 `git stash list` 的 `stash@{0}`**（`WIP on rust: 96943af`），
-`git stash show -p` 可看全部 diff，`git stash pop` 恢复。内容是第二轮尝试：
-`Entry` 改存 `dir: Arc<str>` + `lower_dir: Arc<str>`，扫描侧用 `DirCache` 内联，
-缓存加载侧用文档自带的目录表共享，排序改用 `entry::compare_entries`。
-扫描路径实测 RSS 786MB → 691MB（-12%），但**加载侧改完 cache_test 挂 7 个用例**，
-原因未定位，已回退。
+**内存第三轮（可选，按预期收益排序）**：
+1. 扫描侧 `entries` Vec 倍增扩容：1.53M 条目最终容量 2M × 80B ≈ 167MB，是扫描峰值（~360MiB）高于加载峰值（259MiB）的主因；可按上次条目数预置容量，或接受现状。
+2. `dir`/`lower_dir` 两个 `Arc<str>`（16B/条目）合并为单个共享结构，约省 12MB 稳态；收益递减，谨慎评估。
 
-**新会话第一件事**：`git stash pop` 后只跑 `cargo test -p oilfind-core --test cache_test`，
-重点看这几个用例为何失败（断言指向"旧缓存被删/内容变化"，怀疑与 TempFile 原子替换交互有关，
-不是 Entry 结构本身）：
-- cache_cancelled_save_preserves_the_previous_index
-- cache_failed_save_preserves_the_previous_index
-- cache_rewrites_a_legacy_json_document_as_binary
-- 以及 cache_save_validates_entries_and_roots / cache_rejects_corruption_and_incompatible_versions
-  （这两个与 `validate_entry` 改成按 dir+name 校验有关：空 path 的夹具现在靠 `dir.is_empty()` 拒绝）
-
-**再往下的两个方向**（按预期收益排序）：
-1. `lower_name` 改为从 `lower_dir` 末段切（O(1) 零分配，省一条字符串/条目）
-2. 缓存加载侧共享目录（ stash 里已有雏形，修好测试即可）
-
-**验收口径**（每次改完都跑）：
-`cargo test --workspace` + `clippy -D warnings` + `fmt --check`，
-然后 `/usr/bin/time -l ./target/release/oilfind-cli -cache <cache> -query 报告 -limit 3` 看 peak RSS，
-扫描用 `-scan -root "$HOME" -root /Applications`。基线：1,519,199 条 / 25s / 66MB / 786MB。
+**验收口径**（每次改完都跑）：`cargo test --workspace` + `clippy -D warnings` + `fmt --check`，然后 `/usr/bin/time -l ./target/release/oilfind-cli -cache <cache> -query 报告 -limit 3` 看 peak RSS，扫描用 `-scan -root "$HOME" -root /Applications`。新基线：1,532,419 条 / 7.2s / 69.9MB / 加载峰值 272MB、扫描峰值 ~360MiB、稳态 ~261MiB。
