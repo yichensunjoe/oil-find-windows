@@ -1,5 +1,7 @@
 # P088-oil-find-intranet
 
+[![Windows CI](https://github.com/yichensunjoe/oil-find-intranet/actions/workflows/ci.yml/badge.svg)](https://github.com/yichensunjoe/oil-find-intranet/actions/workflows/ci.yml)
+
 ## 用途
 
 基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 公开源码建立的企业内部内网改造项目。仅使用 MIT 开源部分，不包含、不加载上游未开源 Pro 模块。
@@ -11,7 +13,7 @@
 
 ## 状态
 
-2026-10-24：macOS 分支已固定开源构建并禁用上游在线更新；Windows 客户端首版（本机文件名/拼音搜索）源码与测试完成，待 Windows 真机验收。详见 `HANDOFF.md`。
+2026-10-24：macOS 分支已固定开源构建并禁用上游在线更新；Windows 客户端首版（本机文件名/拼音搜索）源码与测试完成，CI 在 Windows runner 上通过（测试 + 打包 + PE 校验 + 产物上传），待 Windows 真机交互验收。详见 `HANDOFF.md`。
 
 ## 技术栈
 
@@ -65,6 +67,8 @@ python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFindIntranet.exe --arch
 ```
 
 Windows 真机仍需验收：目录选择、列表双击/定位/剪贴板、不同 DPI 与多显示器、ACL 拒绝、取消与重启、SmartScreen/杀软与代码签名。当前 EXE 未签名。
+
+CI 只跑 Windows（`.github/workflows/ci.yml`）：`windows-latest` 上执行测试、打包、PE 校验并上传未签名产物；`heavy-cache-limit` 为手动触发的重负载检查。macOS 侧验证需在本地按上面的 Swift 命令执行。
 
 ## 命令
 
