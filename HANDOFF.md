@@ -8,7 +8,7 @@
 - **UI 体验升级完成**（提交 `64c928d`）：结果列表表头点击排序（▲▼ 指示，无箭头=相关度序）、扫描/加载缓存时底部 indeterminate 进度条、空状态引导文案（无索引/空索引/无匹配三种）、标题栏显示条目数（千分位）、Ctrl+C 复制路径、结果列表右键菜单（打开/定位/复制，右键先选中命中项）、“开始索引”设为默认按钮。USAGE.txt 已补“界面操作”说明。
 - **实测**（$HOME + /Applications，1.57M 条）：加载峰值 RSS 786MB → **239MB**；稳态 ~228MiB；扫描峰值 ~341MiB（最初 402MiB）；缓存 ~70MB；加载 ~0.5s、扫描 ~7.9s（热缓存）。
 - **本地已验证**：`cargo test --workspace` 77 项通过；clippy `-D warnings` 干净；fmt 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；全量扫描 + 加载 + 查询端到端正确（报告 149 条 / 会议纪要 ext:docx 52 条）；旧缓存（多轮前代码写入）仍可正确加载。
-- **CI 三平台全绿**（run 40099275430，覆盖内存与 UI 改动）：ubuntu fmt/clippy/test、macOS 构建测试、Windows x64 构建测试打包 + PE/manifest 校验 + 未签名产物。
+- **CI 三平台全绿**（run 40099275430 覆盖内存与 UI 改动；run 40101140033 覆盖 SharedDir 第三轮）：ubuntu fmt/clippy/test、macOS 构建测试、Windows x64 构建测试打包 + PE/manifest 校验 + 未签名产物。
 - **未验证**：Windows 真机 UI 交互（含排序/进度条/空状态/右键菜单/DPI）、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。
 - **仓库**：公开 https://github.com/yichensunjoe/oil-find-windows （默认分支仍是 `main`＝Go 版）。
 
