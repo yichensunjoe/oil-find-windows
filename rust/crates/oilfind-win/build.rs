@@ -22,7 +22,10 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let script = out_dir.join("app.rc");
-    let contents = format!("1 24 \"{}\"\n", manifest.display());
+    // rc.exe treats backslashes in a string literal as escapes, so a Windows
+    // path must be written with forward slashes (or doubled backslashes).
+    let manifest_path = manifest.display().to_string().replace('\\', "/");
+    let contents = format!("1 24 \"{manifest_path}\"\n");
     if let Err(err) = fs::write(&script, contents) {
         println!("cargo:warning=无法生成资源脚本：{err}");
         return;
