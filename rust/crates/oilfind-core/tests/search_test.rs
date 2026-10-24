@@ -329,10 +329,10 @@ fn ranking_prefers_exact_then_prefix_then_substring() {
         Entry::new(root.join("a/report"), "report".to_string(), 1, 0, false),
     ];
     let expected = vec![
-        entries[3].path.clone(),
-        entries[1].path.clone(),
-        entries[2].path.clone(),
-        entries[0].path.clone(),
+        entries[3].path(),
+        entries[1].path(),
+        entries[2].path(),
+        entries[0].path(),
     ];
     let index = Index {
         entries,
@@ -342,7 +342,7 @@ fn ranking_prefers_exact_then_prefix_then_substring() {
     for _ in 0..3 {
         let (results, total) = index.search("report", None, 100).expect("search");
         assert_eq!(total, expected.len());
-        let paths: Vec<_> = results.iter().map(|entry| entry.path.clone()).collect();
+        let paths: Vec<_> = results.iter().map(|entry| entry.path()).collect();
         assert_eq!(paths, expected);
     }
 }

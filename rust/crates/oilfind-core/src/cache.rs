@@ -20,7 +20,9 @@
 //!
 //! Reads are streamed and bounded: the entry count declared by the file is
 //! rejected before anything is allocated, every entry is validated on the way
-//! in, and the reader is capped at [`MAX_CACHE_BYTES`]. Writes go to a sibling
+//! in, and the reader is capped at [`MAX_CACHE_BYTES`]. Binary entries are
+//! decoded in batches and converted while the next batch is read, so the
+//! loader never holds a second copy of every name. Writes go to a sibling
 //! temporary file, are size-capped while encoding, fsynced and then atomically
 //! renamed, so a failed or cancelled save always leaves the previous cache
 //! untouched.
@@ -32,7 +34,7 @@ use crate::scan::{MAX_ENTRIES, MAX_ROOTS};
 use crate::time;
 use bincode::Options;
 use rayon::prelude::*;
-use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,6 +43,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hard ceiling on the cache file size.
@@ -166,11 +169,11 @@ impl Index {
     ///
     /// Paths under one directory share a long prefix; storing that prefix once
     /// is what makes the binary cache roughly a quarter of the JSON one.
-    fn directory_table(&self) -> (Vec<&Path>, HashMap<&Path, u32>) {
-        let mut index: HashMap<&Path, u32> = HashMap::with_capacity(self.entries.len() / 8);
-        let mut directories: Vec<&Path> = Vec::new();
+    fn directory_table(&self) -> (Vec<&str>, HashMap<&str, u32>) {
+        let mut index: HashMap<&str, u32> = HashMap::with_capacity(self.entries.len() / 8);
+        let mut directories: Vec<&str> = Vec::new();
         for entry in &self.entries {
-            let parent = entry.path.parent().unwrap_or_else(|| Path::new(""));
+            let parent = entry.dir();
             index.entry(parent).or_insert_with(|| {
                 directories.push(parent);
                 // Entries are capped at MAX_ENTRIES, well below u32::MAX.
@@ -208,7 +211,7 @@ struct BinaryCacheRef<'a> {
     version: u32,
     roots: &'a [PathBuf],
     built_at: i64,
-    directories: &'a [&'a Path],
+    directories: &'a [&'a str],
     entries: EntriesRef<'a>,
 }
 
@@ -218,15 +221,14 @@ struct BinaryCacheRef<'a> {
 /// the index in memory.
 struct EntriesRef<'a> {
     entries: &'a [Entry],
-    index: &'a HashMap<&'a Path, u32>,
+    index: &'a HashMap<&'a str, u32>,
 }
 
 impl Serialize for EntriesRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.entries.len()))?;
         for entry in self.entries {
-            let parent = entry.path.parent().unwrap_or_else(|| Path::new(""));
-            let directory = self.index.get(parent).copied().unwrap_or_default();
+            let directory = self.index.get(entry.dir()).copied().unwrap_or_default();
             seq.serialize_element(&BinaryEntry {
                 directory,
                 name: entry.name(),
@@ -248,17 +250,80 @@ struct BinaryEntry<'a> {
     is_dir: bool,
 }
 
-/// Binary document read back from disk. Field order must match
-/// [`BinaryCacheRef`] and [`StoredEntry`]: bincode is positional.
-#[derive(Deserialize)]
+/// Binary document read back from disk.
+///
+/// The document is decoded field by field instead of deriving [`Deserialize`],
+/// because the entries are streamed: each decoded row becomes an [`Entry`]
+/// while the next one is read, so the loader never holds the decoded rows and
+/// the finished index at the same time. On a 1.5M-entry index that is more
+/// than a hundred megabytes.
+///
+/// The wire layout has five positional fields — `version`, `roots`,
+/// `built_at`, `directories`, `entries` — matching [`BinaryCacheRef`] and
+/// [`StoredEntry`]; only the fields the index still needs are kept.
 struct BinaryCache {
-    version: u32,
     roots: Vec<PathBuf>,
     built_at: i64,
-    #[serde(deserialize_with = "deserialize_directories")]
-    directories: Vec<PathBuf>,
-    #[serde(deserialize_with = "deserialize_entries")]
-    entries: Vec<StoredEntry>,
+    entries: Vec<Entry>,
+}
+
+/// Field names of the wire layout, in order. bincode ignores the names and
+/// reads positionally; only the count matters.
+const BINARY_CACHE_FIELDS: &[&str] = &["version", "roots", "builtAt", "directories", "entries"];
+
+impl<'de> Deserialize<'de> for BinaryCache {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("BinaryCache", BINARY_CACHE_FIELDS, BinaryCacheVisitor)
+    }
+}
+
+struct BinaryCacheVisitor;
+
+impl<'de> Visitor<'de> for BinaryCacheVisitor {
+    type Value = BinaryCache;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a binary oilfind index cache")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<BinaryCache, A::Error> {
+        let version: u32 = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::custom("索引缺少版本号"))?;
+        if version != CACHE_VERSION {
+            return Err(de::Error::custom("索引版本不兼容，请重新索引"));
+        }
+        let roots: Vec<PathBuf> = seq
+            .next_element_seed(RootListSeed)?
+            .ok_or_else(|| de::Error::custom("索引缺少目录列表"))?;
+        let built_at: i64 = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::custom("索引缺少索引时间"))?;
+        let directories: Vec<PathBuf> = seq
+            .next_element_seed(DirectoryListSeed)?
+            .ok_or_else(|| de::Error::custom("索引缺少目录表"))?;
+        // The document carries each directory once; sharing it between the
+        // entries that live there is what keeps a loaded index small.
+        let shared_dirs: Vec<Arc<str>> = directories
+            .iter()
+            .map(|dir| Arc::from(dir.to_string_lossy().as_ref()))
+            .collect();
+        let shared_lower_dirs: Vec<Arc<str>> = directories
+            .iter()
+            .map(|dir| Arc::from(dir.to_string_lossy().to_lowercase().as_ref()))
+            .collect();
+        let entries: Vec<Entry> = seq
+            .next_element_seed(EntriesSeed {
+                shared_dirs: &shared_dirs,
+                shared_lower_dirs: &shared_lower_dirs,
+            })?
+            .ok_or_else(|| de::Error::custom("索引缺少条目列表"))?;
+        Ok(BinaryCache {
+            roots,
+            built_at,
+            entries,
+        })
+    }
 }
 
 /// Same field order as [`BinaryEntry`].
@@ -271,53 +336,135 @@ struct StoredEntry {
     is_dir: bool,
 }
 
-impl BinaryCache {
-    /// Rebuilds the index, rejecting anything the writer would not produce.
-    fn into_index(self) -> Result<Index, Error> {
-        if self.version != CACHE_VERSION {
-            return Err(Error::CacheCorrupt(
-                "索引版本不兼容，请重新索引".to_string(),
-            ));
-        }
-        if self.roots.len() > MAX_ROOTS {
-            return Err(Error::CacheCorrupt("索引目录数量超出上限".to_string()));
-        }
-        for root in &self.roots {
-            validate_root(root).map_err(|_| Error::CacheCorrupt("索引目录损坏".to_string()))?;
-        }
-        // Rebuilding the derived search fields (lowercase + pinyin) costs more
-        // than decoding, and every entry is independent, so it runs on all
-        // cores. The results are written into a pre-sized vector in place:
-        // collecting into a fresh one would hold two copies of every entry at
-        // once, which is a few hundred megabytes on a large index.
-        let directories = self.directories;
-        let mut entries: Vec<Entry> =
-            vec![Entry::new(PathBuf::new(), String::new(), 0, 0, false); self.entries.len()];
-        entries
-            .par_iter_mut()
-            .zip(self.entries.into_par_iter())
-            .try_for_each(|(slot, stored)| -> Result<(), Error> {
-                let directory = directories
-                    .get(stored.directory as usize)
-                    .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
-                let entry = Entry::new(
-                    directory.join(&stored.name),
-                    stored.name,
-                    stored.size,
-                    stored.modified,
-                    stored.is_dir,
-                );
-                validate_entry(&entry)
-                    .map_err(|_| Error::CacheCorrupt("索引条目损坏".to_string()))?;
-                *slot = entry;
-                Ok(())
-            })?;
-        Ok(Index {
-            entries,
-            roots: self.roots,
-            built_at: self.built_at,
+/// Reads the root list, bounded and validated, so a document that declares
+/// more roots than an index may cover is rejected before anything is
+/// allocated for them.
+struct RootListSeed;
+
+impl<'de> DeserializeSeed<'de> for RootListSeed {
+    type Value = Vec<PathBuf>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        bounded_sequence::<D, PathBuf, _>(deserializer, "索引目录", MAX_ROOTS, |root| {
+            validate_root(root).map_err(|_| Error::InvalidRoot)
         })
     }
+}
+
+/// Reads the directory table with the same bounds and validation.
+struct DirectoryListSeed;
+
+impl<'de> DeserializeSeed<'de> for DirectoryListSeed {
+    type Value = Vec<PathBuf>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        bounded_sequence::<D, PathBuf, _>(deserializer, "索引目录", MAX_ENTRIES, |root| {
+            validate_root(root).map_err(|_| Error::InvalidRoot)
+        })
+    }
+}
+
+/// Rows decoded per batch: large enough that the per-batch hand-off to the
+/// worker pool disappears, small enough that a batch stays in cache.
+const ENTRY_BATCH: usize = 8192;
+
+/// Streams the entries of a binary document into the index.
+///
+/// Every batch of decoded rows is converted into finished entries on all
+/// cores — rebuilding the derived search fields is the expensive part of a
+/// load — and appended to the index. Decoding and converting one batch at a
+/// time keeps the decoded rows (one name per entry) from outliving the
+/// entries they become.
+struct EntriesSeed<'a> {
+    shared_dirs: &'a [Arc<str>],
+    shared_lower_dirs: &'a [Arc<str>],
+}
+
+impl<'de> DeserializeSeed<'de> for EntriesSeed<'_> {
+    type Value = Vec<Entry>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(EntriesVisitor {
+            shared_dirs: self.shared_dirs,
+            shared_lower_dirs: self.shared_lower_dirs,
+        })
+    }
+}
+
+struct EntriesVisitor<'a> {
+    shared_dirs: &'a [Arc<str>],
+    shared_lower_dirs: &'a [Arc<str>],
+}
+
+impl<'de> Visitor<'de> for EntriesVisitor<'_> {
+    type Value = Vec<Entry>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a list of index entries")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<Entry>, A::Error> {
+        let declared = seq.size_hint().unwrap_or(0);
+        if declared > MAX_DECLARED_ITEMS {
+            return Err(de::Error::custom("索引条目超出安全上限"));
+        }
+        // The writer always declares the true count, so the vector is sized
+        // once and never grows; a document that declares more than it carries
+        // is trimmed after the loop.
+        let mut entries: Vec<Entry> = Vec::with_capacity(declared);
+        let mut batch: Vec<StoredEntry> = Vec::with_capacity(ENTRY_BATCH.min(declared.max(1)));
+        loop {
+            batch.clear();
+            while batch.len() < ENTRY_BATCH {
+                match seq.next_element::<StoredEntry>()? {
+                    Some(stored) => batch.push(stored),
+                    None => break,
+                }
+            }
+            if entries.len() + batch.len() > MAX_DECLARED_ITEMS {
+                return Err(de::Error::custom("索引条目超出安全上限"));
+            }
+            let mut converted = convert_batch(&batch, self.shared_dirs, self.shared_lower_dirs)
+                .map_err(de::Error::custom)?;
+            entries.append(&mut converted);
+            if batch.len() < ENTRY_BATCH {
+                break;
+            }
+        }
+        if entries.len() < entries.capacity() {
+            entries.shrink_to_fit();
+        }
+        Ok(entries)
+    }
+}
+
+/// Converts one batch of decoded rows into finished entries on all cores,
+/// rejecting anything the writer would not produce.
+fn convert_batch(
+    batch: &[StoredEntry],
+    shared_dirs: &[Arc<str>],
+    shared_lower_dirs: &[Arc<str>],
+) -> Result<Vec<Entry>, Error> {
+    batch
+        .par_iter()
+        .map(|stored| {
+            let position = stored.directory as usize;
+            let (dir, lower_dir) = shared_dirs
+                .get(position)
+                .zip(shared_lower_dirs.get(position))
+                .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
+            let entry = Entry::with_dir(
+                dir.clone(),
+                lower_dir.clone(),
+                &stored.name,
+                stored.size,
+                stored.modified,
+                stored.is_dir,
+            );
+            validate_entry(&entry).map_err(|_| Error::CacheCorrupt("索引条目损坏".to_string()))?;
+            Ok(entry)
+        })
+        .collect()
 }
 
 /// Little-endian, variable-length integers: lengths and timestamps are the
@@ -328,35 +475,13 @@ fn binary_options() -> impl Options {
         .with_varint_encoding()
 }
 
-fn deserialize_directories<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<PathBuf>, D::Error> {
-    bounded_sequence::<D, PathBuf, _>(deserializer, "索引目录", |root| {
-        validate_root(root).map_err(|_| Error::InvalidRoot)
-    })
-}
-
-fn deserialize_entries<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<StoredEntry>, D::Error> {
-    bounded_sequence::<D, StoredEntry, _>(deserializer, "索引条目", |entry| {
-        let valid = !entry.name.is_empty()
-            && entry.name.len() <= MAX_NAME_LEN
-            && !entry.name.contains('\0');
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::InvalidEntry)
-        }
-    })
-}
-
-/// Decodes a sequence after checking its declared length against
-/// [`MAX_DECLARED_ITEMS`], so a corrupt header is rejected before the vector
-/// that backs it is allocated. Elements are still validated one by one.
+/// Decodes a sequence after checking its declared length against `limit`, so a
+/// corrupt header is rejected before the vector that backs it is allocated.
+/// Elements are still validated one by one.
 fn bounded_sequence<'de, D, T, V>(
     deserializer: D,
     expected: &'static str,
+    limit: usize,
     validate: V,
 ) -> Result<Vec<T>, D::Error>
 where
@@ -366,6 +491,7 @@ where
 {
     struct Bounded<T, V> {
         expected: &'static str,
+        limit: usize,
         validate: V,
         marker: std::marker::PhantomData<T>,
     }
@@ -379,13 +505,13 @@ where
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
             let declared = seq.size_hint().unwrap_or(0);
-            if declared > MAX_DECLARED_ITEMS {
+            if declared > self.limit {
                 return Err(de::Error::custom("索引条目超出安全上限"));
             }
-            // Bounded by MAX_ENTRIES, and never more than the file can hold.
+            // Bounded by the limit, and never more than the file can hold.
             let mut items: Vec<T> = Vec::with_capacity(declared);
             while let Some(item) = seq.next_element::<T>()? {
-                if items.len() >= MAX_DECLARED_ITEMS {
+                if items.len() >= self.limit {
                     return Err(de::Error::custom("索引条目超出安全上限"));
                 }
                 (self.validate)(&item).map_err(de::Error::custom)?;
@@ -397,6 +523,7 @@ where
 
     deserializer.deserialize_seq(Bounded {
         expected,
+        limit,
         validate,
         marker: std::marker::PhantomData,
     })
@@ -412,7 +539,11 @@ fn load_binary<R: BufRead>(mut reader: R) -> Result<Index, Error> {
     if !trailing.is_empty() {
         return Err(Error::CacheCorrupt("索引缓存包含多余数据".to_string()));
     }
-    document.into_index()
+    Ok(Index {
+        entries: document.entries,
+        roots: document.roots,
+        built_at: document.built_at,
+    })
 }
 
 /// Decodes the legacy JSON document the Go implementation writes.
@@ -450,12 +581,13 @@ impl Serialize for Rfc3339 {
 }
 
 fn validate_entry(entry: &Entry) -> Result<(), Error> {
-    let path = entry.path.to_string_lossy();
-    let invalid = path.is_empty()
+    // A real indexed path always has a parent directory; an empty one means the
+    // entry came from a document that carried only a file name.
+    let invalid = entry.dir().is_empty()
+        || entry.dir().len() > MAX_PATH_LEN
         || entry.name().is_empty()
-        || path.len() > MAX_PATH_LEN
         || entry.name().len() > MAX_NAME_LEN
-        || path.contains('\0')
+        || entry.dir().contains('\0')
         || entry.name().contains('\0');
     if invalid {
         return Err(Error::InvalidEntry);

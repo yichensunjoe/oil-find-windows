@@ -294,13 +294,13 @@ impl App {
         };
         let result = if open {
             std::process::Command::new("open")
-                .arg(&entry.path)
+                .arg(entry.path())
                 .spawn()
                 .map(|_| ())
         } else {
             std::process::Command::new("open")
                 .arg("-R")
-                .arg(&entry.path)
+                .arg(entry.path())
                 .spawn()
                 .map(|_| ())
         };
@@ -313,7 +313,7 @@ impl App {
         let Some(entry) = self.selected.and_then(|i| self.rows.get(i)) else {
             return;
         };
-        match copy_to_clipboard(&entry.path) {
+        match copy_to_clipboard(&entry.path()) {
             Ok(()) => self.status = "已复制路径。".into(),
             Err(err) => self.notice = format!("复制失败：{err}"),
         }
@@ -426,7 +426,7 @@ impl App {
                 for position in range {
                     let entry = &self.rows[position];
                     let selected = self.selected == Some(position);
-                    let label = format!("{}\t{}", entry.name(), entry.path.display());
+                    let label = format!("{}\t{}", entry.name(), entry.path().display());
                     let response = ui.selectable_label(selected, label);
                     if response.clicked() {
                         self.selected = Some(position);

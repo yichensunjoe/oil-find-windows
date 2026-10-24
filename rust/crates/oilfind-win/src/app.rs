@@ -1387,7 +1387,7 @@ impl App {
                 platform::format_size(entry.size)
             };
             let values = [
-                entry.path.to_string_lossy().to_string(),
+                entry.path().to_string_lossy().to_string(),
                 size,
                 platform::format_timestamp(entry.modified, false),
             ];
@@ -1434,7 +1434,7 @@ impl App {
         let Some(entry) = self.selected_entry() else {
             return;
         };
-        let path = entry.path.clone();
+        let path = entry.path();
         if let Err(err) = platform::local_path(&path) {
             api::warn(self.hwnd, &err);
             return;

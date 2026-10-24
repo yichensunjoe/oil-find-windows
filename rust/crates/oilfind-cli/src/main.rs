@@ -214,7 +214,7 @@ fn write_report(out: &mut impl Write, total: usize, entries: &[Entry]) -> std::i
         write!(
             out,
             "{{\"path\":{},\"name\":{},\"size\":{},\"modified\":{},\"is_dir\":{}}}",
-            json_string(&entry.path.to_string_lossy()),
+            json_string(&entry.path().to_string_lossy()),
             json_string(entry.name()),
             entry.size,
             entry.modified,

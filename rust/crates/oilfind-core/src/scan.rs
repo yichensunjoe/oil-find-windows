@@ -1,12 +1,14 @@
 //! Directory scanning: enumerate metadata under explicitly supplied roots.
 
-use crate::entry::{file_name_of, Entry, Index, Progress};
+use crate::entry::{compare_entries, Entry, Index, Progress};
 use crate::error::Error;
 use crate::platform;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -99,18 +101,19 @@ pub fn scan(
         reporter: Reporter::new(&progress),
     };
     let mut entries: Vec<Entry> = Vec::with_capacity(1024);
+    let mut dirs = DirCache::default();
 
     for root in &normalized {
         let mut pending: Vec<PathBuf> = Vec::new();
         // The root itself is not an entry, but everything below it is.
-        read_directory(&shared, root, &mut entries, &mut pending)?;
+        read_directory(&shared, root, &mut entries, &mut pending, &mut dirs)?;
         drain(&shared, pending, &mut entries)?;
         check_stop(&shared)?;
     }
 
     // Deterministic order, independent of directory iteration order and of the
     // order in which the parallel workers finished.
-    entries.sort_by(|a, b| a.lower_path().cmp(b.lower_path()));
+    entries.sort_by(compare_entries);
     let last_root = normalized.last().map_or_else(PathBuf::new, Clone::clone);
     shared.reporter.emit(
         true,
@@ -138,6 +141,7 @@ fn read_directory<F: Fn(Progress) + Sync>(
     directory: &Path,
     entries: &mut Vec<Entry>,
     pending: &mut Vec<PathBuf>,
+    dirs: &mut DirCache,
 ) -> Result<(), Error> {
     let reader = match fs::read_dir(directory) {
         Ok(reader) => reader,
@@ -174,7 +178,7 @@ fn read_directory<F: Fn(Progress) + Sync>(
                 shared.skip(&path);
                 continue;
             }
-            push_entry(shared, entries, &path, &metadata)?;
+            push_entry(shared, entries, dirs, &path, &metadata)?;
             // A package bundle is indexed but never opened: a single .app can
             // hold hundreds of thousands of files, and none of them is
             // something a user searches for.
@@ -187,7 +191,7 @@ fn read_directory<F: Fn(Progress) + Sync>(
             shared.skip_quiet();
             continue;
         }
-        push_entry(shared, entries, &path, &metadata)?;
+        push_entry(shared, entries, dirs, &path, &metadata)?;
     }
     Ok(())
 }
@@ -238,7 +242,10 @@ fn drain<F: Fn(Progress) + Sync>(
                     continue;
                 };
                 next.clear();
-                let result = read_directory(shared, &directory, &mut entries, &mut next);
+                // One directory table per worker: a directory is walked by a
+                // single worker, so siblings still share their parent.
+                let mut dirs = DirCache::default();
+                let result = read_directory(shared, &directory, &mut entries, &mut next, &mut dirs);
                 // Publish before dropping `active`, so the queue is never seen
                 // as empty while this worker still owns work.
                 if !next.is_empty() {
@@ -297,10 +304,30 @@ impl<F: Fn(Progress) + Sync> Shared<'_, F> {
     }
 }
 
+/// Interns the parent directory of a path so siblings share one allocation.
+#[derive(Default)]
+struct DirCache {
+    known: HashMap<String, (Arc<str>, Arc<str>)>,
+}
+
+impl DirCache {
+    fn intern(&mut self, path: &Path) -> (Arc<str>, Arc<str>) {
+        let dir = path
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.known
+            .entry(dir.clone())
+            .or_insert_with(|| (dir.clone().into(), dir.to_lowercase().into()))
+            .clone()
+    }
+}
+
 /// Records one entry, enforcing [`MAX_ENTRIES`] across all workers.
 fn push_entry<F: Fn(Progress) + Sync>(
     shared: &Shared<'_, F>,
     entries: &mut Vec<Entry>,
+    dirs: &mut DirCache,
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<(), Error> {
@@ -312,12 +339,10 @@ fn push_entry<F: Fn(Progress) + Sync>(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
-    entries.push(Entry::new(
-        path.to_path_buf(),
-        file_name_of(path),
-        size,
-        modified,
-        is_dir,
+    let (dir, lower_dir) = dirs.intern(path);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    entries.push(Entry::with_dir(
+        dir, lower_dir, &name, size, modified, is_dir,
     ));
     let visited = shared.visited.fetch_add(1, Ordering::Relaxed) + 1;
     if visited >= MAX_ENTRIES {

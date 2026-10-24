@@ -24,6 +24,6 @@ mod search;
 mod time;
 
 pub use cache::MAX_CACHE_BYTES;
-pub use entry::{Entry, Index, Progress};
+pub use entry::{compare_entries, Entry, Index, Progress};
 pub use error::Error;
 pub use scan::{scan, MAX_ENTRIES, MAX_ROOTS};

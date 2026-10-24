@@ -3,7 +3,7 @@
 mod common;
 
 use common::{now_secs, TempDir};
-use oilfind_core::{scan, Entry, Error, Index, Progress, MAX_ROOTS};
+use oilfind_core::{compare_entries, scan, Entry, Error, Index, Progress, MAX_ROOTS};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -29,11 +29,11 @@ impl Reports {
 fn indexed_paths(index: &Index) -> HashMap<PathBuf, Entry> {
     let mut paths = HashMap::new();
     for entry in &index.entries {
-        let previous = paths.insert(entry.path.clone(), entry.clone());
+        let previous = paths.insert(entry.path(), entry.clone());
         assert!(
             previous.is_none(),
             "duplicate indexed path: {:?}",
-            entry.path
+            entry.path()
         );
     }
     paths
@@ -85,7 +85,7 @@ fn scan_reports_metadata_and_deduplicates_overlapping_roots() {
 
     // Entries are sorted by lowercased path so the cache is deterministic.
     let mut sorted = index.entries.clone();
-    sorted.sort_by(|a, b| a.lower_path().cmp(b.lower_path()));
+    sorted.sort_by(compare_entries);
     assert_eq!(
         index
             .entries
@@ -401,6 +401,6 @@ fn scan_is_deterministic_across_runs() {
     let first = run_scan(&[dir.path().to_path_buf()]).expect("scan");
     let second = run_scan(&[dir.path().to_path_buf()]).expect("scan");
     let paths =
-        |index: &Index| -> Vec<PathBuf> { index.entries.iter().map(|e| e.path.clone()).collect() };
+        |index: &Index| -> Vec<PathBuf> { index.entries.iter().map(|e| e.path()).collect() };
     assert_eq!(paths(&first), paths(&second));
 }
