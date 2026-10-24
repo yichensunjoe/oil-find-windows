@@ -39,18 +39,19 @@ CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilF
 - 文件名/路径搜索，中文、全拼、首字母；空格 AND、`|` OR、`!` 排除、通配符、`regex:`。
 - 筛选：`ext:`、`kind:`（doc/image/video/audio/code/archive/app/folder）、`file:`/`folder:`、`size:`、`dm:`、`path:`。
 - 只读取文件名、路径、大小、修改时间，不读文件正文；不删除/移动/重命名文件。
-- 跳过系统、AppData、依赖与私人运行器目录、符号链接与目录联接；拒绝 UNC/网络映射盘；不支持共享盘与正文检索。
-- 缓存与配置在 `%APPDATA%\OilFindIntranet`，与上游 Mac 应用隔离；索引上限 200 万条，结果最多显示 2000 条并显示总命中。
+- 跳过依赖/版本库与私人运行器目录（任意层级）；`C:\Windows`、`C:\Program Files` 等系统目录只在磁盘根一级跳过，`D:\code\myproject\windows` 这类普通目录仍可搜索；拒绝 UNC/网络映射盘；不支持共享盘与正文检索。
+- 缓存与配置在 `%LOCALAPPDATA%\OilFindIntranet`（不用漫游目录，避免大索引被同步到域服务器），与上游 Mac 应用隔离；索引上限 200 万条，结果最多显示 2000 条并显示总命中。
 - 首版为定期目录快照同步（用户启动索引后每 30 秒），不是 NTFS USN 实时索引；不承诺达到上游 SIMD 性能。
 
 构建（macOS 或 Windows 均可，交叉编译到 Windows）：
 
 ```sh
-# 在 windows/ 目录；GO_BIN 指向 Go 1.24+，PYTHON_BIN 仅用于生成嵌入 manifest
-bash scripts/build.sh /path/to/go
+# 在 windows/ 目录；GO_BIN 指向 Go 1.24+，PYTHON_BIN 仅用于生成/校验嵌入 manifest
+bash scripts/build.sh /path/to/go              # amd64
+ARCH=arm64 bash scripts/build.sh /path/to/go   # arm64（各自生成对应架构的 manifest）
 ```
 
-Windows 原生构建：`powershell -ExecutionPolicy Bypass -File windows\scripts\build.ps1 -GoBin C:\Go\bin\go.exe`。
+Windows 原生构建：`powershell -ExecutionPolicy Bypass -File windows\scripts\build.ps1 -GoBin C:\Go\bin\go.exe`（amd64）。
 
 产物在 `outputs/windows-amd64/`：`OilFindIntranet.exe`（GUI）、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。终端用户使用说明见 `windows/USAGE.txt`。
 

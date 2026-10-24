@@ -80,6 +80,7 @@ type application struct {
 	scanCancel                                   context.CancelFunc
 	scanGeneration, searchGeneration             uint64
 	scanning, autoSync, closing                  bool
+	searchPending                                bool
 	lastUpdate                                   time.Time
 	lastNotice                                   string
 	startupNotice                                string
@@ -140,7 +141,9 @@ func Run() (runErr error) {
 	if available := int(screenHeight) - a.px(48); available > 0 && height > available {
 		height = available
 	}
-	hwnd, _, err := createWindowEx.Call(wsExControl, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(wide("Oil Find 内网版 · Windows 预览版"))), wsOverlapped|wsClipChildren, 0x80000000, 0x80000000, uintptr(width), uintptr(height), 0, 0, instance, 0)
+	title := wide("Oil Find 内网版 · Windows 预览版")
+	hwnd, _, err := createWindowEx.Call(wsExControl, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(title)), wsOverlapped|wsClipChildren, 0x80000000, 0x80000000, uintptr(width), uintptr(height), 0, 0, instance, 0)
+	runtime.KeepAlive(title)
 	if hwnd == 0 {
 		if a.initErr != nil {
 			return a.initErr
@@ -154,6 +157,9 @@ func Run() (runErr error) {
 	}()
 	showWindow.Call(hwnd, 5)
 	updateWindow.Call(hwnd)
+	// Focus only after the window is visible; setting it during WM_CREATE is
+	// discarded once the frame is shown.
+	setFocus.Call(a.search)
 	a.startSearchWorker()
 	a.loadCache()
 	var msg winMessage
@@ -342,7 +348,6 @@ func (a *application) createUI() error {
 	}
 	a.renderStatus()
 	a.layout()
-	setFocus.Call(a.search)
 	return nil
 }
 
@@ -699,6 +704,9 @@ func (a *application) searchNow() {
 	a.lastNotice = "正在搜索已有索引…"
 	a.renderStatus()
 	request := searchRequest{generation: a.searchGeneration, idx: a.idx, query: query, kind: kind}
+	// Never block the UI thread on a busy search worker: replace the queued
+	// request when possible, otherwise remember that the latest query still has
+	// to run and retry once the worker reports back.
 	select {
 	case a.searchRequests <- request:
 	default:
@@ -708,7 +716,8 @@ func (a *application) searchNow() {
 		}
 		select {
 		case a.searchRequests <- request:
-		case <-a.ctx.Done():
+		default:
+			a.searchPending = true
 		}
 	}
 }
@@ -751,7 +760,12 @@ func (a *application) handleEvent(event uiEvent) {
 		enabled(a.start, len(a.config.Roots) > 0)
 		enabled(a.stop, a.autoSync)
 		if event.err != nil {
-			a.lastNotice = "索引失败，已有缓存仍可使用：" + event.err.Error()
+			// Stop the 30s timer: retrying a failing scan (entry cap, vanished
+			// root, revoked access) every 30 seconds only burns CPU.
+			a.autoSync = false
+			killTimer.Call(a.hwnd, syncTimer)
+			enabled(a.stop, false)
+			a.lastNotice = "索引失败，已有缓存仍可使用；自动同步已暂停，请处理后再手动开始：" + event.err.Error()
 			a.renderStatus()
 			return
 		}
@@ -810,6 +824,11 @@ func (a *application) handleEvent(event uiEvent) {
 			a.lastNotice += "（最多 2000 项，请缩小搜索条件）"
 		}
 		a.renderStatus()
+		if a.searchPending {
+			// A query arrived while the worker was busy; run the latest one now.
+			a.searchPending = false
+			a.searchNow()
+		}
 	}
 }
 
@@ -818,16 +837,22 @@ func (a *application) setRows(entries []index.Entry) {
 	sendMessage.Call(a.results, lvmDeleteAll, 0, 0)
 	a.rows = entries
 	for position, entry := range entries {
-		item := listItem{Mask: 1, Item: int32(position), Text: wide(entry.Name)}
+		// The list view copies the text, but only during the call: keep every
+		// UTF-16 buffer reachable until then.
+		namePtr := wide(entry.Name)
+		item := listItem{Mask: 1, Item: int32(position), Text: namePtr}
 		sendMessage.Call(a.results, lvmInsertItem, 0, uintptr(unsafe.Pointer(&item)))
+		runtime.KeepAlive(namePtr)
 		size := formatSize(entry.Size)
 		if entry.IsDir {
 			size = "文件夹"
 		}
 		for sub, value := range []string{entry.Path, size, time.Unix(entry.Modified, 0).Local().Format("2006-01-02 15:04")} {
 			item.SubItem = int32(sub + 1)
-			item.Text = wide(value)
+			valuePtr := wide(value)
+			item.Text = valuePtr
 			sendMessage.Call(a.results, lvmSetItem, 0, uintptr(unsafe.Pointer(&item)))
+			runtime.KeepAlive(valuePtr)
 		}
 	}
 	sendMessage.Call(a.results, 0x000b, 1, 0)
@@ -981,21 +1006,30 @@ func localPath(path string) error {
 		return errors.New("仅支持带盘符的本机目录，不支持 UNC、设备路径或网络共享")
 	}
 	root := path[:2] + `\`
-	driveType, _, _ := getDriveType.Call(uintptr(unsafe.Pointer(wide(root))))
+	rootPtr := wide(root)
+	driveType, _, _ := getDriveType.Call(uintptr(unsafe.Pointer(rootPtr)))
+	runtime.KeepAlive(rootPtr)
 	if driveType == 4 {
 		return errors.New("不支持网络映射盘；请改选本机目录")
 	}
 	if driveType == 0 || driveType == 1 {
 		return errors.New("所选盘符不可用，请选择可访问的本机目录")
 	}
-	volume := make([]uint16, 32768)
-	ok, _, err := getVolumePathName.Call(uintptr(unsafe.Pointer(wide(path))), uintptr(unsafe.Pointer(&volume[0])), uintptr(len(volume)))
-	if ok == 0 {
-		return nativeError("验证本机卷路径", err)
-	}
-	driveType, _, _ = getDriveType.Call(uintptr(unsafe.Pointer(&volume[0])))
-	if driveType == 4 || driveType == 0 || driveType == 1 {
-		return errors.New("目录所在卷不是可用本机磁盘，不支持网络映射或共享")
+	// GetVolumePathNameW has no long-path conversion, so a path longer than
+	// MAX_PATH would fail here even though the drive itself is local. The
+	// drive-letter check above already proves the volume type in that case.
+	if len(path) < 260 {
+		volume := make([]uint16, 32768)
+		pathPtr := wide(path)
+		ok, _, err := getVolumePathName.Call(uintptr(unsafe.Pointer(pathPtr)), uintptr(unsafe.Pointer(&volume[0])), uintptr(len(volume)))
+		runtime.KeepAlive(pathPtr)
+		if ok == 0 {
+			return nativeError("验证本机卷路径", err)
+		}
+		driveType, _, _ = getDriveType.Call(uintptr(unsafe.Pointer(&volume[0])))
+		if driveType == 4 || driveType == 0 || driveType == 1 {
+			return errors.New("目录所在卷不是可用本机磁盘，不支持网络映射或共享")
+		}
 	}
 	return nil
 }
@@ -1031,7 +1065,12 @@ func withinRoot(root, path string) bool {
 }
 
 func (a *application) loadConfiguration() {
+	// LocalAppData, not the roaming profile: a multi-hundred-MB index must never
+	// be synchronised to a domain server by roaming profile settings.
 	base, err := os.UserConfigDir()
+	if local := os.Getenv("LOCALAPPDATA"); local != "" {
+		base, err = local, nil
+	}
 	if err != nil {
 		a.startupNotice = "无法读取当前用户配置目录；本次仅使用内存。"
 		return
@@ -1104,21 +1143,11 @@ func (a *application) loadConfiguration() {
 			a.config.Roots = append(a.config.Roots, validated)
 		}
 	}
-	if sameRoots(config.Roots, a.config.Roots) && sameRoots(config.CacheRoots, a.config.Roots) {
+	// Order-independent: a hand-edited or re-ordered config must not silently
+	// invalidate a cache that still covers exactly the same roots.
+	if sameRootSet(config.Roots, a.config.Roots) && sameRootSet(config.CacheRoots, a.config.Roots) {
 		a.config.CacheRoots = append([]string(nil), a.config.Roots...)
 	}
-}
-
-func sameRoots(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for n := range left {
-		if !strings.EqualFold(filepath.Clean(left[n]), filepath.Clean(right[n])) {
-			return false
-		}
-	}
-	return true
 }
 
 func sameRootSet(left, right []string) bool {
@@ -1165,7 +1194,7 @@ func (a *application) saveConfiguration() error {
 }
 
 func (a *application) loadCache() {
-	if a.cachePath == "" || len(a.config.Roots) == 0 || !sameRoots(a.config.Roots, a.config.CacheRoots) {
+	if a.cachePath == "" || len(a.config.Roots) == 0 || !sameRootSet(a.config.Roots, a.config.CacheRoots) {
 		return
 	}
 	ctx, events, hwnd, path, generation := a.ctx, a.events, a.hwnd, a.cachePath, a.scanGeneration

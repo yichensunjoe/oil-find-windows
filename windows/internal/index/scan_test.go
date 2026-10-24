@@ -91,12 +91,19 @@ func TestScanSelectedRootMetadataAndOverlapDeduplication(t *testing.T) {
 
 func TestScanSkipsDependencySystemAndPrivateDirectories(t *testing.T) {
 	root := testTempDir(t)
-	blocked := []string{"node_modules", ".git", ".claude", ".codex", ".gemini", ".qwen", ".windsurf", ".workbuddy", ".workbuddy-ai", ".freebuff", ".codegraph", ".reasonix", ".pnpm-store", "tmp", ".tmp", "System Volume Information", "$RECYCLE.BIN"}
+	// Project-internal and private runtime folders are skipped at any depth.
+	blocked := []string{"node_modules", ".git", ".claude", ".codex", ".gemini", ".qwen", ".windsurf", ".workbuddy", ".workbuddy-ai", ".freebuff", ".codegraph", ".reasonix", ".pnpm-store"}
 	for _, name := range blocked {
 		writeFixtureFile(t, filepath.Join(root, name, "must-not-index.txt"), "isolated fixture")
 	}
 	visible := filepath.Join(root, "documents", "visible.txt")
 	writeFixtureFile(t, visible, "visible")
+	// Volume-root-only system names must stay searchable when they are nested
+	// inside a user-selected project (D:\code\myproject\windows, D:\work\tmp).
+	nested := []string{"windows", "tmp", ".tmp", "Program Files", "System Volume Information", "$RECYCLE.BIN"}
+	for _, name := range nested {
+		writeFixtureFile(t, filepath.Join(root, "project", name, "nested.txt"), "ordinary fixture")
+	}
 	idx, err := index.Scan(context.Background(), []string{root}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +115,11 @@ func TestScanSkipsDependencySystemAndPrivateDirectories(t *testing.T) {
 	for _, name := range blocked {
 		if _, ok := paths[filepath.Join(root, name, "must-not-index.txt")]; ok {
 			t.Errorf("scanned excluded directory %q", name)
+		}
+	}
+	for _, name := range nested {
+		if _, ok := paths[filepath.Join(root, "project", name, "nested.txt")]; !ok {
+			t.Errorf("nested ordinary directory %q was hidden by a volume-root-only rule", name)
 		}
 	}
 }

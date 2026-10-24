@@ -217,6 +217,10 @@ func tokenize(text string) ([]string, error) {
 		if quote != 0 {
 			if r == quote {
 				quote = 0
+				// An empty quoted token is a user error, not "match everything".
+				if current.Len() == 0 {
+					tokens = append(tokens, "")
+				}
 			} else {
 				current.WriteRune(r)
 			}
@@ -248,7 +252,7 @@ func tokenize(text string) ([]string, error) {
 
 var kinds = map[string][]string{
 	"image":   {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".svg", ".heic"},
-	"doc":     {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".rtf", ".csv", ".odt", ".ods", ".odp"},
+	"doc":     {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".rtf", ".csv", ".odt", ".ods", ".odp", ".wps", ".et", ".dps", ".ofd"},
 	"video":   {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v"},
 	"audio":   {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".wma"},
 	"code":    {".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".h", ".hpp", ".cs", ".java", ".rs", ".swift", ".html", ".css", ".json", ".yaml", ".yml", ".xml", ".sql", ".sh", ".ps1"},
@@ -322,7 +326,7 @@ func termPredicate(token string, now time.Time) (predicate, string, error) {
 			return pred, "", err
 		}
 	}
-	if strings.ContainsAny(low, "*?[") {
+	if strings.ContainsAny(low, "*?") {
 		if _, err := path.Match(low, ""); err != nil {
 			return nil, "", fmt.Errorf("通配符无效: %w", err)
 		}

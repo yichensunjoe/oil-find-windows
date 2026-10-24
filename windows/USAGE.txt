@@ -19,9 +19,9 @@ report budget     同时匹配
 report | budget   任一匹配
 report !draft     排除 draft（可匹配路径）
 "年度 报告"       带空格的词组
-*.pdf             整个文件名的通配符
+*.pdf             整个文件名的通配符（支持 * 和 ?；[ ] 按普通字符处理）
 ext:pdf;docx       扩展名筛选
-kind:image        图片；也有 doc/code/folder/video/audio/archive/app
+kind:image        图片；也有 doc（含 WPS/OFD）/code/folder/video/audio/archive/app
 file:report       仅文件；folder:项目 仅文件夹
 size:>10mb        大小；size:1mb..5mb 为范围
 size:>=1kb        支持 >、>=、<、<=、=
@@ -33,9 +33,12 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
 安全与索引
 - 只读取文件名、路径、大小、修改时间，不读取文件内容。
 - 不删除、不移动、不重命名文件，不更改文件权限。
-- 跳过系统/AppData/依赖/私人运行器目录、符号链接和目录联接；不支持 UNC/网络映射盘。OneDrive 占位文件如果带 reparse 属性会被跳过。
+- 跳过：依赖与版本库目录（node_modules/.git 等）、私人运行器目录（.claude/.codex/.workbuddy 等）在任意层级；
+  C:\Windows、C:\Program Files、C:\ProgramData、$RECYCLE.BIN 等系统目录仅在磁盘根目录一级跳过，
+  因此 D:\code\myproject\windows 或 D:\work\tmp 这类普通项目目录仍可搜索。
+- 跳过符号链接与目录联接；不支持 UNC/网络映射盘。OneDrive 占位文件如果带 reparse 属性会被跳过。
 - 无法读取的路径会跳过并计数；管理员权限不是使用前提。
-- 缓存和配置使用当前用户目录 OilFindIntranet，与上游 Mac 应用隔离。
+- 缓存和配置在 %LOCALAPPDATA%\OilFindIntranet（不使用漫游配置目录，避免把大索引同步到域服务器）。
 - 搜索结果最多显示 2000 条，但同时展示总命中；索引上限 200 万条，超限会报错，不覆盖已有完整索引。
 - 不保证达到上游 Mac SIMD/Everything 的性能，建议先索引工作目录，不要一开始选择整盘。
 - 文件由员工明确操作后交给 Windows 关联程序打开；请勿打开不可信文件。

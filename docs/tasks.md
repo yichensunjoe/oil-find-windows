@@ -20,7 +20,8 @@
 - [x] 便携 Go 工具链（官方 1.27.3，SHA256 核验）+ 项目内缓存。
 - [x] 缓存提交语义（SaveContext 接入、保存失败保留旧索引）与 PerMonitorV2 DPI。
 - [x] 引擎加固：Load 流式限额、Save 体积上限、CLI 取消不提交。
-- [x] 构建脚本与 PE 校验、离线包产出（`outputs/windows-amd64` + preview zip）。
+- [x] 构建脚本与 PE 校验、离线包产出（`outputs/windows-amd64`、`windows-arm64` + preview zip）。
+- [x] 独立 agent 只读审查（约 2200 行生产代码）并按结论修复 3 项 HIGH + 7 项 MEDIUM/LOW。
 - [ ] 提交本轮改动（尚未提交/推送）。
 
 ## 验证
@@ -30,7 +31,8 @@
 - [x] `python3 Tests/Scripts/test_open_core.py`：2/2；构建/打包脚本语法检查通过。
 - [x] Windows `go test ./...`（索引/搜索/缓存，仅临时样例）：97 用例通过，含 `-race`、`vet`。
 - [x] Windows `GOOS=windows GOARCH=amd64/arm64 go build ./cmd/oilfind`（跨编译）。
-- [x] Windows 离线包 + `verify-pe.py`：GUI 子系统、asInvoker、Common-Controls v6、PerMonitorV2 均通过。
+- [x] Windows 离线包 + `verify-pe.py`：amd64 与 arm64 均通过（GUI 子系统、asInvoker、Common-Controls v6、PerMonitorV2）。
+- [x] 独立审查后的回归：97 用例、`-race`、vet 分包、CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、空引号）。
 - [ ] 记录未验证项和原因；不运行真实扫描、安装或未隔离测试。
 
 ## 后续

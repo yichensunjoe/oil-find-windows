@@ -90,7 +90,9 @@ func TestStaleSnapshotIsIgnored(t *testing.T) {
 	old := &index.Index{}
 	a := &application{idx: old, scanGeneration: 7}
 	a.handleEvent(uiEvent{kind: "scan", generation: 6, idx: &index.Index{}})
-	if a.idx != old { t.Fatal("旧扫描 generation 不得替换当前索引") }
+	if a.idx != old {
+		t.Fatal("旧扫描 generation 不得替换当前索引")
+	}
 }
 
 func TestSizeFormatting(t *testing.T) {

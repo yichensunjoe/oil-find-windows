@@ -34,12 +34,15 @@ func isLinkOrReparse(path string, d os.DirEntry) bool {
 	if d.Type()&os.ModeSymlink != 0 {
 		return true
 	}
-	ptr, err := syscall.UTF16PtrFromString(path)
+	// os.Lstat applies the \\?\ long-path conversion that GetFileAttributesW
+	// does not, so entries deeper than MAX_PATH are still classified correctly
+	// instead of being reported as unreadable (and therefore skipped).
+	info, err := os.Lstat(path)
 	if err != nil {
 		return true
 	}
-	attrs, err := syscall.GetFileAttributes(ptr)
-	return err != nil || attrs&0x400 != 0
+	data, ok := info.Sys().(*syscall.Win32FileAttributeData)
+	return !ok || data.FileAttributes&0x400 != 0
 }
 func platformPathEqual(a, b string) bool { return strings.EqualFold(a, b) }
 func platformPathPrefix(a, b string) bool {

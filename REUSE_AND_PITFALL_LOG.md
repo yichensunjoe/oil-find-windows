@@ -2,6 +2,17 @@
 
 > 最新记录置顶，跨项目结论同步工作区根日志与索引。
 
+## 2026-10-24 · 独立审查抓到的 4 类“编译通过但真机会出错”的缺陷（P088-oil-find-intranet）
+
+- 场景：Windows 客户端在 macOS 上只能跨编译，无法运行；请独立 agent 只读审查 2200 行生产代码，结论“无阻断、有 3 项 HIGH”。
+- 结论 1（长路径）：`syscall.GetFileAttributesW` **不做** `\\?\` 转换（`os.Lstat` 会做）。用它判断重解析点，≥260 字符的条目一律报错并被当作链接跳过，根目录含长路径祖先还会误报“不能索引符号链接”。正解：用 `os.Lstat` + `Win32FileAttributeData.FileAttributes&0x400`；`GetVolumePathNameW` 同理，长路径时改用盘符根判断。
+- 结论 2（黑名单过宽）：按裸目录名在任意深度排除 `windows`/`tmp`/`program files`，会把 `D:\code\myproject\windows`、`D:\work\tmp` 整棵隐藏——文件搜索工具静默漏数据最伤信任。正解：系统目录只在磁盘根一级排除，依赖/私人运行器目录（node_modules、.git、.claude…）才任意层级排除；测试要同时断言“嵌套同名目录可搜”。
+- 结论 3（GC 生命周期）：`uintptr(unsafe.Pointer(wide(s)))` 内联传参时，UTF-16 缓冲只以 uintptr 存在，GC 可在 syscall 读取前回收，表现为窗口创建失败/标题乱码，概率低但真实。正解：先存局部变量，调用后 `runtime.KeepAlive`；列表项 `LVITEM.pszText` 同样处理。
+- 结论 4（校验脚本自身错）：PE 节区 RVA→文件偏移用 `max(VirtualSize, SizeOfRawData)` 会与下一节区间重叠，可能“校验通过”但读错数据。正解：用 `SizeOfRawData` 并校验不越过文件末尾。
+- 其他修复：UI 线程阻塞发送（改丢弃+重试标记）、扫描失败仍每 30s 重扫（失败即停自动同步）、`[` 被当通配符导致 `会议[1].docx` 搜不到、kind:doc 缺 WPS/OFD、缓存写进漫游目录（改 `%LOCALAPPDATA%`）、arm64 缺 manifest（构建脚本按 ARCH 生成对应 syso）。
+- 验证：97 用例 + race + vet 分包 + amd64/arm64 打包与 PE 校验 + CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、空引号报错）。
+- 适用边界：所有“在 A 平台交叉编译、到 B 平台运行”的桌面工具；尤其是长路径、GC+syscall、目录排除策略与自制二进制校验脚本。
+
 ## 2026-10-24 · 把 macOS 专属应用做成 Windows 本机版：平台重写与验证边界（P088-oil-find-intranet）
 
 - 场景：上游是 Swift/AppKit + FSEvents + Apple NEON，公司却是 Windows。直接移植不可行，需要独立实现但保持同一产品边界（纯离线、无 Pro、无删除）。

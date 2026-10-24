@@ -25,12 +25,14 @@ def main():
     for i in range(count):
         off = optional + optional_size + i*40
         name, vs, rva, size, fileoff = struct.unpack_from("<8sIIII", data, off)
-        sections.append((name, rva, max(vs, size), fileoff))
+        # Map with SizeOfRawData: VirtualSize can exceed the bytes actually
+        # present in the file and would overlap the next section's range.
+        sections.append((name, rva, size, fileoff))
     def raw(rva):
         for _, start, size, fileoff in sections:
-            if start <= rva < start+size:
+            if start <= rva < start+size and fileoff + (rva-start) < len(data):
                 return fileoff + rva - start
-        raise AssertionError("RVA outside sections")
+        raise AssertionError("RVA outside file-backed sections")
     base = raw(resource_rva)
     def child(offset, wanted):
         _, _, _, _, named, ids = struct.unpack_from("<IIHHHH", data, base+offset)

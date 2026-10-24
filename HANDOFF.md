@@ -2,20 +2,22 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-24 11:40）
+## 当前状态（2026-10-24 11:55）
 
 - 已完成（macOS 基线）：完整克隆 `oil-oil/oil-find` 1.7.1（`e63c7150`），保留历史与 MIT；固定纯公开 target，编译期禁用上游在线更新，离线打包不依赖 Pro/官网。
-- 已完成（Windows 首版）：`windows/` 独立客户端——Go 1.24+、原生 Win32、无 WebView/网络调用；显式目录范围 + 元数据索引 + 中文/拼音搜索 + 语法筛选 + 打开/定位/复制；缓存/配置在 `%APPDATA%\OilFindIntranet`。
-- 已验证：`go test ./...` 97 用例全通过（含 `-race`）；`vet`（index/cmd 全开；ui 仅关 unsafeptr，5 处 Win32 回调指针已人工审查）；`GOOS=windows amd64/arm64` 编译；`scripts/build.sh` 全流程通过；`verify-pe.py` 确认 amd64、GUI 子系统(2)、内嵌 asInvoker/Common-Controls v6/PerMonitorV2。
-- 交付物：`outputs/windows-amd64/`（GUI 4.4MB、CLI 4.3MB、LICENSE、THIRD_PARTY_NOTICES、USAGE）；`outputs/P088-OilFind-Windows-amd64-preview.zip` 3.3MB，SHA256 `7912e1d81f944fb70102820d3c686fc34a54937aabee10aabe5d55bd0c788f16`。
+- 已完成（Windows 首版）：`windows/` 独立客户端——Go 1.24+、原生 Win32、无 WebView/网络调用；显式目录范围 + 元数据索引 + 中文/拼音搜索 + 语法筛选 + 打开/定位/复制；缓存/配置在 `%LOCALAPPDATA%\OilFindIntranet`。
+- 已完成（独立代码审查 + 修复）：另一 agent 只读审查后修复 10 项：长路径误判为链接、系统目录黑名单过宽（现仅磁盘根一级）、Win32 调用指针 GC 生命周期、UI 线程阻塞发送、扫描失败无退避、`[` 被误当通配符、kind:doc 缺 WPS/OFD、缓存目录落 Roaming、verify-pe 节区映射、arm64 缺 manifest。
+- 已验证：`go test ./...` 97 用例全通过（含 `-race`）；`vet`（index/cmd 全开；ui 仅关 unsafeptr，5 处 Win32 回调指针已人工审查）；amd64 与 arm64 均完成打包 + `verify-pe.py`（GUI 子系统 2、asInvoker、Common-Controls v6、PerMonitorV2）；临时样例 CLI 冒烟覆盖字面 `[`、嵌套 `windows`/`tmp` 可搜、WPS 归入文档、空引号报错。
+- 交付物：`outputs/windows-amd64/`、`outputs/windows-arm64/`；`P088-OilFind-Windows-amd64-preview.zip` 3.3MB SHA256 `3b350c06c0d850e06b0ce9176dbded7270ea6e7f52cff7d561811fdcbedee4a3`；`…-arm64-preview.zip` 3.0MB SHA256 `20fe828e9b9360428bfa868f8b3554bde899ca37ae3205a2c43bc8c94b655995`。
 - macOS 侧：`swift build -c release` 与 30 项 Swift + 2 项 Python 隔离测试通过（上一轮）。
-- 未验证：Windows 真机 GUI 交互、DPI/多显示器、ACL 拒绝、取消/重启、SmartScreen/杀软；EXE 未代码签名；PowerShell 脚本未在本机执行（无 pwsh）。
-- 已知限制：30 秒全量快照同步（非 USN 实时）；无共享盘/正文检索；无删除入口；无应用图标；索引常驻内存、上限 200 万条；结果最多显示 2000 条。
+- 未验证：Windows 真机 GUI 交互、DPI/多显示器、ACL 拒绝、取消/重启、SmartScreen/杀软、OneDrive 占位文件；EXE 未代码签名；PowerShell 脚本未在本机执行（无 pwsh）。
+- 已知限制：30 秒全量快照同步（非 USN 实时）；无共享盘/正文检索；无删除入口；无应用图标；索引常驻内存、上限 200 万条；结果最多显示 2000 条；`regex:` 依赖 RE2，无回溯爆炸但语法与 PCRE 不同。
 - 版本与备份：`upstream` 仅追踪来源，push URL 已禁用；无公司远端，仅本机、未异机备份。
-- 下一步：公司 Windows 电脑按 `windows/USAGE.txt` 试点验收 → 确认签名/分发策略 → 视需要加应用图标、NTFS USN 增量、独立 AppId。
+- 下一步：公司 Windows 电脑按 `windows/USAGE.txt` 试点验收 → 确认签名/分发策略 → 视需要加图标、NTFS USN 增量、独立 AppId。
 
 ## 近期轮次（最新在上，保留全部）
 
+- 2026-10-24（第三轮）：派独立 agent 只读审查约 2200 行生产代码；无阻断缺陷，但确认 3 项 HIGH（长路径、黑名单过宽、GC 指针）与 7 项 MEDIUM/LOW，已全部修复并补回归；双架构重新打包与 PE 校验通过。真机项仍未验收。
 - 2026-10-24（第二轮）：完成 Windows 本机文件搜索客户端与离线包；97 用例 + race + vet + PE 校验通过；缓存提交改为可取消（SaveContext），保存失败保留旧索引；引擎加固 Load 流式限额 / Save 体积上限 / CLI 取消不提交；README、AGENTS、需求/架构/任务、CI 同步双平台。未在 Windows 真机运行。
 - 2026-10-24（第一轮）：完成公开源码克隆、纯开源构建/更新边界、macOS 离线打包与项目治理；release 编译及 30+2 项隔离测试通过。未安装/部署，未扫描真实文件，未获取 Pro。
 

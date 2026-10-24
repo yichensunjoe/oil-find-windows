@@ -49,15 +49,51 @@ type Progress struct {
 	Current          string
 }
 
-var excludedDirs = map[string]bool{
+// excludedAtAnyDepth holds directories that are internal to a project or a
+// private agent runtime. Their names are specific enough that skipping them at
+// any depth does not hide ordinary user data.
+var excludedAtAnyDepth = map[string]bool{
 	"node_modules": true, ".git": true, ".svn": true, ".hg": true,
 	".claude": true, ".codex": true, ".workbuddy": true, ".workbuddy-ai": true,
 	".gemini": true, ".qwen": true, ".pnpm-store": true, ".build": true,
 	".windsurf": true, ".freebuff": true, ".codegraph": true, ".reasonix": true,
-	".agents": true, ".config": true, ".tmp": true,
-	"appdata": true, "windows": true, "program files": true, "program files (x86)": true,
+	".agents": true, ".config": true,
+}
+
+// systemRootDirs are only skipped when they sit directly on a volume root.
+// Matching them at any depth would hide ordinary folders such as
+// D:\code\myproject\windows or D:\work\tmp.
+var systemRootDirs = map[string]bool{
+	"windows": true, "program files": true, "program files (x86)": true,
 	"programdata": true, "$recycle.bin": true, "system volume information": true,
-	"recovery": true, "config.msi": true,
+	"recovery": true, "config.msi": true, "tmp": true, ".tmp": true,
+}
+
+// shouldSkipDir decides from the path alone so both the walker and the
+// root validator apply exactly the same rule.
+func shouldSkipDir(path string) bool {
+	name := strings.ToLower(filepath.Base(path))
+	parent := filepath.Dir(path)
+	if excludedAtAnyDepth[name] {
+		return true
+	}
+	if systemRootDirs[name] {
+		return isVolumeRoot(parent)
+	}
+	if name == "appdata" {
+		// AppData lives directly under a user profile; a project folder named
+		// appdata must stay searchable.
+		return strings.EqualFold(filepath.Base(parent), "users") || strings.EqualFold(filepath.Base(parent), "home")
+	}
+	return false
+}
+
+func isVolumeRoot(path string) bool {
+	clean := filepath.Clean(path)
+	if filepath.VolumeName(clean) == "" {
+		return clean == string(filepath.Separator)
+	}
+	return strings.EqualFold(clean, filepath.VolumeName(clean)+string(filepath.Separator))
 }
 
 // Scan only enumerates explicitly supplied, validated roots. Reparse points and
@@ -98,7 +134,7 @@ func Scan(ctx context.Context, roots []string, progress func(Progress)) (*Index,
 				}
 				return nil
 			}
-			if d.IsDir() && (excludedDirs[strings.ToLower(d.Name())] || strings.EqualFold(d.Name(), "tmp")) {
+			if d.IsDir() && shouldSkipDir(path) {
 				stats.Skipped++
 				report(false)
 				return filepath.SkipDir
@@ -182,7 +218,7 @@ func normalizeRoots(roots []string) ([]string, error) {
 			if isLinkOrReparse(p, fs.FileInfoToDirEntry(stat)) {
 				return nil, errors.New("为避免越界，不能索引符号链接或目录联接")
 			}
-			if (p == clean && strings.EqualFold(filepath.Base(p), "tmp")) || excludedDirs[strings.ToLower(filepath.Base(p))] {
+			if shouldSkipDir(p) {
 				return nil, errors.New("该目录属于系统、依赖或私人运行器目录，不在首版索引范围内")
 			}
 			if filepath.Dir(p) == p {

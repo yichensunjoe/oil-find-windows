@@ -5,6 +5,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -197,7 +198,12 @@ func nativeError(operation string, err error) error {
 }
 
 func createControl(owner, instance uintptr, class, label string, style, exStyle uint32, id int) (uintptr, error) {
-	h, _, err := createWindowEx.Call(uintptr(exStyle), uintptr(unsafe.Pointer(wide(class))), uintptr(unsafe.Pointer(wide(label))), uintptr(style|wsChild|wsVisible), 0, 0, 100, 28, owner, uintptr(id), instance, 0)
+	// Hold both UTF-16 buffers in locals: passing only uintptr(unsafe.Pointer(x))
+	// lets the GC free them before the syscall reads them.
+	classPtr, labelPtr := wide(class), wide(label)
+	h, _, err := createWindowEx.Call(uintptr(exStyle), uintptr(unsafe.Pointer(classPtr)), uintptr(unsafe.Pointer(labelPtr)), uintptr(style|wsChild|wsVisible), 0, 0, 100, 28, owner, uintptr(id), instance, 0)
+	runtime.KeepAlive(classPtr)
+	runtime.KeepAlive(labelPtr)
 	if h == 0 {
 		return 0, nativeError("创建界面控件", err)
 	}
@@ -215,7 +221,9 @@ func text(h uintptr) string {
 }
 
 func putText(h uintptr, s string) {
-	setWindowText.Call(h, uintptr(unsafe.Pointer(wide(s))))
+	ptr := wide(s)
+	setWindowText.Call(h, uintptr(unsafe.Pointer(ptr)))
+	runtime.KeepAlive(ptr)
 }
 
 func enabled(h uintptr, yes bool) {
@@ -227,13 +235,18 @@ func enabled(h uintptr, yes bool) {
 }
 
 func warn(owner uintptr, s string) {
-	messageBox.Call(owner, uintptr(unsafe.Pointer(wide(s))), uintptr(unsafe.Pointer(wide("Oil Find 内网版"))), 0x30)
+	textPtr, titlePtr := wide(s), wide("Oil Find 内网版")
+	messageBox.Call(owner, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), 0x30)
+	runtime.KeepAlive(textPtr)
+	runtime.KeepAlive(titlePtr)
 }
 
 func chooseFolder(owner uintptr) (string, error) {
 	buf := make([]uint16, 260)
 	info := browseInfo{Owner: owner, DisplayName: &buf[0], Title: wide("选择本机目录（不支持网络共享或网络映射盘）"), Flags: 0x0001 | 0x0040}
 	pidl, _, _ := browseForFolder.Call(uintptr(unsafe.Pointer(&info)))
+	runtime.KeepAlive(info)
+	runtime.KeepAlive(buf)
 	if pidl == 0 {
 		return "", nil
 	}
@@ -285,7 +298,10 @@ func copyToClipboard(owner uintptr, value string) error {
 }
 
 func openPath(owner uintptr, path string) error {
-	r, _, _ := shellExecute.Call(owner, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(path))), 0, 0, 1)
+	verb, target := wide("open"), wide(path)
+	r, _, _ := shellExecute.Call(owner, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(target)), 0, 0, 1)
+	runtime.KeepAlive(verb)
+	runtime.KeepAlive(target)
 	if r <= 32 {
 		return fmt.Errorf("无法打开所选项目（系统代码 %d）。请检查默认打开程序与访问权限", r)
 	}
@@ -294,7 +310,9 @@ func openPath(owner uintptr, path string) error {
 
 func revealPath(path string) error {
 	var pidl uintptr
-	hr, _, _ := parseDisplayName.Call(uintptr(unsafe.Pointer(wide(path))), 0, uintptr(unsafe.Pointer(&pidl)), 0, 0)
+	pathPtr := wide(path)
+	hr, _, _ := parseDisplayName.Call(uintptr(unsafe.Pointer(pathPtr)), 0, uintptr(unsafe.Pointer(&pidl)), 0, 0)
+	runtime.KeepAlive(pathPtr)
 	if int32(hr) < 0 || pidl == 0 {
 		return fmt.Errorf("无法定位所选项目（系统代码 0x%08x）", uint32(hr))
 	}

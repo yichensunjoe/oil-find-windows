@@ -97,11 +97,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $ProjectDir "LICENSE") -Destination (Join-Path $OutputDir "LICENSE") -Force
     Copy-Item -LiteralPath (Join-Path $ModuleDir "THIRD_PARTY_NOTICES.txt") -Destination (Join-Path $OutputDir "THIRD_PARTY_NOTICES.txt") -Force
     $Usage = Join-Path $ModuleDir "USAGE.txt"
-    if (Test-Path -LiteralPath $Usage -PathType Leaf) {
-        Copy-Item -LiteralPath $Usage -Destination (Join-Path $OutputDir "USAGE.txt") -Force
-    } else {
-        Write-Warning "USAGE.txt is not present; add the usage instructions before distribution."
-    }
+    Copy-Item -LiteralPath $Usage -Destination (Join-Path $OutputDir "USAGE.txt") -Force
     Write-Host "Local Windows build completed: $OutputDir"
     Write-Host "No installation, publication, or runtime dependency download was performed."
 } finally {
