@@ -92,7 +92,7 @@ func TestScanSelectedRootMetadataAndOverlapDeduplication(t *testing.T) {
 func TestScanSkipsDependencySystemAndPrivateDirectories(t *testing.T) {
 	root := testTempDir(t)
 	// Project-internal and private runtime folders are skipped at any depth.
-	blocked := []string{"node_modules", ".git", ".claude", ".codex", ".gemini", ".qwen", ".windsurf", ".workbuddy", ".workbuddy-ai", ".freebuff", ".codegraph", ".reasonix", ".pnpm-store"}
+	blocked := []string{"node_modules", ".git", ".claude", ".codex", ".gemini", ".qwen", ".windsurf", ".workbuddy", ".workbuddy-ai", ".freebuff", ".codegraph", ".pnpm-store"}
 	for _, name := range blocked {
 		writeFixtureFile(t, filepath.Join(root, name, "must-not-index.txt"), "isolated fixture")
 	}

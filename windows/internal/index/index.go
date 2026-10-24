@@ -56,7 +56,7 @@ var excludedAtAnyDepth = map[string]bool{
 	"node_modules": true, ".git": true, ".svn": true, ".hg": true,
 	".claude": true, ".codex": true, ".workbuddy": true, ".workbuddy-ai": true,
 	".gemini": true, ".qwen": true, ".pnpm-store": true, ".build": true,
-	".windsurf": true, ".freebuff": true, ".codegraph": true, ".reasonix": true,
+	".windsurf": true, ".freebuff": true, ".codegraph": true,
 	".agents": true, ".config": true,
 }
 

@@ -2,7 +2,7 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
-## 2026-10-24 · 独立审查抓到的 4 类“编译通过但真机会出错”的缺陷（P088-oil-find-intranet）
+## 2026-10-24 · 独立审查抓到的 4 类“编译通过但真机会出错”的缺陷（Oil Find Intranet）
 
 - 场景：Windows 客户端在 macOS 上只能跨编译，无法运行；请独立 agent 只读审查 2200 行生产代码，结论“无阻断、有 3 项 HIGH”。
 - 结论 1（长路径）：`syscall.GetFileAttributesW` **不做** `\\?\` 转换（`os.Lstat` 会做）。用它判断重解析点，≥260 字符的条目一律报错并被当作链接跳过，根目录含长路径祖先还会误报“不能索引符号链接”。正解：用 `os.Lstat` + `Win32FileAttributeData.FileAttributes&0x400`；`GetVolumePathNameW` 同理，长路径时改用盘符根判断。
@@ -13,7 +13,7 @@
 - 验证：97 用例 + race + vet 分包 + amd64/arm64 打包与 PE 校验 + CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、空引号报错）。
 - 适用边界：所有“在 A 平台交叉编译、到 B 平台运行”的桌面工具；尤其是长路径、GC+syscall、目录排除策略与自制二进制校验脚本。
 
-## 2026-10-24 · 把 macOS 专属应用做成 Windows 本机版：平台重写与验证边界（P088-oil-find-intranet）
+## 2026-10-24 · 把 macOS 专属应用做成 Windows 本机版：平台重写与验证边界（Oil Find Intranet）
 
 - 场景：上游是 Swift/AppKit + FSEvents + Apple NEON，公司却是 Windows。直接移植不可行，需要独立实现但保持同一产品边界（纯离线、无 Pro、无删除）。
 - 结论：分平台入口（`Sources/` 保留 macOS、`windows/` 新写 Go + Win32），共享搜索语法而非共享代码；Windows 端用原生控件而非 WebView，避免浏览器内核依赖。
@@ -25,7 +25,7 @@
 - 验证：97 用例（含 race）、vet 分包、amd64/arm64 编译、`verify-pe.py` 校验 GUI 子系统与内嵌 manifest、临时样例 CLI 建索引/缓存重载/改名同步。
 - 适用边界：桌面应用跨平台重写、Windows 离线工具、任何"回调指针 + 静态检查"冲突的 Go/Win32 项目。
 
-## 2026-10-24 · 开源内网 fork 的闭源更新回流与测试隔离（P088-oil-find-intranet）
+## 2026-10-24 · 开源内网 fork 的闭源更新回流与测试隔离（Oil Find Intranet）
 
 - 场景：公开 MIT 源码不含 Pro，但官方发布包/更新包包含 Pro；用户只要开源模块并计划企业内部内网改造。
 - 结论：仅“不拉私有仓库”不能长期保证开源边界。删除 private target 自动发现与入口，正式版编译期关闭自动/手动更新、下载/安装及更新官网跳转；本分支打包仅归档自己的构建，不生成上游发布清单。许可证随应用资源分发。

@@ -1,4 +1,4 @@
-# AGENTS.md — P088-oil-find-intranet 项目级规则
+# AGENTS.md — Oil Find Intranet (Windows) 项目级规则
 
 本文件是本仓库的项目级规则，独立生效。共享安全、授权与现场保护底线适用于所有改动。
 

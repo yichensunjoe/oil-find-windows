@@ -1,4 +1,4 @@
-# HANDOFF — P088-oil-find-intranet
+# HANDOFF — Oil Find Intranet (Windows)
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
@@ -9,7 +9,7 @@
 - 已完成（独立代码审查 + 修复）：另一 agent 只读审查后修复 10 项：长路径误判为链接、系统目录黑名单过宽（现仅磁盘根一级）、Win32 调用指针 GC 生命周期、UI 线程阻塞发送、扫描失败无退避、`[` 被误当通配符、kind:doc 缺 WPS/OFD、缓存目录落 Roaming、verify-pe 节区映射、arm64 缺 manifest。
 - 已验证（本地）：`go test ./...` 97 用例全通过（含 `-race`）；`vet`（index/cmd 全开；ui 仅关 unsafeptr，5 处 Win32 回调指针已人工审查）；amd64 与 arm64 打包 + `verify-pe.py`；CLI 冒烟覆盖字面 `[`、嵌套 `windows`/`tmp`、WPS、空引号报错。
 - 已验证（GitHub Actions，windows-latest）：run 40063211103 全绿——`internal/index` 与 `internal/ui` 测试**在真实 Windows 上执行通过**（含原生结构体布局/路径/格式化用例，此前只能编译），打包 + PE 校验 + 未签名产物上传（2.76MB）。
-- 交付物：`outputs/windows-amd64/`、`outputs/windows-arm64/`；`P088-OilFind-Windows-amd64-preview.zip` 3.3MB SHA256 `3b350c06c0d850e06b0ce9176dbded7270ea6e7f52cff7d561811fdcbedee4a3`；`…-arm64-preview.zip` 3.0MB SHA256 `20fe828e9b9360428bfa868f8b3554bde899ca37ae3205a2c43bc8c94b655995`。
+- 交付物：`outputs/windows-amd64/`、`outputs/windows-arm64/`；`OilFind-Windows-amd64-preview.zip` 3.3MB SHA256 `3b350c06c0d850e06b0ce9176dbded7270ea6e7f52cff7d561811fdcbedee4a3`；`OilFind-Windows-arm64-preview.zip` 3.0MB SHA256 `20fe828e9b9360428bfa868f8b3554bde899ca37ae3205a2c43bc8c94b655995`。
 - macOS 侧：`swift build -c release` 与 30 项 Swift + 2 项 Python 隔离测试通过（上一轮）。
 - 未验证：Windows 真机 GUI 交互、DPI/多显示器、ACL 拒绝、取消/重启、SmartScreen/杀软、OneDrive 占位文件；EXE 未代码签名；PowerShell 脚本未在本机执行（无 pwsh）。
 - 已知限制：30 秒全量快照同步（非 USN 实时）；无共享盘/正文检索；无删除入口；无应用图标；索引常驻内存、上限 200 万条；结果最多显示 2000 条；`regex:` 依赖 RE2，无回溯爆炸但语法与 PCRE 不同。
