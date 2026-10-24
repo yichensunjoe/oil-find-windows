@@ -27,9 +27,16 @@ foreach ($Source in @((Join-Path $ProjectDir "LICENSE"), (Join-Path $ModuleDir "
         throw "Required distribution notice is missing: $Source"
     }
 }
-$PythonCommand = Get-Command -Name $PythonBin -CommandType Application -ErrorAction SilentlyContinue
+# Get-Command can return several matches (tool cache plus the WindowsApps alias);
+# taking .Source from the whole result produced a space-joined, unusable path.
+$PythonCommand = Get-Command -Name $PythonBin -CommandType Application -ErrorAction SilentlyContinue |
+    Where-Object { $_.Source -like "*.exe" -and $_.Source -notlike "*WindowsApps*" } |
+    Select-Object -First 1
 if ($null -eq $PythonCommand) { throw "Python is required to embed the application manifest." }
 $PythonExe = $PythonCommand.Source
+if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+    throw "Python executable is not usable: $PythonExe"
+}
 
 $CacheDir = Join-Path $ProjectDir "outputs/go-cache"
 $ModCacheDir = Join-Path $ProjectDir "outputs/go-mod-cache"
