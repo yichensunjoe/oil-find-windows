@@ -1,4 +1,4 @@
-name: Windows CI
+name: Rust CI
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  windows-rust:
-    name: Build, test and verify (Windows x64)
-    runs-on: windows-latest
+  lint-and-test:
+    name: Format, clippy and tests
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -30,7 +30,21 @@ jobs:
       - name: Test
         working-directory: rust
         run: cargo test --workspace
-      - name: Build and package
+
+  windows:
+    name: Windows x64 build, test and package
+    runs-on: windows-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          cargo --version
+      - name: Build, test and package
         shell: pwsh
         run: ./rust/scripts/build.ps1
       - name: Verify PE subsystem and embedded manifest
@@ -41,4 +55,32 @@ jobs:
         with:
           name: oil-find-windows-amd64-unsigned
           path: outputs/windows-amd64/
+          if-no-files-found: error
+
+  macos:
+    name: macOS build and test
+    runs-on: macos-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          cargo --version
+      - name: Test
+        working-directory: rust
+        run: cargo test --workspace
+      - name: Build the macOS preview app
+        working-directory: rust
+        run: cargo build --release -p oilfind-mac
+      - name: Package the preview app
+        run: bash rust/scripts/package-mac.sh
+      - name: Upload the macOS preview
+        uses: actions/upload-artifact@v7
+        with:
+          name: oil-find-macos-preview-unsigned
+          path: outputs/OilFind-Rust-macOS-preview.zip
           if-no-files-found: error
