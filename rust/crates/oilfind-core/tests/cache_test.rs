@@ -69,23 +69,149 @@ fn cache_round_trip_rebuilds_search_metadata() {
 }
 
 #[test]
-fn cache_is_written_as_the_documented_json_shape() {
+fn cache_is_written_in_the_binary_format() {
     let dir = TempDir::new("cache-shape");
     let path = cache_path(&dir);
-    let index = sample_index(dir.path());
+    fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    // Many entries under one directory: this is the case the directory table
+    // exists for, and the case a real index is made of.
+    let index = Index {
+        entries: (0..400)
+            .map(|i| {
+                let name = format!("会议纪要-{i:04}.docx");
+                Entry::new(dir.join(&name), name, i as u64, 100 + i, false)
+            })
+            .collect(),
+        roots: vec![dir.path().to_path_buf()],
+        built_at: 1_700_000_000,
+    };
     index.save(&path).expect("save");
 
-    let document: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).expect("read cache")).expect("valid json");
-    assert_eq!(document["version"], 1);
-    assert_eq!(document["roots"][0], dir.path().to_string_lossy().as_ref());
-    assert_eq!(document["builtAt"], "2023-11-14T22:13:20Z");
-    assert_eq!(document["entries"][0]["name"], "a.txt");
-    assert_eq!(document["entries"][0]["isDir"], false);
-    assert_eq!(document["entries"][0]["size"], 3);
-    assert_eq!(document["entries"][0]["modified"], 100);
-    // Derived fields must not be persisted.
-    assert!(document["entries"][0].get("lowerName").is_none());
+    let bytes = fs::read(&path).expect("read cache");
+    assert_eq!(&bytes[..8], b"OILF1\0\0\0", "missing binary magic");
+    // The format version follows the magic as a single-byte varint.
+    assert_eq!(bytes[8], 1, "unexpected cache version");
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+        "cache is still JSON"
+    );
+    // Each path prefix is stored once instead of once per entry, so the file
+    // is far below half of the JSON document it replaced.
+    let json = serde_json::to_vec(&index).expect("serialize json");
+    assert!(
+        bytes.len() * 2 < json.len(),
+        "binary cache ({} bytes) is not smaller than JSON ({} bytes)",
+        bytes.len(),
+        json.len()
+    );
+
+    let loaded = Index::load(&path).expect("load");
+    assert_eq!(loaded.entries, index.entries);
+    assert_eq!(loaded.roots, index.roots);
+    assert_eq!(loaded.built_at, index.built_at);
+}
+
+#[test]
+fn cache_rewrites_a_legacy_json_document_as_binary() {
+    let dir = TempDir::new("cache-upgrade");
+    let path = cache_path(&dir);
+    fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    let document = format!(
+        r#"{{"version":1,"roots":["{root}"],"builtAt":"2023-11-15T06:13:20Z",
+"entries":[{{"path":"{root}/会议纪要.docx","name":"会议纪要.docx","size":7,"modified":200,"isDir":false}}]}}"#,
+        root = json_escape(&dir.path().to_string_lossy())
+    );
+    fs::write(&path, document).expect("write cache");
+
+    let loaded = Index::load(&path).expect("load legacy cache");
+    loaded.save(&path).expect("save");
+
+    let bytes = fs::read(&path).expect("read cache");
+    assert_eq!(&bytes[..8], b"OILF1\0\0\0", "upgrade did not rewrite as binary");
+    assert_eq!(Index::load(&path).expect("load").entries, loaded.entries);
+}
+
+/// Appends a bincode-style LEB128 varint.
+fn varint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Header of a binary cache: magic, version, roots, built_at, then the lengths
+/// of the directory and entry tables.
+fn binary_header(directories: u64, entries: u64) -> Vec<u8> {
+    let mut data = b"OILF1\0\0\0".to_vec();
+    varint(1, &mut data);
+    varint(0, &mut data);
+    varint(0, &mut data);
+    varint(directories, &mut data);
+    varint(entries, &mut data);
+    data
+}
+
+#[test]
+fn cache_rejects_a_binary_document_with_an_incompatible_version() {
+    let dir = TempDir::new("cache-binary-version");
+    let path = cache_path(&dir);
+    sample_index(dir.path()).save(&path).expect("save");
+    let mut bytes = fs::read(&path).expect("read cache");
+    bytes[8] = 2;
+
+    fs::write(&path, &bytes).expect("write cache");
+    let error = Index::load(&path).expect_err("future version must be rejected");
+    assert!(matches!(error, Error::CacheCorrupt(_)), "got: {error}");
+}
+
+#[test]
+fn cache_rejects_trailing_binary_data() {
+    let dir = TempDir::new("cache-binary-trailing");
+    let path = cache_path(&dir);
+    sample_index(dir.path()).save(&path).expect("save");
+    let mut bytes = fs::read(&path).expect("read cache");
+    bytes.extend_from_slice(b"leftover");
+
+    fs::write(&path, &bytes).expect("write cache");
+    let error = Index::load(&path).expect_err("trailing bytes must be rejected");
+    assert!(matches!(error, Error::CacheCorrupt(_)), "got: {error}");
+}
+
+#[test]
+fn cache_rejects_a_declared_entry_count_over_the_limit() {
+    let dir = TempDir::new("cache-binary-count");
+    let path = cache_path(&dir);
+    // The count is checked before the vector is allocated, so this file is
+    // rejected without ever trying to reserve room for the entries.
+    let bytes = binary_header(0, oilfind_core::MAX_ENTRIES as u64 + 1);
+    fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    fs::write(&path, &bytes).expect("write cache");
+
+    let error = Index::load(&path).expect_err("oversized entry count must be rejected");
+    assert!(matches!(error, Error::CacheCorrupt(_)), "got: {error}");
+}
+
+#[test]
+fn cache_rejects_an_entry_pointing_outside_the_directory_table() {
+    let dir = TempDir::new("cache-binary-index");
+    let path = cache_path(&dir);
+    let mut bytes = binary_header(0, 1);
+    varint(3, &mut bytes); // directory index, but the table is empty
+    varint(5, &mut bytes);
+    bytes.extend_from_slice(b"a.txt");
+    varint(1, &mut bytes); // size
+    varint(0, &mut bytes); // modified
+    bytes.push(0); // is_dir
+    fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    fs::write(&path, &bytes).expect("write cache");
+
+    let error = Index::load(&path).expect_err("dangling directory index must be rejected");
+    assert!(matches!(error, Error::CacheCorrupt(_)), "got: {error}");
 }
 
 #[test]

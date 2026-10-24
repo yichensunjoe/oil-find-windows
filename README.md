@@ -36,9 +36,12 @@ powershell -ExecutionPolicy Bypass -File rust\scripts\build.ps1
 ```
 
 ```sh
-# macOS/Linux 上交叉编译（需 rustup target add x86_64-pc-windows-msvc）
+# macOS/Linux 上交叉编译 Windows 版（需 rustup target add x86_64-pc-windows-msvc）
 cd rust
 bash scripts/build.sh
+
+# macOS 预览版（egui 界面，复用同一核心）
+bash scripts/package-mac.sh   # 产出 build/Oil Find Rust.app 与 outputs/OilFind-Rust-macOS-preview.zip
 ```
 
 产物在 `outputs/windows-amd64/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
@@ -53,7 +56,15 @@ cargo fmt --all --check
 cargo check -p oilfind-win --target x86_64-pc-windows-msvc   # Windows 分支类型检查（不链接）
 ```
 
-CI 只跑 Windows（`.github/workflows/ci.yml`）：`windows-latest` 上执行 fmt/clippy/test、打包、PE 校验并上传未签名产物。macOS 客户端（`Sources/`，Swift）仍由本机验收，不在 CI 中运行。
+CI 同时覆盖三个平台（`.github/workflows/ci.yml`）：
+
+| 任务 | 运行器 | 内容 |
+|---|---|---|
+| lint-and-test | ubuntu-latest | `cargo fmt --check`、`clippy -D warnings`、`cargo test --workspace` |
+| windows | windows-latest | 打包 `OilFind.exe`、PE/内嵌 manifest 校验、上传未签名产物 |
+| macos | macos-latest | 构建并打包 `Oil Find Rust.app`、上传未签名预览包 |
+
+`Sources/` 里的 Swift macOS 基线不在 CI 中运行，仍由本机验收。
 
 ## 目录
 

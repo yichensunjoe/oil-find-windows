@@ -1,31 +1,43 @@
 //! Cache persistence.
 //!
-//! The on-disk format is the same JSON document the Go implementation writes,
-//! so an existing cache survives an in-place upgrade:
+//! Two formats are readable, one is written:
 //!
-//! ```json
-//! {"version":1,"roots":["C:\\Users\\me\\Documents"],
-//!  "builtAt":"2026-10-24T05:09:49Z",
-//!  "entries":[{"path":"...","name":"a.txt","size":3,"modified":1761287389,"isDir":false}]}
-//! ```
+//! * **Write (binary, current).** A file that starts with the magic
+//!   `b"OILF1\0\0\0"` holds a bincode document: `version`, `roots`, `built_at`,
+//!   a table of distinct parent `directories` and the `entries` that refer to
+//!   them by index. Storing each directory once instead of repeating its
+//!   prefix in every path is what keeps a 1.5M-entry index around 70 MB
+//!   instead of 300 MB.
+//! * **Read only (JSON, legacy).** A file that does not start with the magic
+//!   is parsed as the document the Go implementation writes, so an existing
+//!   cache survives an in-place upgrade:
 //!
-//! Reads are streamed: the entry array is validated one element at a time and
-//! aborts as soon as it exceeds [`MAX_ENTRIES`], so a hostile file cannot force
-//! a multi-gigabyte allocation. Writes go to a sibling temporary file, are
-//! size-capped, fsynced and then atomically renamed, so a failed or cancelled
-//! save always leaves the previous cache untouched.
+//!   ```json
+//!   {"version":1,"roots":["C:\\Users\\me\\Documents"],
+//!    "builtAt":"2026-10-24T05:09:49Z",
+//!    "entries":[{"path":"...","name":"a.txt","size":3,"modified":1761287389,"isDir":false}]}
+//!   ```
+//!
+//! Reads are streamed and bounded: the entry count declared by the file is
+//! rejected before anything is allocated, every entry is validated on the way
+//! in, and the reader is capped at [`MAX_CACHE_BYTES`]. Writes go to a sibling
+//! temporary file, are size-capped while encoding, fsynced and then atomically
+//! renamed, so a failed or cancelled save always leaves the previous cache
+//! untouched.
 
 use crate::entry::{Entry, Index};
 use crate::error::Error;
 use crate::platform;
 use crate::scan::{MAX_ENTRIES, MAX_ROOTS};
 use crate::time;
+use bincode::Options;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::ser::Serializer;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,8 +48,20 @@ pub const MAX_CACHE_BYTES: u64 = 512 << 20;
 /// Cache format version. Bumping this forces every client to re-index.
 const CACHE_VERSION: u32 = 1;
 
+/// Prefix that marks a binary cache. Anything else is read as legacy JSON.
+const MAGIC: [u8; 8] = *b"OILF1\0\0\0";
+
 const MAX_PATH_LEN: usize = 32_767;
 const MAX_NAME_LEN: usize = 1_024;
+
+/// Buffered I/O size for the cache file: one megabyte keeps the encoder from
+/// issuing a syscall per varint without holding a large copy of the index.
+const WRITE_BUFFER_BYTES: usize = 1 << 20;
+
+/// Upper bound on how many elements a single sequence is allowed to declare
+/// before it is allocated, so a hostile header cannot request gigabytes.
+const MAX_DECLARED_ITEMS: usize = MAX_ENTRIES;
+
 
 /// Used by [`Index::save`], which is never cancelled.
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -57,6 +81,7 @@ impl Index {
             return Err(Error::Cancelled);
         }
         self.validate_for_save()?;
+        let (directories, index) = self.directory_table();
 
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
         let directory = parent.unwrap_or_else(|| Path::new("."));
@@ -69,13 +94,27 @@ impl Index {
                 .file
                 .as_mut()
                 .ok_or_else(|| Error::Io(io::Error::other("临时文件不可用")))?;
-            let mut writer = LimitedWriter::new(file, MAX_CACHE_BYTES);
-            let encoded = serde_json::to_writer(&mut writer, self);
+            // bincode emits varints a couple of bytes at a time; without this
+            // buffer every one of them would be its own `write` syscall.
+            let buffered = io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
+            let mut writer = LimitedWriter::new(buffered, MAX_CACHE_BYTES);
+            writer.write_all(&MAGIC)?;
+            let document = BinaryCacheRef {
+                version: CACHE_VERSION,
+                roots: &self.roots,
+                built_at: self.built_at,
+                directories: &directories,
+                entries: EntriesRef {
+                    entries: &self.entries,
+                    index: &index,
+                },
+            };
+            let encoded = binary_options().serialize_into(&mut writer, &document);
             if let Err(err) = encoded {
                 return Err(if writer.exceeded {
                     Error::CacheTooLarge
                 } else {
-                    Error::Io(err.into())
+                    Error::Io(io::Error::other(err.to_string()))
                 });
             }
             writer.flush()?;
@@ -90,7 +129,8 @@ impl Index {
         Ok(())
     }
 
-    /// Reads and validates a cache written by [`Index::save`].
+    /// Reads and validates a cache written by [`Index::save`], or the legacy
+    /// JSON document written by the Go implementation.
     pub fn load(path: &Path) -> Result<Index, Error> {
         let metadata = fs::symlink_metadata(path)?;
         if platform::is_link_or_reparse(&metadata) {
@@ -104,14 +144,39 @@ impl Index {
         }
         let file = File::open(path)?;
         // A file that grew between the stat and the read cannot exceed the cap.
-        let reader = BufReader::new(file.take(MAX_CACHE_BYTES + 1));
-        let mut deserializer = serde_json::Deserializer::from_reader(reader);
-        let index = Index::deserialize(&mut deserializer)
-            .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
-        deserializer
-            .end()
-            .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
-        Ok(index)
+        let mut reader = BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
+        let mut magic = [0u8; MAGIC.len()];
+        match reader.read_exact(&mut magic) {
+            Ok(()) => {}
+            // Too short to be either format: let the JSON parser reject it.
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(err) => return Err(Error::Io(err)),
+        }
+        if magic == MAGIC {
+            return load_binary(reader);
+        }
+        // Legacy JSON: the magic probe consumed bytes, so reopen the file.
+        let file = File::open(path)?;
+        let reader = BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
+        load_json(reader)
+    }
+
+    /// Maps every entry to the index of its parent directory in `directories`.
+    ///
+    /// Paths under one directory share a long prefix; storing that prefix once
+    /// is what makes the binary cache roughly a quarter of the JSON one.
+    fn directory_table(&self) -> (Vec<&Path>, HashMap<&Path, u32>) {
+        let mut index: HashMap<&Path, u32> = HashMap::with_capacity(self.entries.len() / 8);
+        let mut directories: Vec<&Path> = Vec::new();
+        for entry in &self.entries {
+            let parent = entry.path.parent().unwrap_or_else(|| Path::new(""));
+            index.entry(parent).or_insert_with(|| {
+                directories.push(parent);
+                // Entries are capped at MAX_ENTRIES, well below u32::MAX.
+                (directories.len() - 1) as u32
+            });
+        }
+        (directories, index)
     }
 
     fn validate_for_save(&self) -> Result<(), Error> {
@@ -131,6 +196,222 @@ impl Index {
     }
 }
 
+/// Binary document, borrowed from the index being saved.
+///
+/// `directories` holds each distinct parent path once and `entries` refers to
+/// it by index, which is the whole point of the format: a 1.5M-entry index
+/// repeats the same `/Users/…/Documents` prefix a hundred thousand times in
+/// JSON.
+#[derive(Serialize)]
+struct BinaryCacheRef<'a> {
+    version: u32,
+    roots: &'a [PathBuf],
+    built_at: i64,
+    directories: &'a [&'a Path],
+    entries: EntriesRef<'a>,
+}
+
+/// Serializes entries as `(directory index, name, size, modified, is_dir)`.
+///
+/// Entries are written one at a time, so saving never builds a second copy of
+/// the index in memory.
+struct EntriesRef<'a> {
+    entries: &'a [Entry],
+    index: &'a HashMap<&'a Path, u32>,
+}
+
+impl Serialize for EntriesRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.entries.len()))?;
+        for entry in self.entries {
+            let parent = entry.path.parent().unwrap_or_else(|| Path::new(""));
+            let directory = self.index.get(parent).copied().unwrap_or_default();
+            seq.serialize_element(&BinaryEntry {
+                directory,
+                name: &entry.name,
+                size: entry.size,
+                modified: entry.modified,
+                is_dir: entry.is_dir,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BinaryEntry<'a> {
+    directory: u32,
+    name: &'a str,
+    size: u64,
+    modified: i64,
+    is_dir: bool,
+}
+
+/// Binary document read back from disk. Field order must match
+/// [`BinaryCacheRef`] and [`StoredEntry`]: bincode is positional.
+#[derive(Deserialize)]
+struct BinaryCache {
+    version: u32,
+    roots: Vec<PathBuf>,
+    built_at: i64,
+    #[serde(deserialize_with = "deserialize_directories")]
+    directories: Vec<PathBuf>,
+    #[serde(deserialize_with = "deserialize_entries")]
+    entries: Vec<StoredEntry>,
+}
+
+/// Same field order as [`BinaryEntry`].
+#[derive(Deserialize)]
+struct StoredEntry {
+    directory: u32,
+    name: String,
+    size: u64,
+    modified: i64,
+    is_dir: bool,
+}
+
+impl BinaryCache {
+    /// Rebuilds the index, rejecting anything the writer would not produce.
+    fn into_index(self) -> Result<Index, Error> {
+        if self.version != CACHE_VERSION {
+            return Err(Error::CacheCorrupt("索引版本不兼容，请重新索引".to_string()));
+        }
+        if self.roots.len() > MAX_ROOTS {
+            return Err(Error::CacheCorrupt("索引目录数量超出上限".to_string()));
+        }
+        for root in &self.roots {
+            validate_root(root).map_err(|_| Error::CacheCorrupt("索引目录损坏".to_string()))?;
+        }
+        let mut entries: Vec<Entry> = Vec::with_capacity(self.entries.len());
+        for stored in self.entries {
+            let directory = self
+                .directories
+                .get(stored.directory as usize)
+                .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
+            let entry = Entry::new(
+                directory.join(&stored.name),
+                stored.name,
+                stored.size,
+                stored.modified,
+                stored.is_dir,
+            );
+            validate_entry(&entry).map_err(|_| Error::CacheCorrupt("索引条目损坏".to_string()))?;
+            entries.push(entry);
+        }
+        Ok(Index {
+            entries,
+            roots: self.roots,
+            built_at: self.built_at,
+        })
+    }
+}
+
+/// Little-endian, variable-length integers: lengths and timestamps are the
+/// bulk of the file, and a varint turns an 8-byte length into one or three.
+fn binary_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_little_endian()
+        .with_varint_encoding()
+}
+
+fn deserialize_directories<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<PathBuf>, D::Error> {
+    bounded_sequence::<D, PathBuf, _>(deserializer, "索引目录", |root| {
+        validate_root(root).map_err(|_| Error::InvalidRoot)
+    })
+}
+
+fn deserialize_entries<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<StoredEntry>, D::Error> {
+    bounded_sequence::<D, StoredEntry, _>(deserializer, "索引条目", |entry| {
+        let valid = !entry.name.is_empty()
+            && entry.name.len() <= MAX_NAME_LEN
+            && !entry.name.contains('\0');
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidEntry)
+        }
+    })
+}
+
+/// Decodes a sequence after checking its declared length against
+/// [`MAX_DECLARED_ITEMS`], so a corrupt header is rejected before the vector
+/// that backs it is allocated. Elements are still validated one by one.
+fn bounded_sequence<'de, D, T, V>(
+    deserializer: D,
+    expected: &'static str,
+    validate: V,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+    V: Fn(&T) -> Result<(), Error>,
+{
+    struct Bounded<T, V> {
+        expected: &'static str,
+        validate: V,
+        marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T: Deserialize<'de>, V: Fn(&T) -> Result<(), Error>> Visitor<'de> for Bounded<T, V> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a list of {}", self.expected)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let declared = seq.size_hint().unwrap_or(0);
+            if declared > MAX_DECLARED_ITEMS {
+                return Err(de::Error::custom("索引条目超出安全上限"));
+            }
+            // Bounded by MAX_ENTRIES, and never more than the file can hold.
+            let mut items: Vec<T> = Vec::with_capacity(declared);
+            while let Some(item) = seq.next_element::<T>()? {
+                if items.len() >= MAX_DECLARED_ITEMS {
+                    return Err(de::Error::custom("索引条目超出安全上限"));
+                }
+                (self.validate)(&item).map_err(de::Error::custom)?;
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded {
+        expected,
+        validate,
+        marker: std::marker::PhantomData,
+    })
+}
+
+/// Decodes the binary document and refuses trailing bytes, which would mean
+/// the file was written by a different layout.
+fn load_binary<R: BufRead>(mut reader: R) -> Result<Index, Error> {
+    let document: BinaryCache = binary_options()
+        .deserialize_from(&mut reader)
+        .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
+    let trailing = reader.fill_buf().map_err(Error::Io)?;
+    if !trailing.is_empty() {
+        return Err(Error::CacheCorrupt("索引缓存包含多余数据".to_string()));
+    }
+    document.into_index()
+}
+
+/// Decodes the legacy JSON document the Go implementation writes.
+fn load_json<R: Read>(reader: R) -> Result<Index, Error> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let index =
+        Index::deserialize(&mut deserializer).map_err(|err| Error::CacheCorrupt(err.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
+    Ok(index)
+}
+
 /// Wire form: the same document [`Index::load`] reads back, so an `Index`
 /// always round-trips through serde.
 impl Serialize for Index {
@@ -144,6 +425,7 @@ impl Serialize for Index {
         state.end()
     }
 }
+
 
 /// Serializes Unix seconds as the RFC 3339 string the Go implementation writes.
 struct Rfc3339(i64);

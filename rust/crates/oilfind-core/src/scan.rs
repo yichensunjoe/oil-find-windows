@@ -3,11 +3,11 @@
 use crate::entry::{file_name_of, Entry, Index, Progress};
 use crate::error::Error;
 use crate::platform;
-use std::cell::Cell;
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Instant, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
 
 /// Hard ceiling on the number of indexed entries.
@@ -21,7 +21,7 @@ const CANCEL_CHECK_INTERVAL: usize = 256;
 
 /// Minimum interval between progress callbacks, so a large scan does not flood
 /// the UI thread with events.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+const PROGRESS_INTERVAL_MS: u64 = 150;
 
 /// Directories that are internal to a project or to a private agent runtime.
 /// Their names are specific enough that skipping them at any depth does not
@@ -67,6 +67,12 @@ const SYSTEM_ROOT_DIRS: &[&str] = &[
 /// The scan is all-or-nothing: cancelling or hitting [`MAX_ENTRIES`] returns an
 /// error instead of a partial index, so callers can never publish a truncated
 /// cache.
+///
+/// The top level of every root is read serially, then each immediate
+/// subdirectory is handed to the rayon pool as its own `walkdir` job. Keeping
+/// one `walkdir` per subtree preserves the pruning rules (`filter_entry` still
+/// rejects links and skipped directories before descending) while letting the
+/// per-entry `lstat` calls — the actual cost of a scan — run on all cores.
 pub fn scan(
     cancel: &AtomicBool,
     roots: &[PathBuf],
@@ -77,101 +83,36 @@ pub fn scan(
         return Err(Error::Cancelled);
     }
 
-    let reporter = Reporter::new(&progress);
-    let skipped = Cell::new(0usize);
+    let shared = Shared {
+        cancel,
+        limit_reached: AtomicBool::new(false),
+        visited: AtomicUsize::new(0),
+        skipped: AtomicUsize::new(0),
+        reporter: Reporter::new(&progress),
+    };
     let mut entries: Vec<Entry> = Vec::with_capacity(1024);
-    let mut visited = 0usize;
-    let mut since_cancel_check = 0usize;
 
     for root in &normalized {
-        let mut walker = WalkDir::new(root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| keep_entry(entry, &skipped));
-
-        while let Some(item) = walker.next() {
-            since_cancel_check += 1;
-            if since_cancel_check >= CANCEL_CHECK_INTERVAL {
-                since_cancel_check = 0;
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Error::Cancelled);
-                }
-            }
-            let entry = match item {
-                Ok(entry) => entry,
-                Err(err) => {
-                    // Unreadable directories and vanished entries are counted
-                    // and skipped; one bad branch must not abort the scan.
-                    skipped.set(skipped.get() + 1);
-                    reporter.emit(
-                        false,
-                        visited,
-                        skipped.get(),
-                        err.path().unwrap_or(root.as_path()),
-                    );
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if entry.depth() == 0 {
-                continue;
-            }
-            if entry.file_type().is_dir() && is_package_dir(path) {
-                // Index the bundle itself (so Xcode.app is findable) but never
-                // walk its internals: a single .app can hold hundreds of
-                // thousands of files.
-                walker.skip_current_dir();
-            }
-            let metadata = match fs::symlink_metadata(path) {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    skipped.set(skipped.get() + 1);
-                    reporter.emit(false, visited, skipped.get(), path);
-                    continue;
-                }
-            };
-            if platform::is_link_or_reparse(&metadata) {
-                skipped.set(skipped.get() + 1);
-                reporter.emit(false, visited, skipped.get(), path);
-                continue;
-            }
-            let is_dir = metadata.is_dir();
-            if is_dir && should_skip_dir(path) {
-                skipped.set(skipped.get() + 1);
-                reporter.emit(false, visited, skipped.get(), path);
-                continue;
-            }
-            if !is_dir && !metadata.is_file() {
-                skipped.set(skipped.get() + 1);
-                continue;
-            }
-            let size = if is_dir { 0 } else { metadata.len() };
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|elapsed| elapsed.as_secs() as i64)
-                .unwrap_or(0);
-            entries.push(Entry::new(
-                path.to_path_buf(),
-                file_name_of(path),
-                size,
-                modified,
-                is_dir,
-            ));
-            visited += 1;
-            if entries.len() >= MAX_ENTRIES {
-                return Err(Error::EntryLimit);
-            }
-            reporter.emit(false, visited, skipped.get(), path);
-        }
+        let mut directories: Vec<PathBuf> = Vec::new();
+        read_top_level(&shared, root, &mut entries, &mut directories)?;
+        let chunks: Vec<Vec<Entry>> = directories
+            .par_iter()
+            .map(|directory| walk_subtree(&shared, directory))
+            .collect::<Result<Vec<_>, Error>>()?;
+        entries.extend(chunks.into_iter().flatten());
+        check_stop(&shared)?;
     }
 
-    // Deterministic order, independent of directory iteration order.
+    // Deterministic order, independent of directory iteration order and of the
+    // order in which the parallel subtrees finished.
     entries.sort_by(|a, b| a.lower_path().cmp(b.lower_path()));
     let last_root = normalized.last().map_or_else(PathBuf::new, Clone::clone);
-    reporter.emit(true, visited, skipped.get(), &last_root);
+    shared.reporter.emit(
+        true,
+        shared.visited.load(Ordering::Relaxed),
+        shared.skipped.load(Ordering::Relaxed),
+        &last_root,
+    );
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
@@ -180,6 +121,204 @@ pub fn scan(
         roots: normalized,
         built_at: crate::time::now_secs(),
     })
+}
+
+/// Reads the immediate children of `root`.
+///
+/// Files are indexed right here; directories are collected into `directories`
+/// so they can be walked in parallel. The root itself is never an entry, but
+/// every subdirectory is (matching the depth-based rule the sequential walk
+/// used).
+fn read_top_level(
+    shared: &Shared<'_, impl Fn(Progress) + Sync>,
+    root: &Path,
+    entries: &mut Vec<Entry>,
+    directories: &mut Vec<PathBuf>,
+) -> Result<(), Error> {
+    let reader = match fs::read_dir(root) {
+        Ok(reader) => reader,
+        Err(_) => {
+            // An unreadable root contributes nothing, exactly like the walkdir
+            // error path: it is counted, reported and skipped.
+            shared.skip(root);
+            return Ok(());
+        }
+    };
+    for item in reader {
+        check_stop(shared)?;
+        let item = match item {
+            Ok(item) => item,
+            Err(_) => {
+                shared.skip(root);
+                continue;
+            }
+        };
+        let path = item.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                shared.skip(&path);
+                continue;
+            }
+        };
+        if platform::is_link_or_reparse(&metadata) {
+            shared.skip(&path);
+            continue;
+        }
+        if metadata.is_dir() {
+            if should_skip_dir(&path) {
+                shared.skip(&path);
+                continue;
+            }
+            if is_package_dir(&path) {
+                // Index the bundle itself (so Xcode.app is findable) but never
+                // walk its internals: a single .app can hold hundreds of
+                // thousands of files.
+                push_entry(shared, entries, &path, &metadata)?;
+                continue;
+            }
+            directories.push(path);
+            continue;
+        }
+        if !metadata.is_file() {
+            shared.skip_quiet();
+            continue;
+        }
+        push_entry(shared, entries, &path, &metadata)?;
+    }
+    Ok(())
+}
+
+/// Walks one subdirectory serially, returning the entries it contains.
+///
+/// `root` is the directory this job was started for; it has already been
+/// validated by [`read_top_level`], so it is indexed like any other child.
+fn walk_subtree(
+    shared: &Shared<'_, impl Fn(Progress) + Sync>,
+    root: &Path,
+) -> Result<Vec<Entry>, Error> {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| keep_entry(entry, &shared.skipped));
+    let mut since_cancel_check = 0usize;
+
+    while let Some(item) = walker.next() {
+        since_cancel_check += 1;
+        if since_cancel_check >= CANCEL_CHECK_INTERVAL {
+            since_cancel_check = 0;
+            check_stop(shared)?;
+        }
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(err) => {
+                // Unreadable directories and vanished entries are counted and
+                // skipped; one bad branch must not abort the scan.
+                shared.skip(err.path().unwrap_or(root));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if entry.depth() > 0 && entry.file_type().is_dir() && is_package_dir(path) {
+            walker.skip_current_dir();
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                shared.skip(path);
+                continue;
+            }
+        };
+        if platform::is_link_or_reparse(&metadata) {
+            shared.skip(path);
+            continue;
+        }
+        let is_dir = metadata.is_dir();
+        if is_dir && should_skip_dir(path) {
+            shared.skip(path);
+            continue;
+        }
+        if !is_dir && !metadata.is_file() {
+            shared.skip_quiet();
+            continue;
+        }
+        push_entry(shared, &mut entries, path, &metadata)?;
+    }
+    check_stop(shared)?;
+    Ok(entries)
+}
+
+/// Shared, thread-safe state of one scan.
+struct Shared<'a, F: Fn(Progress) + Sync> {
+    cancel: &'a AtomicBool,
+    /// Set once [`MAX_ENTRIES`] is reached so every other job stops early.
+    limit_reached: AtomicBool,
+    visited: AtomicUsize,
+    skipped: AtomicUsize,
+    reporter: Reporter<'a, F>,
+}
+
+impl<F: Fn(Progress) + Sync> Shared<'_, F> {
+    /// Counts a rejected entry and reports it.
+    fn skip(&self, current: &Path) {
+        let skipped = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
+        self.reporter
+            .emit(false, self.visited.load(Ordering::Relaxed), skipped, current);
+    }
+
+    /// Counts a rejected entry that the sequential walk never reported either
+    /// (special files such as sockets).
+    fn skip_quiet(&self) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records one entry, enforcing [`MAX_ENTRIES`] across all workers.
+fn push_entry<F: Fn(Progress) + Sync>(
+    shared: &Shared<'_, F>,
+    entries: &mut Vec<Entry>,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), Error> {
+    let is_dir = metadata.is_dir();
+    let size = if is_dir { 0 } else { metadata.len() };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    entries.push(Entry::new(
+        path.to_path_buf(),
+        file_name_of(path),
+        size,
+        modified,
+        is_dir,
+    ));
+    let visited = shared.visited.fetch_add(1, Ordering::Relaxed) + 1;
+    if visited >= MAX_ENTRIES {
+        shared.limit_reached.store(true, Ordering::Relaxed);
+        return Err(Error::EntryLimit);
+    }
+    shared.reporter.emit(
+        false,
+        visited,
+        shared.skipped.load(Ordering::Relaxed),
+        path,
+    );
+    Ok(())
+}
+
+/// Fails the whole scan once the caller cancelled or the entry ceiling is hit.
+fn check_stop<F: Fn(Progress) + Sync>(shared: &Shared<'_, F>) -> Result<(), Error> {
+    if shared.cancel.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    if shared.limit_reached.load(Ordering::Relaxed) {
+        return Err(Error::EntryLimit);
+    }
+    Ok(())
 }
 
 /// macOS package directories whose contents are implementation details.
@@ -203,14 +342,14 @@ fn is_package_dir(path: &Path) -> bool {
 
 /// `filter_entry` predicate: prunes links and skipped directories before the
 /// walker descends into them, which is what keeps `node_modules` cheap.
-fn keep_entry(entry: &DirEntry, skipped: &Cell<usize>) -> bool {
+fn keep_entry(entry: &DirEntry, skipped: &AtomicUsize) -> bool {
     let file_type = entry.file_type();
     if file_type.is_symlink() {
-        skipped.set(skipped.get() + 1);
+        skipped.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if file_type.is_dir() && should_skip_dir(entry.path()) {
-        skipped.set(skipped.get() + 1);
+        skipped.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     true
@@ -346,28 +485,63 @@ fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
 }
 
 /// Throttled progress reporting.
+///
+/// Workers emit concurrently, so the callback is gated by a CAS on
+/// `next_emit_ms` (at most one report per interval) and the reported counters
+/// are clamped to the highest value already reported: `visited` and `skipped`
+/// never go backwards even when two workers interleave.
 struct Reporter<'a, F: Fn(Progress)> {
     inner: &'a F,
-    last: Cell<Instant>,
+    start: Instant,
+    next_emit_ms: AtomicU64,
+    reported_visited: AtomicUsize,
+    reported_skipped: AtomicUsize,
 }
 
 impl<'a, F: Fn(Progress)> Reporter<'a, F> {
     fn new(inner: &'a F) -> Self {
         Reporter {
             inner,
-            last: Cell::new(Instant::now()),
+            start: Instant::now(),
+            next_emit_ms: AtomicU64::new(0),
+            reported_visited: AtomicUsize::new(0),
+            reported_skipped: AtomicUsize::new(0),
         }
     }
 
     fn emit(&self, force: bool, visited: usize, skipped: usize, current: &Path) {
-        if force || self.last.get().elapsed() >= PROGRESS_INTERVAL {
-            (self.inner)(Progress {
-                visited,
-                skipped,
-                current: current.to_path_buf(),
-            });
-            self.last.set(Instant::now());
+        if !force {
+            let now = self.start.elapsed().as_millis() as u64;
+            let next = self.next_emit_ms.load(Ordering::Relaxed);
+            if now < next {
+                return;
+            }
+            if self
+                .next_emit_ms
+                .compare_exchange(
+                    next,
+                    now + PROGRESS_INTERVAL_MS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                return;
+            }
         }
+        let visited = self
+            .reported_visited
+            .fetch_max(visited, Ordering::Relaxed)
+            .max(visited);
+        let skipped = self
+            .reported_skipped
+            .fetch_max(skipped, Ordering::Relaxed)
+            .max(skipped);
+        (self.inner)(Progress {
+            visited,
+            skipped,
+            current: current.to_path_buf(),
+        });
     }
 }
 
