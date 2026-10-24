@@ -1,4 +1,4 @@
-name: Open-source intranet CI
+name: Windows CI
 
 on:
   push:
@@ -9,27 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  macos-open-source:
-    runs-on: macos-14
-    env:
-      CI: "true"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Show Swift toolchain
-        run: swift --version
-      - name: Build release app
-        run: swift build -c release
-      - name: Test isolated public-source fixtures
-        run: swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.IntranetUpdateTests/'
-      - name: Check open-source boundary
-        run: python3 Tests/Scripts/test_open_core.py
-      - name: Check packaging script syntax
-        run: bash -n scripts/build-app.sh scripts/package.sh
-
   windows-local-search:
+    name: Build, test and verify (Windows x64)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -38,23 +19,24 @@ jobs:
           persist-credentials: false
       - name: Show Go toolchain
         run: go version
-      - name: Build and test Windows client
+      - name: Build, test and package
         shell: pwsh
         run: ./windows/scripts/build.ps1 -GoBin go
       - name: Verify PE subsystem and embedded manifest
         shell: pwsh
         run: python ./windows/scripts/verify-pe.py ./outputs/windows-amd64/OilFindIntranet.exe --arch amd64
       - name: Upload unsigned preview artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oil-find-intranet-windows-amd64-unsigned
           path: outputs/windows-amd64/
           if-no-files-found: error
 
-  windows-heavy-cache-limit:
+  heavy-cache-limit:
     # Manual only: streams MaxEntries+1 entries and needs roughly 950MB RSS.
     # Run it after changing Load/Save limits in windows/internal/index.
     if: github.event_name == 'workflow_dispatch'
+    name: Heavy cache-limit check (manual)
     runs-on: windows-latest
     steps:
       - name: Checkout

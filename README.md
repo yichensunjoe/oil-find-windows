@@ -2,7 +2,7 @@
 
 ## 用途
 
-基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 公开源码建立的公司内网改造项目。仅使用 MIT 开源部分，不包含、不加载上游未开源 Pro 模块。
+基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 公开源码建立的企业内部内网改造项目。仅使用 MIT 开源部分，不包含、不加载上游未开源 Pro 模块。
 
 当前提供两个平台入口，共用同一公开功能边界（文件名搜索、纯本地、无 Pro）：
 
