@@ -71,6 +71,6 @@ python3 scripts/verify-pe.py ../outputs/windows-amd64/OilFindIntranet.exe --arch
 
 ## Git 与备份
 
-- 独立仓库，分支 `main`；`origin` 为公开仓库 `yichensunjoe/oil-find-intranet`，`upstream` 仅追踪来源、推送地址已禁用。
-- 推送前确认不含密钥、构建产物、个人路径或内部主机信息；公开仓库内容视为已发布。
+- 独立仓库，分支 `main`；`origin` 为私有仓库 `yichensunjoe/oil-find-intranet`，`upstream` 仅追踪来源、推送地址已禁用。
+- 推送前确认不含密钥、构建产物、个人路径或内部主机信息；仓库虽为私有，仍按“内容会被他人看到”的标准检查，改回公开需明确授权。
 - 密钥、索引、依赖、构建产物、应用安装包、个人会话数据不提交。保留上游历史，不改写已发布提交。

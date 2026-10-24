@@ -1,6 +1,6 @@
 # P088-oil-find-intranet
 
-[![Windows CI](https://github.com/yichensunjoe/oil-find-intranet/actions/workflows/ci.yml/badge.svg)](https://github.com/yichensunjoe/oil-find-intranet/actions/workflows/ci.yml)
+> 私有仓库。CI（只跑 Windows）在 GitHub Actions 中运行，需登录仓库后查看。
 
 ## 用途
 

@@ -13,7 +13,7 @@
 - macOS 侧：`swift build -c release` 与 30 项 Swift + 2 项 Python 隔离测试通过（上一轮）。
 - 未验证：Windows 真机 GUI 交互、DPI/多显示器、ACL 拒绝、取消/重启、SmartScreen/杀软、OneDrive 占位文件；EXE 未代码签名；PowerShell 脚本未在本机执行（无 pwsh）。
 - 已知限制：30 秒全量快照同步（非 USN 实时）；无共享盘/正文检索；无删除入口；无应用图标；索引常驻内存、上限 200 万条；结果最多显示 2000 条；`regex:` 依赖 RE2，无回溯爆炸但语法与 PCRE 不同。
-- 版本与备份：公开仓库 `https://github.com/yichensunjoe/oil-find-intranet`（origin，main），CI 只跑 Windows；`upstream` 仅追踪来源、push URL 禁用。公开前已清理个人路径与工作区指向，未含密钥/构建产物。异机备份即 GitHub 远端。
+- 版本与备份：**私有**仓库 `https://github.com/yichensunjoe/oil-find-intranet`（origin，main，2026-10-24 由公开改为私有），CI 只跑 Windows；`upstream` 仅追踪来源、push URL 禁用。公开前已清理个人路径与工作区指向，未含密钥/构建产物。异机备份即 GitHub 远端。
 - 下一步：公司 Windows 电脑按 `windows/USAGE.txt` 试点验收 → 确认签名/分发策略 → 视需要加图标、NTFS USN 增量、独立 AppId。
 
 ## 近期轮次（最新在上，保留全部）
