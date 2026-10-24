@@ -41,3 +41,35 @@
 - 已验证：`swift build -c release`；Swift debug 白名单 30/30；`test_open_core.py` 2/2；`bash -n`、manifest 无外部依赖/Pro、`git diff --check`。
 - 已知限制：上游部分全量测试访问真实个人目录；release 测试因上游 DEBUG-only helper 不能编译，故 release build 与 debug test 分开；存在上游 weak capture 警告。
 - 未验证：macOS 应用打包/签名/安装/启动、真实文件扫描、完整测试集。
+
+---
+
+## 下一步（内存优化第二轮，接续点）
+
+**现状**：HEAD = `96943af`，工作区干净，65 测试 / clippy 0 / fmt 干净，三平台 CI 绿。
+内存仍约 786MB（1.5M 条目）。第一轮（去掉 name/lower_name 冗余字符串）已落地并推送。
+
+**未完成的改动在 `git stash list` 的 `stash@{0}`**（`WIP on rust: 96943af`），
+`git stash show -p` 可看全部 diff，`git stash pop` 恢复。内容是第二轮尝试：
+`Entry` 改存 `dir: Arc<str>` + `lower_dir: Arc<str>`，扫描侧用 `DirCache` 内联，
+缓存加载侧用文档自带的目录表共享，排序改用 `entry::compare_entries`。
+扫描路径实测 RSS 786MB → 691MB（-12%），但**加载侧改完 cache_test 挂 7 个用例**，
+原因未定位，已回退。
+
+**新会话第一件事**：`git stash pop` 后只跑 `cargo test -p oilfind-core --test cache_test`，
+重点看这几个用例为何失败（断言指向"旧缓存被删/内容变化"，怀疑与 TempFile 原子替换交互有关，
+不是 Entry 结构本身）：
+- cache_cancelled_save_preserves_the_previous_index
+- cache_failed_save_preserves_the_previous_index
+- cache_rewrites_a_legacy_json_document_as_binary
+- 以及 cache_save_validates_entries_and_roots / cache_rejects_corruption_and_incompatible_versions
+  （这两个与 `validate_entry` 改成按 dir+name 校验有关：空 path 的夹具现在靠 `dir.is_empty()` 拒绝）
+
+**再往下的两个方向**（按预期收益排序）：
+1. `lower_name` 改为从 `lower_dir` 末段切（O(1) 零分配，省一条字符串/条目）
+2. 缓存加载侧共享目录（ stash 里已有雏形，修好测试即可）
+
+**验收口径**（每次改完都跑）：
+`cargo test --workspace` + `clippy -D warnings` + `fmt --check`，
+然后 `/usr/bin/time -l ./target/release/oilfind-cli -cache <cache> -query 报告 -limit 3` 看 peak RSS，
+扫描用 `-scan -root "$HOME" -root /Applications`。基线：1,519,199 条 / 25s / 66MB / 786MB。
