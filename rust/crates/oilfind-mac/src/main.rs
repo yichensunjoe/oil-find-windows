@@ -93,6 +93,17 @@ impl App {
             cache_path,
         };
         app.load_state();
+        if app.roots.is_empty() {
+            // First launch: index the user's own files like a normal desktop
+            // search tool, instead of starting empty.
+            app.roots = default_roots();
+            app.save_config();
+            if !app.roots.is_empty() {
+                app.start_scan();
+            }
+        } else if app.index.is_none() {
+            app.start_scan();
+        }
         app
     }
 
@@ -507,6 +518,20 @@ fn install_cjk_font(ctx: &egui::Context) {
         ctx.set_fonts(fonts);
         return;
     }
+}
+
+/// `<home>` plus `/Applications`: everything the user thinks of as "my files",
+/// without walking `/System` and `/private`.
+fn default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home);
+    }
+    let applications = PathBuf::from("/Applications");
+    if applications.is_dir() {
+        roots.push(applications);
+    }
+    roots
 }
 
 fn storage_paths() -> (Option<PathBuf>, Option<PathBuf>) {

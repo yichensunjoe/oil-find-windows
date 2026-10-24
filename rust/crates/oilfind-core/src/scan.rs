@@ -84,13 +84,13 @@ pub fn scan(
     let mut since_cancel_check = 0usize;
 
     for root in &normalized {
-        let walker = WalkDir::new(root)
+        let mut walker = WalkDir::new(root)
             .follow_links(false)
             .sort_by_file_name()
             .into_iter()
             .filter_entry(|entry| keep_entry(entry, &skipped));
 
-        for item in walker {
+        while let Some(item) = walker.next() {
             since_cancel_check += 1;
             if since_cancel_check >= CANCEL_CHECK_INTERVAL {
                 since_cancel_check = 0;
@@ -116,6 +116,12 @@ pub fn scan(
             let path = entry.path();
             if entry.depth() == 0 {
                 continue;
+            }
+            if entry.file_type().is_dir() && is_package_dir(path) {
+                // Index the bundle itself (so Xcode.app is findable) but never
+                // walk its internals: a single .app can hold hundreds of
+                // thousands of files.
+                walker.skip_current_dir();
             }
             let metadata = match fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
@@ -176,6 +182,25 @@ pub fn scan(
     })
 }
 
+/// macOS package directories whose contents are implementation details.
+fn is_package_dir(path: &Path) -> bool {
+    const SUFFIXES: [&str; 8] = [
+        ".app",
+        ".bundle",
+        ".framework",
+        ".plugin",
+        ".kext",
+        ".appex",
+        ".xpc",
+        ".xcodeproj",
+    ];
+    let name = match path.file_name() {
+        Some(name) => name.to_string_lossy().to_lowercase(),
+        None => return false,
+    };
+    SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+}
+
 /// `filter_entry` predicate: prunes links and skipped directories before the
 /// walker descends into them, which is what keeps `node_modules` cheap.
 fn keep_entry(entry: &DirEntry, skipped: &Cell<usize>) -> bool {
@@ -204,23 +229,42 @@ pub(crate) fn should_skip_dir(path: &Path) -> bool {
     if SYSTEM_ROOT_DIRS.contains(&name.as_str()) {
         return path.parent().is_some_and(platform::is_volume_root);
     }
+    // macOS keeps caches, mail and app containers under `<home>/Library` and
+    // trash under `<home>/.Trash`; a project folder with the same name must
+    // stay searchable, so the rule only fires directly under a user profile.
+    if HOME_CACHES.contains(&name.as_str()) {
+        return under_user_profile(path);
+    }
     if name == "appdata" {
         // Only `<volume>\Users\<profile>\AppData` (and the Unix `/Users/...`,
         // `/home/...` equivalents) is a cache folder. A project folder named
         // appdata must stay searchable.
-        let Some(profile) = path.parent() else {
-            return false;
-        };
-        let Some(users) = profile.parent() else {
-            return false;
-        };
-        let users_name = users
-            .file_name()
-            .map(|name| name.to_string_lossy().to_lowercase());
-        return matches!(users_name.as_deref(), Some("users") | Some("home"))
-            && users.parent().is_some_and(platform::is_volume_root);
+        return under_user_profile(path);
     }
     false
+}
+
+/// Tool caches that live directly under the home directory. They hold hundreds
+/// of thousands of files and none of them is something a user searches for.
+const HOME_CACHES: [&str; 11] = [
+    "library", ".trash", ".cargo", ".rustup", ".cache", ".npm", ".gradle", ".m2", ".conda",
+    ".pyenv", ".nvm",
+];
+
+/// True for `<volume>/Users/<profile>/<dir>` (macOS/Linux) and
+/// `<volume>\Users\<profile>\<dir>` (Windows).
+fn under_user_profile(path: &Path) -> bool {
+    let Some(profile) = path.parent() else {
+        return false;
+    };
+    let Some(users) = profile.parent() else {
+        return false;
+    };
+    let users_name = users
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase());
+    matches!(users_name.as_deref(), Some("users") | Some("home"))
+        && users.parent().is_some_and(platform::is_volume_root)
 }
 
 /// Validates, cleans and de-duplicates the requested roots.
@@ -350,6 +394,12 @@ mod tests {
     fn appdata_only_applies_under_a_user_profile() {
         assert!(should_skip_dir(Path::new("/Users/joe/AppData")));
         assert!(should_skip_dir(Path::new("/home/joe/appdata")));
+        assert!(should_skip_dir(Path::new("/Users/joe/Library")));
+        assert!(should_skip_dir(Path::new("/Users/joe/.cargo")));
+        assert!(!should_skip_dir(Path::new("/Users/joe/projects/.cargo")));
+        assert!(should_skip_dir(Path::new("/Users/joe/.Trash")));
+        assert!(!should_skip_dir(Path::new("/Users/joe/projects/Library")));
+        assert!(!should_skip_dir(Path::new("/Volumes/Data/Library")));
         assert!(!should_skip_dir(Path::new("/Users/joe/project/appdata")));
         assert!(!should_skip_dir(Path::new("/Users/joe/AppData/Roaming")));
     }
