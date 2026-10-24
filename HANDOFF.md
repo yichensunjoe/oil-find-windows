@@ -7,7 +7,7 @@
 - 已完成（macOS 基线）：完整克隆 `oil-oil/oil-find` 1.7.1（`e63c7150`），保留历史与 MIT；固定纯公开 target，编译期禁用上游在线更新，离线打包不依赖 Pro/官网。
 - 已完成（Windows 首版）：`windows/` 独立客户端——Go 1.24+、原生 Win32、无 WebView/网络调用；显式目录范围 + 元数据索引 + 中文/拼音搜索 + 语法筛选 + 打开/定位/复制；缓存/配置在 `%APPDATA%\OilFindIntranet`。
 - 已验证：`go test ./...` 97 用例全通过（含 `-race`）；`vet`（index/cmd 全开；ui 仅关 unsafeptr，5 处 Win32 回调指针已人工审查）；`GOOS=windows amd64/arm64` 编译；`scripts/build.sh` 全流程通过；`verify-pe.py` 确认 amd64、GUI 子系统(2)、内嵌 asInvoker/Common-Controls v6/PerMonitorV2。
-- 交付物：`outputs/windows-amd64/`（GUI 4.4MB、CLI 4.3MB、LICENSE、THIRD_PARTY_NOTICES、USAGE）；`outputs/P088-OilFind-Windows-amd64-preview.zip` 3.3MB，SHA256 `494f1b75244c26b3e0ec21d189da0f2896579d0903a87a46b0302632a21eec0e`。
+- 交付物：`outputs/windows-amd64/`（GUI 4.4MB、CLI 4.3MB、LICENSE、THIRD_PARTY_NOTICES、USAGE）；`outputs/P088-OilFind-Windows-amd64-preview.zip` 3.3MB，SHA256 `7912e1d81f944fb70102820d3c686fc34a54937aabee10aabe5d55bd0c788f16`。
 - macOS 侧：`swift build -c release` 与 30 项 Swift + 2 项 Python 隔离测试通过（上一轮）。
 - 未验证：Windows 真机 GUI 交互、DPI/多显示器、ACL 拒绝、取消/重启、SmartScreen/杀软；EXE 未代码签名；PowerShell 脚本未在本机执行（无 pwsh）。
 - 已知限制：30 秒全量快照同步（非 USN 实时）；无共享盘/正文检索；无删除入口；无应用图标；索引常驻内存、上限 200 万条；结果最多显示 2000 条。

@@ -45,15 +45,13 @@ unset GOOS GOARCH
     export TEMP="$TEST_TMP_DIR"
     export TMP="$TEST_TMP_DIR"
     export TMPDIR="$TEST_TMP_DIR"
-    # TestLoadRejectsStreamOverEntryLimit is skipped by default (about 950MB RSS).
-    # Run it with OILFIND_HEAVY_TESTS=1 after changing Load/Save limits; the
-    # manual CI job windows-heavy-cache-limit does the same.
     "$GO_BIN" test ./...
 )
 
 # TestLoadRejectsStreamOverEntryLimit (MaxEntries+1 streamed entries, about
-# 900MB RSS) is skipped by default so packaging stays light. Run it on purpose
-# after touching the cache format:
+# 950MB RSS) is skipped by default so packaging stays light. Run it on purpose
+# after touching the cache format; the manual CI job windows-heavy-cache-limit
+# does the same:
 #   OILFIND_HEAVY_TESTS=1 "$GO_BIN" test ./internal/index -run TestLoadRejectsStreamOverEntryLimit
 
 # vet is split by package on purpose. The Win32 UI receives system pointers
