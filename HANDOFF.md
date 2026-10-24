@@ -2,14 +2,16 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-24 14:00，分支 `rust`：Rust 重写进行中）
+## 当前状态（2026-10-24 14:25，分支 `rust`）
 
-- **进度保留**：Go 实现完整留在 `main`，并打标签 `v0.1-go`（提交 `bbb4e43` 之后）。回退方式：`git checkout main`。
-- **重写分支**：`rust`。已删除 `windows/`（Go），新增 `rust/` Cargo workspace：`crates/oilfind-core`（扫描/索引/查询/缓存）、`crates/oilfind-win`（Win32 UI）、`crates/oilfind-cli`；`Sources/`（macOS Swift）保留，仅本机验收。
-- **工具链**：Rust 1.92 已固定于 `rust/rust-toolchain.toml`；本地已装 `x86_64-pc-windows-msvc` 目标用于类型检查（不链接）。
-- **CI**：改为 Windows-only（fmt → clippy → test → 打包 → PE 校验 → 上传产物）；仓库已重新设为 **public** 以使用免费 Windows runner。
-- 状态：核心引擎与 Win32 界面由两个 agent 并行实现中；尚未集成、未跑通 CI、未产出 Rust 二进制。
-- 下一步：合并两份实现 → `cargo test/clippy/fmt` → `cargo check --target x86_64-pc-windows-msvc` → 推送分支 → CI 绿 → 补文档与实测数据。
+- **Go 版保留**：`main` 分支完整保留 Go 实现，标签 `v0.1-go`；回退 `git checkout main`。
+- **Rust 版已跑通**：`rust` 分支（6 个提交）删除 `windows/`（Go），新增 `rust/` cargo workspace：`oilfind-core`（扫描/索引/查询/缓存）、`oilfind-win`（Win32 UI）、`oilfind-cli`。`Sources/`（macOS Swift）保留，仅本机验收。
+- **CI 全绿**（run 40069938323，Windows x64）：fmt → clippy `-D warnings` → test（60 项）→ 打包 → PE 校验（GUI 子系统 + asInvoker + Common-Controls v6 + PerMonitorV2）→ 上传产物（1.8MB）。
+- **本地已验证**：`cargo test --workspace` 60 项通过；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo fmt --check` 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；CLI 冒烟（字面 `[`、嵌套 windows/tmp、WPS、拼音 xmwd/hyjy、空引号报错）。
+- **与 Go 版的有意差异**：缓存仍是 JSON（可读 Go 版缓存），文件改名 `index.json`；`dm:` 改用**本地时区**（Go 版是 UTC，凌晨会差一天）；`appdata` 规则真正生效（Go 版实际未命中）；新增 `chrono` 依赖处理时区。
+- **未验证**：Windows 真机 UI 交互、DPI/多显示器、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。
+- **仓库**：公开 https://github.com/yichensunjoe/oil-find-windows （默认分支仍是 `main`＝Go 版）。
+- 下一步：真机验收 → 通过后把 `rust` 合入 `main` 并切换默认分支 → 再补图标/USN 增量。
 
 ## 历史状态（2026-10-24 11:55，Go 版，已冻结在 `main`）
 

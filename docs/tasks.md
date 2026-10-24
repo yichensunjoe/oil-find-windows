@@ -11,7 +11,16 @@
 - [x] 收口正式编译、隔离测试和交接。
 - [x] 本地检查结果补入交接：本项目无 error。
 
-### Windows 分支（第二阶段，进行中）
+### Windows：Rust 重写（分支 `rust`，已跑通）
+
+- [x] 保留 Go 版：`main` + 标签 `v0.1-go`。
+- [x] `rust/` cargo workspace：core（扫描/索引/查询/缓存）、win（Win32 UI）、cli。
+- [x] 本地 60 项测试、clippy `-D warnings`、fmt 通过；`cargo check --target x86_64-pc-windows-msvc` 通过。
+- [x] Windows CI 全绿：fmt → clippy → test → 打包 → PE 校验 → 上传产物。
+- [ ] Windows 真机验收（UI 交互、DPI、目录选择、定位/剪贴板、ACL、SmartScreen）。
+- [ ] 验收通过后合并到 `main` 并切换默认分支。
+
+### Windows：Go 版（已冻结在 `main`）
 
 - [x] 确认首版只做 Windows 本机文件搜索。
 - [x] Go 索引/搜索/缓存实现：显式范围、跳过 reparse/系统/依赖/私人目录、拒绝网络路径。

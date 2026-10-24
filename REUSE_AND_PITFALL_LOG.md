@@ -2,6 +2,18 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
+## 2026-10-24 · Go→Rust 重写：四个只在真实 Windows 上暴露的坑（Oil Find for Windows）
+
+- 场景：把已跑通的 Go + Win32 客户端重写为 Rust（windows-sys 原生控件），开发机是 macOS，只能靠 `cargo check --target x86_64-pc-windows-msvc` 与 GitHub Actions 的 windows-latest 验证。
+- 坑 1（**verbatim 路径**）：`std::fs::canonicalize` 在 Windows 返回 `\\?\C:\...`，被“拒绝 UNC/设备路径”的规则当成非法根，所有扫描测试失败。正解：校验前剥掉 `\\?\`（`\\?\UNC\` 还原成 `\\server\share` 再拒），并让测试夹具也返回去前缀路径，否则断言永远不相等。
+- 坑 2（**测试临时目录**）：Windows 的 `%TEMP%` 在 AppData 下，会被“排除 AppData”策略拒绝。正解：集成测试用 `env!("CARGO_TARGET_TMPDIR")`（项目内 `target/tmp`），不要放宽业务排除。
+- 坑 3（**JSON 里的 Windows 路径**）：手写 JSON 夹具直接拼 `C:\...`，反斜杠是非法转义，解析失败；Unix 上永远发现不了。正解：统一 `json_escape()`。
+- 坑 4（**rc.exe 的路径转义**）：`embed_resource::compile` 接收的是 `.rc` 脚本而不是 manifest；且 rc 字符串里的 `\a` 会被当转义序列，`RC.EXE failed to compile`。正解：生成 `1 24 "<manifest>"` 的 .rc，并把路径里的 `\` 换成 `/`。
+- 另：`HWND`（`*mut c_void`）不是 `Send`，后台线程只能捕获 `isize` 或专用 `SendHwnd` 包装，且只允许 `PostMessage`。
+- 时区：`dm:today` 必须用本地时区（chrono），UTC 会在 UTC+8 的凌晨差一天。
+- 验证：本地 60 项测试 + clippy `-D warnings` + fmt；CI（windows-latest）fmt/clippy/test/打包/PE 校验全绿。
+- 适用边界：任何“在 A 平台交叉编译、到 B 平台运行”的 Rust 桌面工具；尤其是路径、临时目录、rc.exe 与线程 Send 边界。
+
 ## 2026-10-24 · 独立审查抓到的 4 类“编译通过但真机会出错”的缺陷（Oil Find for Windows）
 
 - 场景：Windows 客户端在 macOS 上只能跨编译，无法运行；请独立 agent 只读审查 2200 行生产代码，结论“无阻断、有 3 项 HIGH”。
