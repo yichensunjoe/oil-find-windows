@@ -1,6 +1,6 @@
 //! Directory scanning: enumerate metadata under explicitly supplied roots.
 
-use crate::entry::{compare_entries, Entry, Index, Progress};
+use crate::entry::{compare_entries, Entry, Index, Progress, SharedDir};
 use crate::error::Error;
 use crate::platform;
 use rayon::prelude::*;
@@ -307,18 +307,18 @@ impl<F: Fn(Progress) + Sync> Shared<'_, F> {
 /// Interns the parent directory of a path so siblings share one allocation.
 #[derive(Default)]
 struct DirCache {
-    known: HashMap<String, (Arc<str>, Arc<str>)>,
+    known: HashMap<String, Arc<SharedDir>>,
 }
 
 impl DirCache {
-    fn intern(&mut self, path: &Path) -> (Arc<str>, Arc<str>) {
+    fn intern(&mut self, path: &Path) -> Arc<SharedDir> {
         let dir = path
             .parent()
             .map(|dir| dir.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.known
             .entry(dir.clone())
-            .or_insert_with(|| (dir.clone().into(), dir.to_lowercase().into()))
+            .or_insert_with(|| SharedDir::new(dir))
             .clone()
     }
 }
@@ -339,11 +339,9 @@ fn push_entry<F: Fn(Progress) + Sync>(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
-    let (dir, lower_dir) = dirs.intern(path);
+    let shared_dir = dirs.intern(path);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    entries.push(Entry::with_dir(
-        dir, lower_dir, &name, size, modified, is_dir,
-    ));
+    entries.push(Entry::with_dir(shared_dir, &name, size, modified, is_dir));
     let visited = shared.visited.fetch_add(1, Ordering::Relaxed) + 1;
     if visited >= MAX_ENTRIES {
         shared.limit_reached.store(true, Ordering::Relaxed);

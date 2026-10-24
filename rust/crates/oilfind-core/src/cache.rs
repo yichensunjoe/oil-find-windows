@@ -27,7 +27,7 @@
 //! renamed, so a failed or cancelled save always leaves the previous cache
 //! untouched.
 
-use crate::entry::{Entry, Index};
+use crate::entry::{Entry, Index, SharedDir};
 use crate::error::Error;
 use crate::platform;
 use crate::scan::{MAX_ENTRIES, MAX_ROOTS};
@@ -304,18 +304,13 @@ impl<'de> Visitor<'de> for BinaryCacheVisitor {
             .ok_or_else(|| de::Error::custom("索引缺少目录表"))?;
         // The document carries each directory once; sharing it between the
         // entries that live there is what keeps a loaded index small.
-        let shared_dirs: Vec<Arc<str>> = directories
+        let shared_dirs: Vec<Arc<SharedDir>> = directories
             .iter()
-            .map(|dir| Arc::from(dir.to_string_lossy().as_ref()))
-            .collect();
-        let shared_lower_dirs: Vec<Arc<str>> = directories
-            .iter()
-            .map(|dir| Arc::from(dir.to_string_lossy().to_lowercase().as_ref()))
+            .map(|dir| SharedDir::new(dir.to_string_lossy().into_owned()))
             .collect();
         let entries: Vec<Entry> = seq
             .next_element_seed(EntriesSeed {
                 shared_dirs: &shared_dirs,
-                shared_lower_dirs: &shared_lower_dirs,
             })?
             .ok_or_else(|| de::Error::custom("索引缺少条目列表"))?;
         Ok(BinaryCache {
@@ -376,8 +371,7 @@ const ENTRY_BATCH: usize = 8192;
 /// time keeps the decoded rows (one name per entry) from outliving the
 /// entries they become.
 struct EntriesSeed<'a> {
-    shared_dirs: &'a [Arc<str>],
-    shared_lower_dirs: &'a [Arc<str>],
+    shared_dirs: &'a [Arc<SharedDir>],
 }
 
 impl<'de> DeserializeSeed<'de> for EntriesSeed<'_> {
@@ -386,14 +380,12 @@ impl<'de> DeserializeSeed<'de> for EntriesSeed<'_> {
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_seq(EntriesVisitor {
             shared_dirs: self.shared_dirs,
-            shared_lower_dirs: self.shared_lower_dirs,
         })
     }
 }
 
 struct EntriesVisitor<'a> {
-    shared_dirs: &'a [Arc<str>],
-    shared_lower_dirs: &'a [Arc<str>],
+    shared_dirs: &'a [Arc<SharedDir>],
 }
 
 impl<'de> Visitor<'de> for EntriesVisitor<'_> {
@@ -424,8 +416,8 @@ impl<'de> Visitor<'de> for EntriesVisitor<'_> {
             if entries.len() + batch.len() > MAX_DECLARED_ITEMS {
                 return Err(de::Error::custom("索引条目超出安全上限"));
             }
-            let mut converted = convert_batch(&batch, self.shared_dirs, self.shared_lower_dirs)
-                .map_err(de::Error::custom)?;
+            let mut converted =
+                convert_batch(&batch, self.shared_dirs).map_err(de::Error::custom)?;
             entries.append(&mut converted);
             if batch.len() < ENTRY_BATCH {
                 break;
@@ -442,20 +434,16 @@ impl<'de> Visitor<'de> for EntriesVisitor<'_> {
 /// rejecting anything the writer would not produce.
 fn convert_batch(
     batch: &[StoredEntry],
-    shared_dirs: &[Arc<str>],
-    shared_lower_dirs: &[Arc<str>],
+    shared_dirs: &[Arc<SharedDir>],
 ) -> Result<Vec<Entry>, Error> {
     batch
         .par_iter()
         .map(|stored| {
-            let position = stored.directory as usize;
-            let (dir, lower_dir) = shared_dirs
-                .get(position)
-                .zip(shared_lower_dirs.get(position))
+            let shared = shared_dirs
+                .get(stored.directory as usize)
                 .ok_or_else(|| Error::CacheCorrupt("索引目录索引越界".to_string()))?;
             let entry = Entry::with_dir(
-                dir.clone(),
-                lower_dir.clone(),
+                shared.clone(),
                 &stored.name,
                 stored.size,
                 stored.modified,

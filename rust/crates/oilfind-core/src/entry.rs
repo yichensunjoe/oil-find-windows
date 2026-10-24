@@ -12,18 +12,53 @@ use std::sync::Arc;
 /// Longest file name accepted from a cache document.
 pub(crate) const MAX_NAME_LEN: usize = 1_024;
 
+/// One parent directory, shared by every entry that lives in it.
+///
+/// The original-case and lowercase forms sit in a single allocation, so a
+/// directory that holds 40 000 files pays for both strings once, and the
+/// ordering comparison reads one cache line instead of chasing two
+/// allocations. The two forms are concatenated in `text`, split at `split`.
+#[derive(Debug)]
+pub(crate) struct SharedDir {
+    text: String,
+    split: usize,
+}
+
+impl SharedDir {
+    /// Builds the shared form of one directory path.
+    pub(crate) fn new(dir: String) -> Arc<SharedDir> {
+        let lower_dir = dir.to_lowercase();
+        let mut text = String::with_capacity(dir.len() + lower_dir.len());
+        text.push_str(&dir);
+        text.push_str(&lower_dir);
+        Arc::new(SharedDir {
+            text,
+            split: dir.len(),
+        })
+    }
+
+    /// Directory as it appears on disk.
+    pub(crate) fn dir(&self) -> &str {
+        &self.text[..self.split]
+    }
+
+    /// Lowercased directory, used for matching and deterministic ordering.
+    pub(crate) fn lower_dir(&self) -> &str {
+        &self.text[self.split..]
+    }
+}
+
 /// One indexed file or directory.
 ///
-/// The parent directory is stored as a shared [`Arc<str>`], so a directory that
-/// holds 40 000 files keeps its path (and its lowercase form) once instead of
-/// 40 000 times. `name` is the file name and `pinyin` only exists for names
-/// that contain Han text. `lower_name` holds the lowercase form only when it
-/// differs from `name`: a name that is ASCII without `A`-`Z` is already its
-/// own lowercase form, so the copy would buy nothing.
+/// The parent directory is stored as a shared [`Arc<SharedDir>`], so a
+/// directory that holds 40 000 files keeps its path (and its lowercase form)
+/// once instead of 40 000 times. `name` is the file name and `pinyin` only
+/// exists for names that contain Han text. `lower_name` holds the lowercase
+/// form only when it differs from `name`: a name that is ASCII without
+/// `A`-`Z` is already its own lowercase form, so the copy would buy nothing.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    pub(crate) dir: Arc<str>,
-    pub(crate) lower_dir: Arc<str>,
+    pub(crate) shared: Arc<SharedDir>,
     pub name: Box<str>,
     pub size: u64,
     pub modified: i64,
@@ -76,14 +111,12 @@ impl Entry {
             .parent()
             .map(|dir| dir.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let lower_dir = dir.to_lowercase();
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or(name);
         let mut entry = Entry {
-            dir: dir.into(),
-            lower_dir: lower_dir.into(),
+            shared: SharedDir::new(dir),
             name: file_name.into_boxed_str(),
             size,
             modified,
@@ -97,12 +130,12 @@ impl Entry {
 
     /// Full path of the entry. Allocates; call it only for rows a user sees.
     pub fn path(&self) -> PathBuf {
-        if self.dir.is_empty() {
+        if self.shared.dir().is_empty() {
             return PathBuf::from(&*self.name);
         }
         PathBuf::from(format!(
             "{dir}{sep}{name}",
-            dir = self.dir,
+            dir = self.shared.dir(),
             sep = std::path::MAIN_SEPARATOR,
             name = self.name
         ))
@@ -112,16 +145,14 @@ impl Entry {
     /// siblings cheap: the scanner interns each directory once. The name is
     /// passed on its own because the cache loader has it without a path.
     pub(crate) fn with_dir(
-        dir: Arc<str>,
-        lower_dir: Arc<str>,
+        shared: Arc<SharedDir>,
         name: &str,
         size: u64,
         modified: i64,
         is_dir: bool,
     ) -> Self {
         let mut entry = Entry {
-            dir,
-            lower_dir,
+            shared,
             name: Box::from(name),
             size,
             modified,
@@ -140,7 +171,7 @@ impl Entry {
 
     /// Directory of the entry, shared between its siblings.
     pub fn dir(&self) -> &str {
-        &self.dir
+        self.shared.dir()
     }
 
     /// Lowercased name, used for case-insensitive matching and ranking.
@@ -155,12 +186,12 @@ impl Entry {
 
     /// Lowercased full path, used for matching and deterministic ordering.
     pub fn lower_path(&self) -> String {
-        if self.lower_dir.is_empty() {
+        if self.shared.lower_dir().is_empty() {
             return self.lower_name().to_string();
         }
         format!(
             "{dir}{sep}{name}",
-            dir = self.lower_dir,
+            dir = self.shared.lower_dir(),
             sep = std::path::MAIN_SEPARATOR,
             name = self.lower_name()
         )
@@ -290,7 +321,7 @@ impl Index {
 /// directory is a prefix of the other the separator decides (`/Users/a-b` sorts
 /// before `/Users/a/x` because `-` is smaller than `/`).
 pub fn compare_entries(a: &Entry, b: &Entry) -> Ordering {
-    let (left_dir, right_dir) = (a.lower_dir.as_ref(), b.lower_dir.as_ref());
+    let (left_dir, right_dir) = (a.shared.lower_dir(), b.shared.lower_dir());
     let common = left_dir.len().min(right_dir.len());
     match left_dir.as_bytes()[..common].cmp(&right_dir.as_bytes()[..common]) {
         Ordering::Equal if left_dir.len() == right_dir.len() => a.lower_name().cmp(b.lower_name()),
@@ -377,6 +408,17 @@ mod tests {
             );
             assert_eq!(entry.lower_name(), lowered);
         }
+    }
+
+    #[test]
+    fn shared_dir_splits_the_two_forms() {
+        let shared = SharedDir::new("/Users/Joe/Docs".to_string());
+        assert_eq!(shared.dir(), "/Users/Joe/Docs");
+        assert_eq!(shared.lower_dir(), "/users/joe/docs");
+        // 空目录（相对路径的父目录）两种形式都为空，路径拼接据此走分支。
+        let empty = SharedDir::new(String::new());
+        assert_eq!(empty.dir(), "");
+        assert_eq!(empty.lower_dir(), "");
     }
 }
 
