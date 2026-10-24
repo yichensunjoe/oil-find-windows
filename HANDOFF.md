@@ -2,14 +2,14 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-24 21:40，分支 `rust`）
+## 当前状态（2026-10-24 22:00，分支 `rust`）
 
-- **内存优化第二轮完成**：恢复 stash 后 7 个 cache_test 失败，根因是加载侧把父目录传给 `Entry::with_dir`，`stored.name` 被丢弃（加载条目名字全部变成目录末段）；`with_dir` 改为直接收名字，20/20 通过。叠加 lower_name 零副本快路径与二进制缓存分批流式转换，提交 `24a90aa`。
+- **内存优化第二轮 + 第三轮完成**：修复 stash 恢复后 7 个 cache_test 失败（根因：加载侧把父目录传给 `Entry::with_dir`，`stored.name` 被丢弃，提交 `24a90aa`）；叠加 lower_name 零副本快路径（89.6% 命中）与二进制缓存 8192 条/批流式转换；第三轮把目录的原始/小写两种形式合并进单一 `SharedDir` 分配（条目 80B→72B，提交 `53c08ce`）。
 - **UI 体验升级完成**（提交 `64c928d`）：结果列表表头点击排序（▲▼ 指示，无箭头=相关度序）、扫描/加载缓存时底部 indeterminate 进度条、空状态引导文案（无索引/空索引/无匹配三种）、标题栏显示条目数（千分位）、Ctrl+C 复制路径、结果列表右键菜单（打开/定位/复制，右键先选中命中项）、“开始索引”设为默认按钮。USAGE.txt 已补“界面操作”说明。
-- **实测**（$HOME + /Applications，1,532,419 条）：加载峰值 RSS 786MB → **272MB**；稳态 ~261MiB；扫描峰值 ~360MiB（此前 402MiB）；缓存 69.9MB；加载 ~0.6s、扫描 ~7.2s（热缓存）。
-- **本地已验证**：`cargo test --workspace` 76 项通过（含 4 个新增排序/格式化单测）；clippy `-D warnings` 干净；fmt 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；全量扫描 + 加载 + 查询端到端正确（报告 149 条 / 会议纪要 ext:docx 52 条）；旧缓存（stash 前代码写入）仍可正确加载。
-- **CI 三平台全绿**（run 40099275430，覆盖内存与 UI 两轮改动）：ubuntu fmt/clippy/test、macOS 构建测试、Windows x64 构建测试打包 + PE/manifest 校验 + 未签名产物。
-- **未验证**：Windows 真机 UI 交互（含本轮新增的排序/进度条/空状态/右键菜单/DPI）、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。
+- **实测**（$HOME + /Applications，1.57M 条）：加载峰值 RSS 786MB → **239MB**；稳态 ~228MiB；扫描峰值 ~341MiB（最初 402MiB）；缓存 ~70MB；加载 ~0.5s、扫描 ~7.9s（热缓存）。
+- **本地已验证**：`cargo test --workspace` 77 项通过；clippy `-D warnings` 干净；fmt 干净；`cargo check -p oilfind-win --target x86_64-pc-windows-msvc` 通过；全量扫描 + 加载 + 查询端到端正确（报告 149 条 / 会议纪要 ext:docx 52 条）；旧缓存（多轮前代码写入）仍可正确加载。
+- **CI 三平台全绿**（run 40099275430，覆盖内存与 UI 改动）：ubuntu fmt/clippy/test、macOS 构建测试、Windows x64 构建测试打包 + PE/manifest 校验 + 未签名产物。
+- **未验证**：Windows 真机 UI 交互（含排序/进度条/空状态/右键菜单/DPI）、目录选择对话框、定位/剪贴板、ACL 拒绝、SmartScreen；EXE 未签名。CI 只证明构建/测试/PE 结构。
 - **仓库**：公开 https://github.com/yichensunjoe/oil-find-windows （默认分支仍是 `main`＝Go 版）。
 
 ## 历史状态（2026-10-24 11:55，Go 版，已冻结在 `main`）
@@ -28,6 +28,7 @@
 
 ## 近期轮次（最新在上，保留全部）
 
+- 2026-10-24（第六轮）：内存第三轮——`dir`/`lower_dir` 两个 `Arc<str>` 合并为单一 `SharedDir`（原始/小写拼接在同一分配，条目 80B→72B，加载侧共享目录表减半）。实测加载峰值 272→239MB、稳态 261→228MiB、扫描峰值 360→341MiB；77 测试 + clippy + fmt + msvc 全绿。提交 `53c08ce`。评估后放弃"扫描侧按上次条目数预置容量"（只对 App 有益且需改核心 API，CLI 无法体现）。
 - 2026-10-24（第五轮）：Win32 界面升级（提交 `64c928d`）：表头点击排序（▲▼，无箭头=相关度）、扫描/加载底部 marquee 进度条、空状态引导、标题条目数千分位、Ctrl+C 复制、结果列表右键菜单（命中项先选中）、“开始索引”默认按钮。76 测试 + clippy + fmt + msvc 检查全绿；真机交互未验收。
 - 2026-10-24（第四轮）：恢复第二轮 stash 后定位 7 个 cache_test 失败根因——加载侧丢弃 `stored.name`（传给 `with_dir` 的是父目录而非名字），非 TempFile 交互；修复后叠加 lower_name 零副本快路径（89.6% 条目命中）与二进制缓存 8192 条/批流式转换。实测加载峰值 786MB → 272MB、稳态 ~261MiB、扫描峰值 ~360MiB；72 测试 + clippy + fmt + msvc 检查全绿，旧缓存兼容。提交 `24a90aa`，未推真机验收。
 - 2026-10-24（第三轮）：派独立 agent 只读审查约 2200 行生产代码；无阻断缺陷，但确认 3 项 HIGH（长路径、黑名单过宽、GC 指针）与 7 项 MEDIUM/LOW，已全部修复并补回归；双架构重新打包与 PE 校验通过。真机项仍未验收。
@@ -47,8 +48,6 @@
 
 **真机验收（最高优先级）**：在 Windows 10/11 上按 `rust/USAGE.txt` 实测：UI 交互（表头排序与箭头、底部进度条、空状态文案、标题计数、右键菜单、Ctrl+C、默认按钮回车）、DPI/多显示器、目录选择对话框、打开/定位/复制路径、ACL 拒绝目录、取消扫描、SmartScreen 行为。EXE 未签名，需确认签名/分发方式。通过后再把 `rust` 合入 `main` 并切换默认分支，最后补图标 / NTFS USN 增量。
 
-**内存第三轮（可选，按预期收益排序）**：
-1. 扫描侧 `entries` Vec 倍增扩容：1.53M 条目最终容量 2M × 80B ≈ 167MB，是扫描峰值（~360MiB）高于加载峰值（259MiB）的主因；可按上次条目数预置容量，或接受现状。
-2. `dir`/`lower_dir` 两个 `Arc<str>`（16B/条目）合并为单个共享结构，约省 12MB 稳态；收益递减，谨慎评估。
+**内存第三轮（已完成，提交 `53c08ce`）**：`dir`/`lower_dir` 合并为单一 `SharedDir` 分配，条目 80B→72B，实测加载峰值 272→239MB、稳态 261→228MiB、扫描峰值 360→341MiB。已放弃的方向：扫描侧按上次条目数预置容量（只对 App 有益、需改 `scan()` 核心 API，CLI 无法体现收益）。
 
-**验收口径**（每次改完都跑）：`cargo test --workspace` + `clippy -D warnings` + `fmt --check`，然后 `/usr/bin/time -l ./target/release/oilfind-cli -cache <cache> -query 报告 -limit 3` 看 peak RSS，扫描用 `-scan -root "$HOME" -root /Applications`。新基线：1,532,419 条 / 7.2s / 69.9MB / 加载峰值 272MB、扫描峰值 ~360MiB、稳态 ~261MiB。
+**验收口径**（每次改完都跑）：`cargo test --workspace` + `clippy -D warnings` + `fmt --check`，然后 `/usr/bin/time -l ./target/release/oilfind-cli -cache <cache> -query 报告 -limit 3` 看 peak RSS，扫描用 `-scan -root "$HOME" -root /Applications`。最新基线（1,569,136 条）：加载 ~0.5s / 峰值 239MB / 稳态 ~228MiB；扫描 ~7.9s / 峰值 ~341MiB；缓存 ~70MB。
