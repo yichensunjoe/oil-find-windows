@@ -2,6 +2,19 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
+## 2026-10-24 · 原生 Win32 界面升级：windows-sys 的六个实测要点（Oil Find for Windows）
+
+- 场景：给 `oilfind-win` 加表头排序、进度条、空状态、右键菜单、Ctrl+C、默认按钮；开发机是 macOS，只能 `cargo check --target x86_64-pc-windows-msvc` 类型检查，交互本身无法本地运行。
+- 要点 1（坐标函数在 Gdi）：`ScreenToClient` / `ClientToScreen` 在 `Win32::Graphics::Gdi` 模块（user32 转发），不在 `WindowsAndMessaging`；按后者找会直接编译不过。
+- 要点 2（表头通知靠转发）：表头点击（HDN_ITEMCLICK）由 SysHeader32 发给父窗口=列表视图，列表视图再转发给自己的父窗口；在窗口过程的 WM_NOTIFY 里用 `LVM_GETHEADER` 拿表头句柄比对 `hwndFrom` 即可。HDN_ITEMCLICK 是负数通知码（u32 4294966974 / i32 -300），`NMHEADERW.iItem` 是列号。
+- 要点 3（结构体 Default 不统一）：`LVITEMW`/`LVCOLUMNW` 有 `Default`，`HDITEMW`/`LVHITTESTINFO`/`NMHEADERW` 没有，必须逐字段构造；windows-sys 0.5x 的 FLAGS 类型都是 `u32` 别名（MENU_ITEM_FLAGS、TRACK_POPUP_MENU_FLAGS、LVHITTESTINFO_FLAGS…），常量可直接用、可直接按位或。
+- 要点 4（纯逻辑可跨平台单测）：`cargo test -p oilfind-win` 在 macOS 上能编译并运行（实测 9 项通过），排序比较器、千分位格式化这类纯函数放进 app.rs 的 tests 模块即可在开发机验证，不必等真机。
+- 要点 5（clippy 1.92 与 MSRV 冲突）：`manual_is_multiple_of` 要求 `% 3 == 0` 改 `is_multiple_of(3)`，但后者 MSRV 1.87 > 工作区声明的 1.75；倒序计数（`since_separator == 3`）可绕开且更易读，不要为过 lint 抬 MSRV。
+- 要点 6（marquee 进度条）：`ICC_PROGRESS_CLASS` 要加进 `InitCommonControlsEx`；建 `msctls_progress2` 时带 `PBS_MARQUEE`(0x08)，用 `PBM_SETMARQUEE`(WM_USER+10, wParam=开关, lParam=毫秒) 启停；平时 `ShowWindow(SW_HIDE)`，布局里固定在客户区底部细条，不扰动其他控件。
+- 经验：`TrackPopupMenu` + `TPM_RETURNCMD` 同步返回菜单 ID，不用自定义消息回路；右键菜单先 `LVM_HITTEST` + `LVM_SETITEMSTATE` 选中命中项，与资源管理器行为一致。空状态提示用后创建的 STATIC 覆盖在列表上（隐藏时不吃鼠标），`WM_CTLCOLORSTATIC` 里按 `lParam==控件句柄` 只给自己改灰色文字，其余静态控件必须落到 DefWindowProc。
+- 验证：`cargo test --workspace` 76 项 + clippy `-D warnings` + fmt + msvc target check；界面交互属真机验收项。
+- 适用边界：任何用 windows-sys 写原生界面的 Rust 项目；尤其是"跨平台开发 + 目标平台才能跑"的桌面工具。
+
 ## 2026-10-24 · Rust 缓存加载器：一个"静默丢字段"的 bug 与两种内存测量口径（Oil Find for Windows）
 
 - 场景：内存优化第二轮（`Entry` 改 `Arc<str>` 共享目录）stash 恢复后 7 个 cache_test 失败，交接记录怀疑是 TempFile 原子替换交互。实际根因：`Entry::with_dir(dir, lower_dir, path, ...)` 被传入**父目录**而非文件路径，`file_name()` 取出目录末段，`stored.name` 被完全丢弃——所有加载条目的名字都变成所在目录名。
