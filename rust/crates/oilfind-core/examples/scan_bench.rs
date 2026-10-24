@@ -21,7 +21,11 @@ fn main() {
         "load" => {
             let started = Instant::now();
             let loaded = Index::load(Path::new(&args[1])).expect("load");
-            eprintln!("load   {:>8.2?} entries={}", started.elapsed(), loaded.len());
+            eprintln!(
+                "load   {:>8.2?} entries={}",
+                started.elapsed(),
+                loaded.len()
+            );
             let started = Instant::now();
             let (_, total) = loaded.search(&args[2], None, 3).expect("search");
             eprintln!("search {:>8.2?} total={}", started.elapsed(), total);

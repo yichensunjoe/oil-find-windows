@@ -127,7 +127,11 @@ fn cache_rewrites_a_legacy_json_document_as_binary() {
     loaded.save(&path).expect("save");
 
     let bytes = fs::read(&path).expect("read cache");
-    assert_eq!(&bytes[..8], b"OILF1\0\0\0", "upgrade did not rewrite as binary");
+    assert_eq!(
+        &bytes[..8],
+        b"OILF1\0\0\0",
+        "upgrade did not rewrite as binary"
+    );
     assert_eq!(Index::load(&path).expect("load").entries, loaded.entries);
 }
 

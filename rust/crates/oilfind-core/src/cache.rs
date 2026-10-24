@@ -62,7 +62,6 @@ const WRITE_BUFFER_BYTES: usize = 1 << 20;
 /// before it is allocated, so a hostile header cannot request gigabytes.
 const MAX_DECLARED_ITEMS: usize = MAX_ENTRIES;
 
-
 /// Used by [`Index::save`], which is never cancelled.
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -144,7 +143,8 @@ impl Index {
         }
         let file = File::open(path)?;
         // A file that grew between the stat and the read cannot exceed the cap.
-        let mut reader = BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
+        let mut reader =
+            BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
         let mut magic = [0u8; MAGIC.len()];
         match reader.read_exact(&mut magic) {
             Ok(()) => {}
@@ -274,7 +274,9 @@ impl BinaryCache {
     /// Rebuilds the index, rejecting anything the writer would not produce.
     fn into_index(self) -> Result<Index, Error> {
         if self.version != CACHE_VERSION {
-            return Err(Error::CacheCorrupt("索引版本不兼容，请重新索引".to_string()));
+            return Err(Error::CacheCorrupt(
+                "索引版本不兼容，请重新索引".to_string(),
+            ));
         }
         if self.roots.len() > MAX_ROOTS {
             return Err(Error::CacheCorrupt("索引目录数量超出上限".to_string()));
@@ -404,8 +406,8 @@ fn load_binary<R: BufRead>(mut reader: R) -> Result<Index, Error> {
 /// Decodes the legacy JSON document the Go implementation writes.
 fn load_json<R: Read>(reader: R) -> Result<Index, Error> {
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let index =
-        Index::deserialize(&mut deserializer).map_err(|err| Error::CacheCorrupt(err.to_string()))?;
+    let index = Index::deserialize(&mut deserializer)
+        .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
     deserializer
         .end()
         .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
@@ -425,7 +427,6 @@ impl Serialize for Index {
         state.end()
     }
 }
-
 
 /// Serializes Unix seconds as the RFC 3339 string the Go implementation writes.
 struct Rfc3339(i64);

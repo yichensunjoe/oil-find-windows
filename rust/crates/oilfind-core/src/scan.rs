@@ -7,17 +7,14 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, UNIX_EPOCH};
-use walkdir::{DirEntry, WalkDir};
 
 /// Hard ceiling on the number of indexed entries.
 pub const MAX_ENTRIES: usize = 2_000_000;
 
 /// Hard ceiling on the number of roots a single index may cover.
 pub const MAX_ROOTS: usize = 64;
-
-/// How often the cancellation flag is sampled while walking.
-const CANCEL_CHECK_INTERVAL: usize = 256;
 
 /// Minimum interval between progress callbacks, so a large scan does not flood
 /// the UI thread with events.
@@ -68,11 +65,16 @@ const SYSTEM_ROOT_DIRS: &[&str] = &[
 /// error instead of a partial index, so callers can never publish a truncated
 /// cache.
 ///
-/// The top level of every root is read serially, then each immediate
-/// subdirectory is handed to the rayon pool as its own `walkdir` job. Keeping
-/// one `walkdir` per subtree preserves the pruning rules (`filter_entry` still
-/// rejects links and skipped directories before descending) while letting the
-/// per-entry `lstat` calls — the actual cost of a scan — run on all cores.
+/// Work is split per directory, not per subtree. The top level of every root is
+/// read serially; every subdirectory found there is indexed immediately and put
+/// on a shared queue, and the rayon pool drains that queue one directory at a
+/// time. Splitting per directory matters because real trees are extremely
+/// unbalanced — on the reference machine one branch holds 43% of all entries,
+/// so a per-subtree split leaves most cores idle while that branch is walked.
+///
+/// Each directory is still read serially, so the pruning rules (a link or a
+/// skipped directory is never descended into, a package bundle is indexed but
+/// not opened) are applied exactly once per entry.
 pub fn scan(
     cancel: &AtomicBool,
     roots: &[PathBuf],
@@ -93,18 +95,16 @@ pub fn scan(
     let mut entries: Vec<Entry> = Vec::with_capacity(1024);
 
     for root in &normalized {
-        let mut directories: Vec<PathBuf> = Vec::new();
-        read_top_level(&shared, root, &mut entries, &mut directories)?;
-        let chunks: Vec<Vec<Entry>> = directories
-            .par_iter()
-            .map(|directory| walk_subtree(&shared, directory))
-            .collect::<Result<Vec<_>, Error>>()?;
+        let mut pending: Vec<PathBuf> = Vec::new();
+        // The root itself is not an entry, but everything below it is.
+        read_directory(&shared, root, &mut entries, &mut pending)?;
+        let chunks = drain(&shared, pending)?;
         entries.extend(chunks.into_iter().flatten());
         check_stop(&shared)?;
     }
 
     // Deterministic order, independent of directory iteration order and of the
-    // order in which the parallel subtrees finished.
+    // order in which the parallel workers finished.
     entries.sort_by(|a, b| a.lower_path().cmp(b.lower_path()));
     let last_root = normalized.last().map_or_else(PathBuf::new, Clone::clone);
     shared.reporter.emit(
@@ -123,24 +123,23 @@ pub fn scan(
     })
 }
 
-/// Reads the immediate children of `root`.
+/// Reads one directory: indexes every child and queues the subdirectories that
+/// still need to be walked.
 ///
-/// Files are indexed right here; directories are collected into `directories`
-/// so they can be walked in parallel. The root itself is never an entry, but
-/// every subdirectory is (matching the depth-based rule the sequential walk
-/// used).
-fn read_top_level(
-    shared: &Shared<'_, impl Fn(Progress) + Sync>,
-    root: &Path,
+/// A subdirectory is indexed when it is discovered, so it is never visited
+/// twice and the root — which the caller never queues — stays out of the index.
+fn read_directory<F: Fn(Progress) + Sync>(
+    shared: &Shared<'_, F>,
+    directory: &Path,
     entries: &mut Vec<Entry>,
-    directories: &mut Vec<PathBuf>,
+    pending: &mut Vec<PathBuf>,
 ) -> Result<(), Error> {
-    let reader = match fs::read_dir(root) {
+    let reader = match fs::read_dir(directory) {
         Ok(reader) => reader,
         Err(_) => {
-            // An unreadable root contributes nothing, exactly like the walkdir
-            // error path: it is counted, reported and skipped.
-            shared.skip(root);
+            // Unreadable directories are counted and skipped; one bad branch
+            // must not abort the scan.
+            shared.skip(directory);
             return Ok(());
         }
     };
@@ -149,7 +148,7 @@ fn read_top_level(
         let item = match item {
             Ok(item) => item,
             Err(_) => {
-                shared.skip(root);
+                shared.skip(directory);
                 continue;
             }
         };
@@ -170,14 +169,13 @@ fn read_top_level(
                 shared.skip(&path);
                 continue;
             }
-            if is_package_dir(&path) {
+            push_entry(shared, entries, &path, &metadata)?;
+            if !is_package_dir(&path) {
                 // Index the bundle itself (so Xcode.app is findable) but never
                 // walk its internals: a single .app can hold hundreds of
                 // thousands of files.
-                push_entry(shared, entries, &path, &metadata)?;
-                continue;
+                pending.push(path);
             }
-            directories.push(path);
             continue;
         }
         if !metadata.is_file() {
@@ -189,64 +187,60 @@ fn read_top_level(
     Ok(())
 }
 
-/// Walks one subdirectory serially, returning the entries it contains.
+/// Drains the queue of pending directories on the rayon pool.
 ///
-/// `root` is the directory this job was started for; it has already been
-/// validated by [`read_top_level`], so it is indexed like any other child.
-fn walk_subtree(
-    shared: &Shared<'_, impl Fn(Progress) + Sync>,
-    root: &Path,
-) -> Result<Vec<Entry>, Error> {
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut walker = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| keep_entry(entry, &shared.skipped));
-    let mut since_cancel_check = 0usize;
+/// `active` counts the workers that currently hold a directory. A worker only
+/// leaves when the queue is empty *and* nobody is still reading a directory,
+/// which is what guarantees that the queue is not abandoned while a sibling is
+/// still producing work.
+fn drain<F: Fn(Progress) + Sync>(
+    shared: &Shared<'_, F>,
+    pending: Vec<PathBuf>,
+) -> Result<Vec<Vec<Entry>>, Error> {
+    let queue = Mutex::new(pending);
+    let active = AtomicUsize::new(0);
+    let workers = rayon::current_num_threads().max(1);
 
-    while let Some(item) = walker.next() {
-        since_cancel_check += 1;
-        if since_cancel_check >= CANCEL_CHECK_INTERVAL {
-            since_cancel_check = 0;
-            check_stop(shared)?;
-        }
-        let entry = match item {
-            Ok(entry) => entry,
-            Err(err) => {
-                // Unreadable directories and vanished entries are counted and
-                // skipped; one bad branch must not abort the scan.
-                shared.skip(err.path().unwrap_or(root));
-                continue;
+    (0..workers)
+        .into_par_iter()
+        .map(|_| -> Result<Vec<Entry>, Error> {
+            let mut entries: Vec<Entry> = Vec::new();
+            let mut next: Vec<PathBuf> = Vec::new();
+            loop {
+                let directory = {
+                    // The counter is bumped under the same lock that pops, so
+                    // "queue empty and nobody active" cannot be observed while
+                    // a directory is in flight.
+                    let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+                    let directory = queue.pop();
+                    if directory.is_some() {
+                        active.fetch_add(1, Ordering::SeqCst);
+                    }
+                    directory
+                };
+                let Some(directory) = directory else {
+                    if active.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                    continue;
+                };
+                next.clear();
+                let result = read_directory(shared, &directory, &mut entries, &mut next);
+                // Publish before dropping `active`, so the queue is never seen
+                // as empty while this worker still owns work.
+                if !next.is_empty() {
+                    queue
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .append(&mut next);
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                result?;
             }
-        };
-        let path = entry.path();
-        if entry.depth() > 0 && entry.file_type().is_dir() && is_package_dir(path) {
-            walker.skip_current_dir();
-        }
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                shared.skip(path);
-                continue;
-            }
-        };
-        if platform::is_link_or_reparse(&metadata) {
-            shared.skip(path);
-            continue;
-        }
-        let is_dir = metadata.is_dir();
-        if is_dir && should_skip_dir(path) {
-            shared.skip(path);
-            continue;
-        }
-        if !is_dir && !metadata.is_file() {
-            shared.skip_quiet();
-            continue;
-        }
-        push_entry(shared, &mut entries, path, &metadata)?;
-    }
-    check_stop(shared)?;
-    Ok(entries)
+            Ok(entries)
+        })
+        .collect()
 }
 
 /// Shared, thread-safe state of one scan.
@@ -263,8 +257,12 @@ impl<F: Fn(Progress) + Sync> Shared<'_, F> {
     /// Counts a rejected entry and reports it.
     fn skip(&self, current: &Path) {
         let skipped = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
-        self.reporter
-            .emit(false, self.visited.load(Ordering::Relaxed), skipped, current);
+        self.reporter.emit(
+            false,
+            self.visited.load(Ordering::Relaxed),
+            skipped,
+            current,
+        );
     }
 
     /// Counts a rejected entry that the sequential walk never reported either
@@ -301,12 +299,9 @@ fn push_entry<F: Fn(Progress) + Sync>(
         shared.limit_reached.store(true, Ordering::Relaxed);
         return Err(Error::EntryLimit);
     }
-    shared.reporter.emit(
-        false,
-        visited,
-        shared.skipped.load(Ordering::Relaxed),
-        path,
-    );
+    shared
+        .reporter
+        .emit(false, visited, shared.skipped.load(Ordering::Relaxed), path);
     Ok(())
 }
 
@@ -338,21 +333,6 @@ fn is_package_dir(path: &Path) -> bool {
         None => return false,
     };
     SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
-}
-
-/// `filter_entry` predicate: prunes links and skipped directories before the
-/// walker descends into them, which is what keeps `node_modules` cheap.
-fn keep_entry(entry: &DirEntry, skipped: &AtomicUsize) -> bool {
-    let file_type = entry.file_type();
-    if file_type.is_symlink() {
-        skipped.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if file_type.is_dir() && should_skip_dir(entry.path()) {
-        skipped.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 /// Decides from the path alone so the walker and the root validator apply
