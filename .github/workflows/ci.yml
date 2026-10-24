@@ -28,7 +28,7 @@ jobs:
       - name: Upload unsigned preview artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: oil-find-intranet-windows-amd64-unsigned
+          name: oil-find-windows-amd64-unsigned
           path: outputs/windows-amd64/
           if-no-files-found: error
 
