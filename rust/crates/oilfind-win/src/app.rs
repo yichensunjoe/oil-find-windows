@@ -863,11 +863,14 @@ impl App {
         // 底部细进度条：贴客户区下边缘，扫描时显示。
         move_control(self.progress, 0, height - self.px(6), width, self.px(6));
 
+        // 列宽：文件名 / 完整路径（弹性，吃掉剩余宽度）/ 大小 / 修改日期。
+        // 日期列按 "YYYY-MM-DD HH:MM"（16 字符，界面字体下约 125px）留足余量；
+        // 文件名与路径的超长内容由列表视图在单元格边界裁切，属预期行为。
         for (position, mut column_width) in [
             self.px(220),
-            width - 2 * padding - self.px(505),
+            width - 2 * padding - self.px(515),
             self.px(100),
-            self.px(165),
+            self.px(175),
         ]
         .into_iter()
         .enumerate()
