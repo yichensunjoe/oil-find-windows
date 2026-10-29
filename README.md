@@ -9,6 +9,21 @@ Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立�
 
 > 实现语言：**Rust**（1.92，原生 Win32，无 GC）。仓库的 `main` 分支保留同功能的 Go 实现（标签 `v0.1-go`），用于对照与回退。
 
+## 用途
+
+在 Windows 10/11 x64 上替代“只能搜文件名”的折中方案：用户显式选择目录，本地建立文件名与路径索引，按中文、拼音或语法即时筛选，双击打开、定位或复制路径。全程离线、只读、不需要管理员权限。
+
+## 当前状态
+
+Rust 版已作为主线（Go 版保留在 `v0.1-go` 标签对照/回退），三平台 CI 常绿；界面交互、DPI/多显示器与 ACL 拒绝场景仍待 Windows 真机验收，详见[已知限制](#已知限制)。
+
+## 技术栈
+
+- Rust 1.92（`rust/rust-toolchain.toml` 固定），核心引擎与平台层拆成 workspace crate。
+- Windows 原生 Win32 界面（无 Electron/Tauri）；macOS 预览壳用 egui，复用同一核心。
+- 元数据索引常驻内存（`%LOCALAPPDATA%\OilFind` 持久化），不读文件正文。
+- 构建：Cargo + PowerShell/Bash 脚本（见[快速开始](#快速开始)）。
+
 ## 功能
 
 - 文件名与路径搜索，支持中文、全拼、首字母。
@@ -26,7 +41,7 @@ Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立�
 - 索引与配置存放在 `%LOCALAPPDATA%\OilFind`（不使用漫游目录）。
 - 不支持：SMB/NAS 共享盘检索、多人服务、文件正文检索、删除操作。
 
-## 构建
+## 快速开始
 
 需要 Rust 1.92（`rust/rust-toolchain.toml` 已固定）。
 
@@ -46,7 +61,7 @@ bash scripts/package-mac.sh   # 产出 build/Oil Find Rust.app 与 outputs/OilFi
 
 产物在 `outputs/windows-amd64/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
 
-## 测试与校验
+## 常用命令
 
 ```sh
 cd rust
@@ -66,7 +81,7 @@ CI 同时覆盖三个平台（`.github/workflows/ci.yml`）：
 
 `Sources/` 里的 Swift macOS 基线不在 CI 中运行，仍由本机验收。
 
-## 目录
+## 项目结构
 
 | 路径 | 内容 |
 |---|---|
@@ -77,6 +92,12 @@ CI 同时覆盖三个平台（`.github/workflows/ci.yml`）：
 | `rust/USAGE.txt` | 终端用户说明 |
 | `Sources/`、`Package.swift` | macOS 基线源码（本机验收） |
 | `site/` | 上游官网参考代码（未启用、未部署） |
+
+## 配置
+
+- 索引范围、排除规则与显示偏好都存在本机 `%LOCALAPPDATA%\OilFind`，不入库、不上传。
+- 默认不扫描任何目录；必须手动添加范围并点“开始索引”，删除范围只改配置。
+- 无环境变量、无账号、无网络依赖；manifest 为 `asInvoker`，不请求管理员权限。
 
 ## 上游来源与许可
 
