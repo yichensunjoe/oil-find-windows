@@ -10,6 +10,7 @@
 - 本机验证：Rust 工作区 125 项、Swift 白名单及定向测试 44 项通过；fmt、Clippy、Windows 目标类型检查通过；Python 脚本测试 23 项通过、2 项跳过。
 - 已构建本地 ad-hoc 签名的 `build/Oil Find Intranet.app` 和 ZIP，并检查身份、签名与 ZIP 完整性；未安装或启动应用。
 - 未验证：Windows 真机 GUI/DPI/ACL/锁/PE 打包、PowerShell 实机脚本、真实外置卷、Swift GUI 和本轮 CI；本机缺 `llvm-rc`。路径检查与打开/遍历之间仍有竞态；旧 GUI 启动测试已停用。
+- `origin` 当前为公开仓库（2026-11-02 核实）；本次公开推送已获用户确认，远端状态以 Git 为准。
 - 下一步：获授权后在隔离环境做 macOS GUI/安装验收及 Windows 真机验收；正式签名与分发另行确认。
 
 ## 历史状态（2026-10-25 16:55，分支 `main`）
