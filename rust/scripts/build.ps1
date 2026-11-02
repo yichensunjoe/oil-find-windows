@@ -10,7 +10,16 @@ $ScriptDir = $PSScriptRoot
 $RustDir = Split-Path -Parent $ScriptDir
 $ProjectDir = Split-Path -Parent $RustDir
 $OutputDir = Join-Path $ProjectDir "outputs/windows-amd64"
-$ReleaseDir = Join-Path $RustDir "target/release"
+$Target = "x86_64-pc-windows-msvc"
+$ConfiguredTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DIR")
+if ([string]::IsNullOrEmpty($ConfiguredTargetDir)) {
+    $TargetDir = Join-Path $RustDir "target"
+} elseif ([System.IO.Path]::IsPathRooted($ConfiguredTargetDir)) {
+    $TargetDir = $ConfiguredTargetDir
+} else {
+    $TargetDir = Join-Path $RustDir $ConfiguredTargetDir
+}
+$ReleaseDir = Join-Path (Join-Path $TargetDir $Target) "release"
 
 $CargoCommand = Get-Command -Name $CargoBin -CommandType Application -ErrorAction SilentlyContinue
 if ($null -eq $CargoCommand) {
@@ -50,11 +59,23 @@ function Invoke-Cargo {
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-Push-Location -LiteralPath $RustDir
+$PreviousTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
+$PreviousTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
+$BuildTempDir = Join-Path $ProjectDir (".oilfind-build-temp-" + [Guid]::NewGuid().ToString("N"))
+$TempCreated = $false
+$LocationPushed = $false
 try {
-    Invoke-Cargo @("test", "--workspace")
-    Invoke-Cargo @("build", "--release", "-p", "oilfind-win")
-    Invoke-Cargo @("build", "--release", "-p", "oilfind-cli")
+    # Do not reuse an existing path, even if a name collision occurs.
+    New-Item -ItemType Directory -Path $BuildTempDir -ErrorAction Stop | Out-Null
+    $TempCreated = $true
+    [Environment]::SetEnvironmentVariable("TEMP", $BuildTempDir, "Process")
+    [Environment]::SetEnvironmentVariable("TMP", $BuildTempDir, "Process")
+    Push-Location -LiteralPath $RustDir
+    $LocationPushed = $true
+
+    Invoke-Cargo @("test", "--workspace", "--target-dir", $TargetDir)
+    Invoke-Cargo @("build", "--release", "--target", $Target, "--target-dir", $TargetDir, "-p", "oilfind-win")
+    Invoke-Cargo @("build", "--release", "--target", $Target, "--target-dir", $TargetDir, "-p", "oilfind-cli")
 
     $GuiBinary = Join-Path $ReleaseDir "oilfind-win.exe"
     $CliBinary = Join-Path $ReleaseDir "oilfind-cli.exe"
@@ -81,5 +102,16 @@ try {
     Write-Host "No installation, publication, or runtime dependency download was performed."
 }
 finally {
-    Pop-Location
+    [Environment]::SetEnvironmentVariable("TEMP", $PreviousTemp, "Process")
+    [Environment]::SetEnvironmentVariable("TMP", $PreviousTmp, "Process")
+    try {
+        if ($LocationPushed) {
+            Pop-Location
+        }
+    }
+    finally {
+        if ($TempCreated) {
+            Remove-Item -LiteralPath $BuildTempDir -Recurse -Force
+        }
+    }
 }

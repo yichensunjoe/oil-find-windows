@@ -175,6 +175,28 @@ fn scan_skips_dependency_system_and_private_directories() {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn scan_searches_ordinary_directories_with_mac_package_suffixes() {
+    let dir = TempDir::new("scan-package-suffixes");
+    for name in ["project.app", "assets.bundle", "client.xcodeproj"] {
+        dir.write(&format!("{name}/needle.txt"), "temporary fixture");
+    }
+    let paths = indexed_paths(&run_scan(&[dir.path().to_path_buf()]).expect("scan"));
+    for name in ["project.app", "assets.bundle", "client.xcodeproj"] {
+        assert!(paths.contains_key(&dir.join(&format!("{name}/needle.txt"))));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn scan_keeps_macos_package_contents_excluded() {
+    let dir = TempDir::new("scan-mac-packages");
+    let file = dir.write("project.app/needle.txt", "temporary fixture");
+    let paths = indexed_paths(&run_scan(&[dir.path().to_path_buf()]).expect("scan"));
+    assert!(!paths.contains_key(&file));
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_never_follows_symlinks() {
@@ -226,6 +248,38 @@ fn scan_never_follows_symlinks() {
         matches!(error, Error::LinkRoot),
         "unexpected error: {error}"
     );
+    let error = run_scan(&[linked_dir.join("..")])
+        .expect_err("parent traversal must not hide a linked root");
+    assert!(
+        matches!(error, Error::LinkRoot),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_rechecks_a_directory_before_descending() {
+    let dir = TempDir::new("scan-swapped-directory");
+    let root = dir.mkdir("selected");
+    let pending = dir.mkdir("selected/pending");
+    let outside = dir.mkdir("outside");
+    common::write_file(&outside.join("outside-secret.txt"), "temporary fixture");
+    let swapped = AtomicBool::new(false);
+    let cancel = AtomicBool::new(false);
+
+    let index = scan(&cancel, &[root], |progress| {
+        if progress.current == pending && !swapped.swap(true, Ordering::Relaxed) {
+            fs::remove_dir(&pending).expect("remove empty fixture directory");
+            std::os::unix::fs::symlink(&outside, &pending).expect("replace with fixture link");
+        }
+    })
+    .expect("scan");
+
+    assert!(swapped.load(Ordering::Relaxed), "fixture was not replaced");
+    assert!(index
+        .entries
+        .iter()
+        .all(|entry| entry.name() != "outside-secret.txt"));
 }
 
 #[test]

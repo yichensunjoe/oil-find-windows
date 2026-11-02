@@ -57,12 +57,6 @@ fn run() -> Result<(), String> {
         if cancel.load(Ordering::SeqCst) {
             return Err("已取消：未写入索引缓存".to_string());
         }
-        if let Some(parent) = options.cache.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| format!("创建缓存目录 {} 失败：{err}", parent.display()))?;
-            }
-        }
         index
             .save_cancellable(cancel, &options.cache)
             .map_err(|err| format!("写入索引缓存 {} 失败：{err}", options.cache.display()))?;

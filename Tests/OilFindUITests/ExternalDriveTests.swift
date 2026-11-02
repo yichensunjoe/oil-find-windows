@@ -35,6 +35,8 @@ final class ExternalDriveTests: XCTestCase {
         var onStateChange: ((IndexManager.State) -> Void)?
         var onIndexChange: (() -> Void)?
         var starts = 0, stops = 0
+        var configs: [IndexConfig] = []
+        func updateConfig(_ config: IndexConfig) { configs.append(config) }
         func start() { starts += 1 }
         var onStop: (() -> Void)?
         func stop() { stops += 1; onStop?() }
@@ -59,6 +61,316 @@ final class ExternalDriveTests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.01))
         } while ProcessInfo.processInfo.systemUptime < deadline
         _ = try XCTUnwrap(condition() ? true : nil, description, file: file, line: line)
+    }
+
+    func testFirstRunWaitsForExplicitExternalIndexingOptIn() throws {
+        let suite = "OilFindExternalOptIn-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = temporaryDirectory(), monitor = Monitor()
+        let persistence = ExternalDrivePersistence(directory: directory)
+        let lock = NSLock()
+        var discoveries = 0, configs: [IndexConfig] = [], indexes: [Index] = []
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: monitor, discover: {
+            lock.lock(); discoveries += 1; lock.unlock()
+            return [self.volume]
+        }, settingsDefaults: defaults, makeIndex: { config, _, _ in
+            configs.append(config); let index = Index(); indexes.append(index); return index
+        })
+        defer { catalog.stop() }
+        XCTAssertFalse(ExternalDrivePreferences().enabled)
+        XCTAssertFalse(catalog.enabled)
+        XCTAssertFalse(persistence.load().enabled)
+        catalog.start()
+        try waitUntil("initial external preferences") { catalog.ready }
+        XCTAssertFalse(catalog.enabled)
+        XCTAssertEqual(monitor.starts, 0)
+        lock.lock(); let before = discoveries; lock.unlock()
+        XCTAssertEqual(before, 0)
+        XCTAssertTrue(indexes.isEmpty)
+        guard !catalog.enabled else { return }
+
+        let excluded = volume.path + "/Private"
+        defaults.set([excluded], forKey: "userExcludedPaths")
+        catalog.setEnabled(true)
+        try waitUntil("explicit external opt-in") { indexes.count == 1 && indexes[0].starts == 1 }
+        XCTAssertEqual(monitor.starts, 1)
+        let config = try XCTUnwrap(configs.first)
+        Array((excluded + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(config.isExcluded(path: $0)) }
+        try waitUntil("enabled state persisted") { persistence.load().enabled }
+        catalog.setEnabled(false)
+        try waitUntil("disabled state persisted") { !persistence.load().enabled }
+        XCTAssertEqual(indexes[0].stops, 1)
+
+        let restoredMonitor = Monitor()
+        let restored = ExternalDriveCatalog(directory: directory, monitor: restoredMonitor,
+                                            discover: { XCTFail("Disabled catalog must not discover volumes"); return [] },
+                                            settingsDefaults: defaults, makeIndex: { _, _, _ in XCTFail("Disabled catalog must not index"); return Index() })
+        defer { restored.stop() }
+        restored.start()
+        try waitUntil("disabled state restored") { restored.ready }
+        XCTAssertFalse(restored.enabled)
+        XCTAssertEqual(restoredMonitor.starts, 0)
+    }
+
+    func testPreviouslyEnabledIsolatedExternalSettingsRemainEnabled() throws {
+        let suite = "OilFindExternalSaved-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = temporaryDirectory(), monitor = Monitor()
+        let persistence = ExternalDrivePersistence(directory: directory)
+        persistence.save(.init(enabled: true))
+        let index = Index()
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: monitor, discover: { [self.volume] },
+                                          settingsDefaults: defaults, makeIndex: { _, _, _ in index })
+        defer { catalog.stop() }
+        catalog.start()
+        try waitUntil("previously enabled catalog") { catalog.ready && catalog.enabled && index.starts == 1 }
+        XCTAssertEqual(monitor.starts, 1)
+        XCTAssertTrue(persistence.load().enabled)
+    }
+
+    func testUserExclusionsAndScopeFollowExternalDriveSettings() throws {
+        let suite = "OilFindExternalExclusions-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let initialPath = volume.path + "/Private"
+        defaults.set([initialPath], forKey: "userExcludedPaths")
+        defaults.set(true, forKey: "indexPackageContents")
+        let directory = temporaryDirectory()
+        var initialConfig: IndexConfig?
+        let index = Index()
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(enabled: true),
+                                          discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                          settingsDefaults: defaults, makeIndex: { config, _, _ in
+            initialConfig = config; return index
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([volume])
+        let initial = try XCTUnwrap(initialConfig)
+        XCTAssertEqual(initial.rootPath, volume.path)
+        XCTAssertEqual(initial.userExcludedPaths, [initialPath])
+        XCTAssertTrue(initial.indexPackageContents)
+        Array((initialPath + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(initial.isExcluded(path: $0)) }
+        Array((volume.path + "/Public/leaf").utf8).withUnsafeBufferPointer { XCTAssertFalse(initial.isExcluded(path: $0)) }
+
+        let changedPath = volume.path + "/Other"
+        defaults.set([changedPath], forKey: "userExcludedPaths")
+        defaults.set(false, forKey: "indexPackageContents")
+        catalog.updateSettings()
+        let changed = try XCTUnwrap(index.configs.last)
+        XCTAssertEqual(changed.rootPath, volume.path)
+        XCTAssertEqual(changed.userExcludedPaths, [changedPath])
+        XCTAssertFalse(changed.indexPackageContents)
+        Array((changedPath + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(changed.isExcluded(path: $0)) }
+        Array((initialPath + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertFalse(changed.isExcluded(path: $0)) }
+        try waitUntil("isolated drive preferences written") {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("drives.json").path)
+        }
+    }
+
+    func testExclusionFollowsRecordedUUIDAcrossRemountsAndRestart() throws {
+        let suite = "OilFindExternalRemount-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let original = volume.path + "/Private"
+        defaults.set([original], forKey: "userExcludedPaths")
+        let directory = temporaryDirectory()
+        var configs: [IndexConfig] = [], indexes: [Index] = []
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(enabled: true),
+                                          discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                          settingsDefaults: defaults, makeIndex: { config, _, _ in
+            configs.append(config); let index = Index(); indexes.append(index); return index
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([volume])
+        try XCTUnwrap(indexes.last).complete(store(path: volume.path))
+        var renamed = volume; renamed.name = "Renamed"; renamed.path = "/Volumes/Renamed"
+        catalog.updateMounted([renamed])
+        XCTAssertEqual(indexes.first?.stops, 1)
+        XCTAssertTrue(catalog.searchSources().isEmpty)
+        let mapped = try XCTUnwrap(configs.last)
+        XCTAssertEqual(Set(mapped.userExcludedPaths), Set([original, renamed.path + "/Private"]))
+        Array((renamed.path + "/Private/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(mapped.isExcluded(path: $0)) }
+        Array((renamed.path + "/Private-other/leaf").utf8).withUnsafeBufferPointer { XCTAssertFalse(mapped.isExcluded(path: $0)) }
+        try XCTUnwrap(indexes.last).complete(store(path: renamed.path))
+        let extensionSource = SearchSource(id: "extension", displayName: "", isOnline: true, store: store(path: renamed.path))
+        XCTAssertTrue(catalog.filteredExtensionSources([extensionSource]).isEmpty)
+
+        var third = renamed; third.path = "/Volumes/Third"
+        catalog.updateMounted([third])
+        let historical = SearchSource(id: "historical", displayName: "", isOnline: false, store: store(path: renamed.path))
+        XCTAssertTrue(catalog.filteredExtensionSources([historical]).isEmpty)
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [original])
+        let persistence = ExternalDrivePersistence(directory: directory)
+        try waitUntil("remount history persisted") {
+            let record = persistence.load().drives.first
+            return record?.path == third.path && Set(record?.previousPaths ?? []) == Set([self.volume.path, renamed.path])
+        }
+        let persisted = persistence.load(), restoredDirectory = temporaryDirectory()
+        var restoredConfig: IndexConfig?
+        let restored = ExternalDriveCatalog(directory: restoredDirectory, monitor: Monitor(), initialPreferences: persisted,
+                                           discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                           settingsDefaults: defaults, makeIndex: { config, _, _ in
+            restoredConfig = config; return Index()
+        })
+        defer { restored.stop() }
+        var fourth = third; fourth.path = "/Volumes/Fourth"
+        restored.updateMounted([fourth])
+        let afterRestart = try XCTUnwrap(restoredConfig)
+        Array((fourth.path + "/Private/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(afterRestart.isExcluded(path: $0)) }
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [original])
+        try waitUntil("restored remount history persisted") {
+            ExternalDrivePersistence(directory: restoredDirectory).load().drives.first?.path == fourth.path
+        }
+    }
+
+    func testUnmatchedExclusionsPauseIndexesUntilUserReselects() throws {
+        let suite = "OilFindExternalReview-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let unknown = "/Volumes/Unknown/Private", current = volume.path + "/Private"
+        defaults.set([unknown], forKey: "userExcludedPaths")
+        var configs: [IndexConfig] = [], indexes: [Index] = []
+        let directory = temporaryDirectory()
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(enabled: true),
+                                          discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                          settingsDefaults: defaults, makeIndex: { config, _, _ in
+            configs.append(config); let index = Index(); indexes.append(index); return index
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([volume])
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        XCTAssertEqual(catalog.rows.first?.status, .exclusionReview)
+        XCTAssertEqual(catalog.knownDrives.first?.enabled, false)
+        XCTAssertTrue(indexes.isEmpty)
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [unknown])
+        XCTAssertTrue(L10n.text("driveExclusionReview", chinese: false).contains("First add"))
+
+        defaults.set([unknown, current], forKey: "userExcludedPaths")
+        catalog.updateSettings()
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        XCTAssertTrue(indexes.isEmpty)
+        defaults.set([current], forKey: "userExcludedPaths")
+        catalog.updateSettings()
+        XCTAssertFalse(catalog.exclusionReviewRequired)
+        XCTAssertEqual(indexes.count, 1)
+        let config = try XCTUnwrap(configs.last)
+        Array((current + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(config.isExcluded(path: $0)) }
+        try XCTUnwrap(indexes.last).complete(store(path: volume.path))
+        XCTAssertEqual(catalog.searchSources().count, 1)
+        defaults.set([unknown], forKey: "userExcludedPaths")
+        XCTAssertTrue(catalog.searchSources().isEmpty, "An unresolved rule must hide old sources immediately")
+        catalog.updateSettings()
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        XCTAssertEqual(indexes.first?.stops, 1)
+        XCTAssertTrue(catalog.searchSources().isEmpty)
+        let other = SearchSource(id: "extension", displayName: "", isOnline: true, store: store(path: "/Volumes/Other"))
+        XCTAssertTrue(catalog.filteredExtensionSources([other]).isEmpty)
+        try waitUntil("isolated review metadata persisted") {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("drives.json").path)
+        }
+    }
+
+    func testAmbiguousOldMountPausesAllPossibleDrives() throws {
+        let suite = "OilFindExternalAmbiguous-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let old = "/Volumes/Old", exclusion = old + "/Private"
+        defaults.set([exclusion], forKey: "userExcludedPaths")
+        var first = volume; first.path = "/Volumes/First"
+        var second = volume; second.uuid = secondUUID; second.path = "/Volumes/Second"; second.device = "disk8"
+        var firstRecord = ExternalDriveRecord(id: uuid, name: first.name, path: first.path, lastConnected: Date())
+        var secondRecord = ExternalDriveRecord(id: secondUUID, name: second.name, path: second.path, lastConnected: Date())
+        firstRecord.previousPaths = [old]; secondRecord.previousPaths = [old, first.path]
+        var created = 0, configs: [String: IndexConfig] = [:]
+        let directory = temporaryDirectory()
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(),
+                                          initialPreferences: .init(enabled: true, drives: [firstRecord, secondRecord]),
+                                          discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                          settingsDefaults: defaults, makeIndex: { config, _, id in
+            created += 1; configs[id] = config; return Index()
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([first, second])
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        XCTAssertEqual(created, 0)
+        XCTAssertTrue(catalog.rows.allSatisfy { $0.status == .exclusionReview })
+        XCTAssertTrue(catalog.knownDrives.allSatisfy { !$0.enabled })
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [exclusion])
+
+        // A deliberate re-selection binds the new rule to the mounted UUID even when
+        // the same mount name also appears in another drive's history.
+        let selected = first.path + "/Private"
+        XCTAssertTrue(catalog.bindSelectedExclusions([selected]))
+        defaults.set([exclusion, selected], forKey: "userExcludedPaths")
+        catalog.updateSettings()
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        defaults.set([selected], forKey: "userExcludedPaths")
+        catalog.updateSettings()
+        XCTAssertFalse(catalog.exclusionReviewRequired)
+        XCTAssertEqual(created, 2)
+        var renamed = first; renamed.path = "/Volumes/First-Renamed"
+        catalog.updateMounted([renamed, second])
+        let config = try XCTUnwrap(configs[uuid])
+        Array((renamed.path + "/Private/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(config.isExcluded(path: $0)) }
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [selected])
+        let persistence = ExternalDrivePersistence(directory: directory)
+        try waitUntil("explicit exclusion binding persisted") {
+            let saved = persistence.load()
+            return saved.drives.first(where: { $0.id == self.uuid })?.path == renamed.path
+                && saved.exclusionBindings?[selected] == ExternalExclusionBinding(id: self.uuid, root: first.path)
+        }
+        let persisted = persistence.load(), restoredDirectory = temporaryDirectory()
+        var restoredConfigs: [String: IndexConfig] = [:]
+        let restored = ExternalDriveCatalog(directory: restoredDirectory, monitor: Monitor(), initialPreferences: persisted,
+                                           discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                           settingsDefaults: defaults, makeIndex: { config, _, id in
+            restoredConfigs[id] = config; return Index()
+        })
+        defer { restored.stop() }
+        var next = renamed; next.path = "/Volumes/First-Again"
+        restored.updateMounted([next, second])
+        XCTAssertFalse(restored.exclusionReviewRequired)
+        let afterRestart = try XCTUnwrap(restoredConfigs[uuid])
+        Array((next.path + "/Private/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(afterRestart.isExcluded(path: $0)) }
+        try waitUntil("restored explicit binding persisted") {
+            ExternalDrivePersistence(directory: restoredDirectory).load().drives.first(where: { $0.id == self.uuid })?.path == next.path
+        }
+    }
+
+    func testReselectingTheSameAmbiguousPathBindsCurrentUUIDWithoutChangingSettings() throws {
+        let suite = "OilFindExternalReselection-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let original = "/Volumes/Old/Private"
+        defaults.set([original], forKey: "userExcludedPaths")
+        var first = volume; first.path = "/Volumes/Old"
+        var second = volume; second.uuid = secondUUID; second.path = "/Volumes/Second"; second.device = "disk8"
+        let firstRecord = ExternalDriveRecord(id: uuid, name: first.name, path: first.path, lastConnected: Date())
+        var secondRecord = ExternalDriveRecord(id: secondUUID, name: second.name, path: second.path, lastConnected: Date())
+        secondRecord.previousPaths = [first.path]
+        let directory = temporaryDirectory()
+        var configs: [String: IndexConfig] = [:]
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(),
+                                          initialPreferences: .init(enabled: true, drives: [firstRecord, secondRecord]),
+                                          discover: { XCTFail("Unexpected volume discovery"); return [] },
+                                          settingsDefaults: defaults, makeIndex: { config, _, id in
+            configs[id] = config; return Index()
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([first, second])
+        XCTAssertTrue(catalog.exclusionReviewRequired)
+        XCTAssertTrue(catalog.bindSelectedExclusions([original]))
+        catalog.updateSettings()
+        XCTAssertFalse(catalog.exclusionReviewRequired)
+        XCTAssertEqual(defaults.stringArray(forKey: "userExcludedPaths"), [original])
+        let selected = try XCTUnwrap(configs[uuid])
+        Array((original + "/leaf").utf8).withUnsafeBufferPointer { XCTAssertTrue(selected.isExcluded(path: $0)) }
+        try waitUntil("same-path re-selection persisted") {
+            ExternalDrivePersistence(directory: directory).load().exclusionBindings?[original]
+                == ExternalExclusionBinding(id: self.uuid, root: first.path)
+        }
     }
 
     func testVolumeEligibilityUsesLocalUserVisibleIdentityAndExcludesSpecialVolumes() {
@@ -101,7 +413,7 @@ final class ExternalDriveTests: XCTestCase {
     func testPreEjectStopsWholeDeviceBeforeReturningAndWithdrawsSources() throws {
         var indexes: [Index] = []
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(), makeIndex: { _, _, _ in
+                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in
             let index = Index(); indexes.append(index); return index
         })
         defer { catalog.stop() }
@@ -120,7 +432,7 @@ final class ExternalDriveTests: XCTestCase {
         var second = volume; second.uuid = secondUUID; second.name = "Second"; second.path = "/Volumes/Second"
         var mounted = [volume, second], indexes: [Index] = [], indexesByID: [String: Index] = [:]
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(), discover: { mounted }, makeIndex: { _, _, id in
+                                          initialPreferences: .init(enabled: true), discover: { mounted }, makeIndex: { _, _, id in
             let index = Index(); indexes.append(index); indexesByID[id] = index; return index
         })
         defer { catalog.stop() }
@@ -147,7 +459,7 @@ final class ExternalDriveTests: XCTestCase {
         var indexes: [Index] = []
         let mounted = [volume]
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(), discover: { mounted }, makeIndex: { _, _, _ in
+                                          initialPreferences: .init(enabled: true), discover: { mounted }, makeIndex: { _, _, _ in
             let index = Index(); indexes.append(index); return index
         })
         defer { catalog.stop() }
@@ -173,7 +485,7 @@ final class ExternalDriveTests: XCTestCase {
     func testRemoveDeletesCatalogAndOnlyRecreatesAfterNextConnection() throws {
         let directory = temporaryDirectory(); var indexes: [Index] = []
         let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(),
-                                          initialPreferences: .init(), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
+                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
         let first = try XCTUnwrap(indexes.first)
@@ -197,7 +509,7 @@ final class ExternalDriveTests: XCTestCase {
     func testProgressDoesNotInvalidateSearchUntilSourceStoreOrOnlineStateChanges() throws {
         var indexes: [Index] = [], changes = 0
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
+                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.onSourcesChange = { changes += 1 }
         catalog.updateMounted([volume]); XCTAssertEqual(changes, 0)
@@ -215,7 +527,7 @@ final class ExternalDriveTests: XCTestCase {
     func testMasterAndDriveSwitchesPreserveSettingsAndDeleteOnlyDisabledCatalogs() throws {
         let directory = temporaryDirectory(), monitor = Monitor()
         var indexes: [Index] = []
-        let catalog = ExternalDriveCatalog(directory: directory, monitor: monitor, initialPreferences: .init(), discover: { [self.volume] },
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: monitor, initialPreferences: .init(enabled: true), discover: { [self.volume] },
                                           makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
@@ -240,7 +552,7 @@ final class ExternalDriveTests: XCTestCase {
     func testDisconnectRetainsCatalogAndReconnectUsesSameUUIDAcrossRename() throws {
         let directory = temporaryDirectory()
         var indexes: [Index] = [], urls: [URL] = []
-        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(),
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(enabled: true),
                                           makeIndex: { _, url, _ in urls.append(url); let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
@@ -262,15 +574,18 @@ final class ExternalDriveTests: XCTestCase {
     }
 
     func testUpgradeLoadsOldPreferencesAndCatalogWithoutRecreatingThem() throws {
+        let suite = "OilFindExternalSavedUpgrade-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         let directory = temporaryDirectory(), persistence = ExternalDrivePersistence(directory: temporaryDirectory())
-        XCTAssertEqual(ExternalDriveCatalog().enabled, true)
+        XCTAssertFalse(ExternalDrivePreferences().enabled)
         let legacy = ExternalDrivePersistence(directory: directory)
         let disabled = ExternalDriveRecord(id: secondUUID, name: "Disabled", path: "/Volumes/Disabled", lastConnected: Date(), enabled: false)
         legacy.save(.init(enabled: true, drives: [.init(id: uuid, name: volume.name, path: volume.path, lastConnected: Date()), disabled]))
         try Data("legacy catalog".utf8).write(to: legacy.indexURL(uuid))
         var urls: [URL] = []
         let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { [self.volume] },
-                                          makeIndex: { _, url, _ in urls.append(url); return Index() })
+                                          settingsDefaults: defaults, makeIndex: { _, url, _ in urls.append(url); return Index() })
         defer { catalog.stop() }
         catalog.start()
         try waitUntil("legacy preferences and mounted drive index") { catalog.ready && urls.count == 1 && catalog.rows.count == 2 }
@@ -278,7 +593,7 @@ final class ExternalDriveTests: XCTestCase {
         XCTAssertEqual(catalog.rows.count, 2); XCTAssertEqual(catalog.rows.first { $0.id == secondUUID }?.status, .disabled)
         XCTAssertEqual(urls, [legacy.indexURL(uuid)])
         XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(urls.first)), Data("legacy catalog".utf8))
-        XCTAssertTrue(persistence.load().enabled)
+        XCTAssertFalse(persistence.load().enabled)
     }
 
     func testPublicSnapshotArgumentsHaveThreeRowsAndNoPersistentIO() throws {
@@ -294,7 +609,7 @@ final class ExternalDriveTests: XCTestCase {
     }
 
     func testDisconnectedNotificationWaitsForApprovalCatalogSave() throws {
-        let index = Index(), catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(), initialPreferences: .init(),
+        let index = Index(), catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(), initialPreferences: .init(enabled: true),
                                                             makeIndex: { _, _, _ in index })
         defer { catalog.stop() }
         catalog.updateMounted([volume]); index.complete(store(path: volume.path))
@@ -325,7 +640,7 @@ final class ExternalDriveTests: XCTestCase {
         var stale = current; stale.name = "Stale"; stale.path = "/Volumes/Stale"
         let staleVolume = stale
         var discoveries = 0, indexes: [Index] = [], changes = 0
-        let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(), initialPreferences: .init(),
+        let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(), initialPreferences: .init(enabled: true),
                                           discover: {
             lock.lock(); discoveries += 1; let invocation = discoveries; lock.unlock()
             if invocation == 1 {

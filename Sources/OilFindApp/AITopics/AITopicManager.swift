@@ -41,9 +41,9 @@ final class AITopicManager: ObservableObject {
     #if DEBUG
     private(set) var snapshot = false
     #endif
-    static let defaultURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Oil Find/ai-topics/index.sqlite")
+    static let defaultURL = Application.supportDirectory.appendingPathComponent("ai-topics/index.sqlite")
     private static func providerPreferenceKey(_ provider: AITopicProvider) -> String { "aiTopicsProvider.\(provider.rawValue).enabled" }
-    init(defaults: UserDefaults = .standard, url: URL? = nil, locations: AITopicLocations = .local,
+    init(defaults: UserDefaults = Application.preferences, url: URL? = nil, locations: AITopicLocations = .local,
          detectProviders: @escaping () -> Set<AITopicProvider> = { AITopicInstallation.installed() }) {
         self.defaults = defaults; self.locations = locations
         self.detectProviders = detectProviders

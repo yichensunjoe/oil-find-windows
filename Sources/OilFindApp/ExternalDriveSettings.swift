@@ -12,6 +12,10 @@ struct ExternalDriveSettings: View {
                 .accessibilityIdentifier("external-drives.enabled")
             Text(text("drivesDescription")).font(.footnote).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if catalog.exclusionReviewRequired {
+                Text(text("driveExclusionReview")).font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if catalog.ready && catalog.rows.isEmpty {
                 Text(text("drivesEmpty")).font(.footnote).foregroundStyle(.secondary)
             }
@@ -56,6 +60,7 @@ struct ExternalDriveSettings: View {
             let date = DateFormatter(); date.locale = locale; date.dateFormat = chinese ? "M月d日" : "MMM d"
             return text("driveOffline", date.string(from: row.record.lastConnected))
         case .disabled: return text("driveDisabled")
+        case .exclusionReview: return text("driveExclusionPaused")
         }
     }
 }

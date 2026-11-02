@@ -44,7 +44,7 @@ final class UpdateManager: ObservableObject {
         return !state.busy
         #endif
     }
-    init(snapshot: Bool = false, preferences: UpdatePreferences = UpdatePreferences(), current: UpdateVersion = UpdateManager.current) {
+    init(snapshot: Bool = false, preferences: UpdatePreferences = UpdatePreferences(defaults: Application.preferences), current: UpdateVersion = UpdateManager.current) {
         self.snapshot = snapshot; self.preferences = preferences
         runningVersion = current
         automatic = Self.onlineUpdatesAllowed && (snapshot ? true : preferences.automatic)

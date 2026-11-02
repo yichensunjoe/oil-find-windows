@@ -49,7 +49,7 @@
 - 中性 `ApplicationExtension` 保留但没有 Pro 实现。
 - `site/` 是营销官网/静态演示及支付授权接口，仅留作来源参考，不是搜索服务，也不部署。
 - `scripts/package.sh` 改为本分支离线包，不要求私有仓库、不发布至官网；应用包携带 MIT 许可证。
-- Bundle ID、名称、快捷键和缓存路径暂沿用上游，安装前必须隔离，避免原版冲突。
+- Swift 副本使用独立的 Bundle ID、名称、快捷键和数据路径，不迁移、覆盖或清理上游 Oil Find / Sift 的数据。真实安装与界面行为仍需单独验收。
 - 测试使用默认 debug 模式，因为上游 UI 测试依赖 DEBUG-only helper；应用正式编译单独执行 release build。安全测试白名单只访问临时样例，`CI=true` 并非安全沙箱。
 
 以下保留上游架构参考；其中 Pro 条件构建与上游更新描述不再适用于本分支。
@@ -58,7 +58,7 @@
 
 | 维度 | 要求 |
 | --- | --- |
-| 覆盖 | 默认索引启动卷上的个人文件与应用；依赖目录、包内部、`~/Library`、系统目录可在设置里打开，全开即整盘；免费应用自动索引当前连接的本地外置卷；离线目录由可选扩展提供来源 |
+| 覆盖 | Swift 基线索引启动卷上的个人文件与应用；依赖目录、包内部、`~/Library`、系统目录可在设置里打开，全开即整盘；外置卷默认关闭，用户启用后自动索引已连接的本地外置卷；离线目录由可选扩展提供来源 |
 | 速度 | 单来源：3 个字符以上的查询在 1000 万条目上 p95 ≤ 30 ms，单字符 ≤ 80 ms；多来源：85 万 + 两份各 100 万条目时，3 字符以上 p95 ≤ 15 ms，单字符 ≤ 80 ms（验收目标） |
 | 实时 | 在线来源的文件新增、删除、改名、移动在 1 秒内反映到索引；卷退出前取消扫描与监听，免费来源撤下并保留目录文件，可选扩展可提供离线来源 |
 | 启动 | 启动盘已有索引加载 ≤ 1.5 秒，随后用 FSEvents 历史补齐变动；其他来源在后台载入，不阻塞搜索面板 |
@@ -112,7 +112,7 @@ oil-find/
   docs/
 ```
 
-`Package.swift`：`swift-tools-version:5.10`，`platforms: [.macOS(.v14)]`。公开 target 为 `COilFind`、`OilFindCore`、`OilFindApp`（library）、`OilFind`（executable）与 `oilfind-cli`，另有核心与应用界面两个测试 target；应用界面测试依赖 `OilFindApp`。应用 bundle id 为 `com.oiloil.find`。
+`Package.swift`：`swift-tools-version:5.10`，`platforms: [.macOS(.v14)]`。公开 target 为 `COilFind`、`OilFindCore`、`OilFindApp`（library）、`OilFind`（executable）与 `oilfind-cli`，另有核心与应用界面两个测试 target；应用界面测试依赖 `OilFindApp`。隔离副本的 bundle id 为 `com.reasonix.oilfind.intranet`。
 
 ## 开放核心与应用扩展
 
@@ -278,6 +278,8 @@ playground xcarchive dsym rtfd scptd lproj logicx band screenstudio pages number
 用户可在「排除的文件类型」设置扩展名，默认空集合。取文件名称最后一个 `.` 后的部分，不区分大小写；目录和目录包自身不受影响。扫描、直接 FSEvents 与实时子树扫描都在入库前执行相同规则；无配置时跳过扩展名计算，常见 ASCII 扩展名复用 `Classifier.extensionKey` 的 UInt64 键，长扩展名和非 ASCII 扩展名使用预编译的 Unicode 标量规则比较 UTF-8，不逐项创建 String 或分配堆内存。输入仅在回车或失焦时提交，去掉前导点、按空白和逗号分词、转小写并去重，规范化也保留原生撤销记录。
 
 `SettingsPreferences` 保存全局扩展名集合并通知各 `IndexManager`（可注入独立偏好或禁用共享偏好），所以启动卷与扩展提供的卷索引遵守同一排除设置。在线来源重建；离线来源从原目录快照重新载入，在内存中排除相应文件，不扫描、不覆盖原文件。格式 3 的预留头字段（偏移 120）保存不含扩展名的范围指纹，用于识别只有文件类型配置变化的离线目录；旧目录仍兼容。离线目录未曾保存的文件需在卷重新连接并重建后补齐。
+
+用户排除目录也应用于启动卷和外置卷；配置变化时先撤下旧搜索结果，最新排除配置的索引重建成功后才重新展示。外置卷按 UUID 和历史挂载路径映射排除规则；旧路径无法唯一归属时暂停所有外置来源及相关扩展来源，并提示用户重新选择，不修改原排除列表。
 
 ## 线程模型
 

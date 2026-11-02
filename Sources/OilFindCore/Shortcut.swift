@@ -3,7 +3,7 @@ import Carbon
 
 public enum Shortcut {
     public static let defaultKeyCode = UInt32(kVK_ANSI_F)
-    public static let defaultModifiers = UInt32(cmdKey | shiftKey)
+    public static let defaultModifiers = UInt32(controlKey | optionKey | shiftKey)
 
     public static func symbols(keyCode: UInt32, modifiers: UInt32) -> String {
         let prefix = [(controlKey, "⌃"), (optionKey, "⌥"), (shiftKey, "⇧"), (cmdKey, "⌘")]

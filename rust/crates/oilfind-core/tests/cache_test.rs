@@ -135,16 +135,22 @@ fn cache_rewrites_a_legacy_json_document_as_binary() {
     assert_eq!(Index::load(&path).expect("load").entries, loaded.entries);
 }
 
-/// Appends a bincode-style LEB128 varint.
-fn varint(mut value: u64, out: &mut Vec<u8>) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
+/// Appends a bincode 1.x variable-length integer.
+fn varint(value: u64, out: &mut Vec<u8>) {
+    match value {
+        0..=250 => out.push(value as u8),
+        251..=65_535 => {
+            out.push(251);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
         }
-        out.push(byte | 0x80);
+        65_536..=4_294_967_295 => {
+            out.push(252);
+            out.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        _ => {
+            out.push(253);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
     }
 }
 
@@ -158,6 +164,20 @@ fn binary_header(directories: u64, entries: u64) -> Vec<u8> {
     varint(directories, &mut data);
     varint(entries, &mut data);
     data
+}
+
+#[test]
+fn cache_rejects_a_declared_string_larger_than_the_file_without_panicking() {
+    let dir = TempDir::new("cache-string-length");
+    let path = dir.join("truncated.bin");
+    // Version 1, one root, followed by a string length that cannot fit in the file.
+    let mut data = b"OILF1\0\0\0\x01\x01\xfd".to_vec();
+    data.extend_from_slice(&u64::MAX.to_le_bytes());
+    fs::write(&path, data).expect("write fixture");
+
+    let result = std::panic::catch_unwind(|| Index::load(&path));
+    assert!(result.is_ok(), "a truncated cache must not panic");
+    assert!(matches!(result.unwrap(), Err(Error::CacheCorrupt(_))));
 }
 
 #[test]
@@ -197,7 +217,10 @@ fn cache_rejects_a_declared_entry_count_over_the_limit() {
     fs::write(&path, &bytes).expect("write cache");
 
     let error = Index::load(&path).expect_err("oversized entry count must be rejected");
-    assert!(matches!(error, Error::CacheCorrupt(_)), "got: {error}");
+    assert!(
+        matches!(&error, Error::CacheCorrupt(detail) if detail.contains("索引条目超出安全上限")),
+        "got: {error}"
+    );
 }
 
 #[test]
@@ -512,6 +535,57 @@ fn cache_refuses_a_symlinked_file() {
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
     let error = Index::load(&link).expect_err("symlinked cache");
     assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+
+    let original = fs::read(&real).expect("read original cache");
+    let error = sample_index(dir.path())
+        .save(&link)
+        .expect_err("saving through a cache link must be rejected");
+    assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+    assert!(fs::symlink_metadata(&link)
+        .expect("link")
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&real).expect("read original cache"), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_refuses_a_linked_parent_directory() {
+    let dir = TempDir::new("cache-linked-parent");
+    let real = dir.mkdir("real");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink directory");
+    let path = link.join("index.bin");
+    let error = sample_index(dir.path())
+        .save(&path)
+        .expect_err("linked cache directory must be rejected");
+    assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+    assert!(!real.join("index.bin").exists());
+
+    let disguised = link.join("..").join("would-not-write.bin");
+    let error = sample_index(dir.path())
+        .save(&disguised)
+        .expect_err("parent traversal must not hide a cache link");
+    assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+    assert!(!dir.join("would-not-write.bin").exists());
+
+    sample_index(dir.path())
+        .save(&real.join("index.bin"))
+        .expect("save to real directory");
+    let error = Index::load(&path).expect_err("linked cache directory must be rejected");
+    assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+}
+
+#[test]
+fn cache_refuses_parent_traversal_through_a_missing_directory() {
+    let dir = TempDir::new("cache-missing-parent");
+    let path = dir.join("missing/../would-not-write.bin");
+    let error = sample_index(dir.path())
+        .save(&path)
+        .expect_err("missing parent must not be collapsed away");
+    assert!(matches!(error, Error::CacheUnsupported(_)), "got: {error}");
+    assert!(!dir.join("missing").exists());
+    assert!(!dir.join("would-not-write.bin").exists());
 }
 
 #[cfg(unix)]

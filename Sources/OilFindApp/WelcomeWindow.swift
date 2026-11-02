@@ -16,9 +16,9 @@ final class WelcomeModel: ObservableObject {
     private var iconObserver: AnyCancellable?
     init(granted: Bool, snapshot: Bool = false) {
         self.granted = granted
-        if !snapshot { SettingsPreferences.register() }
-        keyCode = snapshot ? Shortcut.defaultKeyCode : UInt32(clamping: UserDefaults.standard.integer(forKey: "hotKeyCode"))
-        modifiers = snapshot ? Shortcut.defaultModifiers : UInt32(clamping: UserDefaults.standard.integer(forKey: "hotKeyModifiers"))
+        if !snapshot { SettingsPreferences.register(in: Application.preferences) }
+        keyCode = snapshot ? Shortcut.defaultKeyCode : UInt32(clamping: Application.preferences.integer(forKey: "hotKeyCode"))
+        modifiers = snapshot ? Shortcut.defaultModifiers : UInt32(clamping: Application.preferences.integer(forKey: "hotKeyModifiers"))
         iconObserver = NSApplication.shared.publisher(for: \.applicationIconImage).sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -50,7 +50,7 @@ struct WelcomeContent: View {
     var body: some View {
         VStack(spacing: 0) {
             Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 72, height: 72)
-            Text("Oil Find").font(.system(size: 22, weight: .semibold)).padding(.top, 14)
+            Text("Oil Find Intranet").font(.system(size: 22, weight: .semibold)).padding(.top, 14)
             Text(L10n.text("welcome.subtitle")).font(.system(size: 13))
                 .foregroundStyle(Color(nsColor: .secondaryLabelColor)).padding(.top, 6)
             HStack(spacing: 8) {

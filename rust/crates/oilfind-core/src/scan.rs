@@ -143,6 +143,15 @@ fn read_directory<F: Fn(Progress) + Sync>(
     pending: &mut Vec<PathBuf>,
     dirs: &mut DirCache,
 ) -> Result<(), Error> {
+    // A directory may have been replaced after it was queued. Check it again
+    // before descending instead of letting read_dir follow a newly created link.
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !platform::is_link_or_reparse(&metadata) => {}
+        _ => {
+            shared.skip(directory);
+            return Ok(());
+        }
+    }
     let reader = match fs::read_dir(directory) {
         Ok(reader) => reader,
         Err(_) => {
@@ -179,10 +188,9 @@ fn read_directory<F: Fn(Progress) + Sync>(
                 continue;
             }
             push_entry(shared, entries, dirs, &path, &metadata)?;
-            // A package bundle is indexed but never opened: a single .app can
-            // hold hundreds of thousands of files, and none of them is
-            // something a user searches for.
-            if !is_package_dir(&path) {
+            // macOS package bundles can contain huge implementation trees.
+            // On Windows and Linux the same suffixes are ordinary directories.
+            if !cfg!(target_os = "macos") || !is_package_dir(&path) {
                 pending.push(path);
             }
             continue;
@@ -475,29 +483,27 @@ fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
         if !root.is_absolute() {
             return Err(Error::RelativeRoot);
         }
-        let cleaned = platform::clean_path(&root);
-        platform::validate_local_volume(&cleaned)?;
-        let metadata = fs::symlink_metadata(&cleaned).map_err(Error::RootUnreadable)?;
-        if !metadata.is_dir() {
-            return Err(Error::NotDirectory);
-        }
-        // Every ancestor is checked, not just the leaf the user picked, so a
-        // protected or linked parent cannot be used as a back door.
-        let mut current: &Path = &cleaned;
-        loop {
-            let metadata = fs::symlink_metadata(current).map_err(Error::RootUnreadable)?;
+        platform::validate_local_volume(&root)?;
+        // Inspect the original components from the volume root before touching
+        // their children or collapsing `..`, so a link cannot redirect either.
+        let mut current = PathBuf::new();
+        for component in root.components() {
+            current.push(component.as_os_str());
+            if !current.is_absolute() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&current).map_err(Error::RootUnreadable)?;
             if platform::is_link_or_reparse(&metadata) {
                 return Err(Error::LinkRoot);
             }
-            if should_skip_dir(current) {
+            if should_skip_dir(&current) {
                 return Err(Error::ProtectedRoot);
             }
-            match current.parent() {
-                Some(parent) if parent != current => current = parent,
-                _ => break,
+            if !metadata.is_dir() {
+                return Err(Error::NotDirectory);
             }
         }
-        normalized.push(cleaned);
+        normalized.push(platform::clean_path(&root));
     }
 
     // Shortest first, so a parent is always seen before its children.

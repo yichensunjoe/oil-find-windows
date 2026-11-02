@@ -13,14 +13,15 @@
 - 来源：`https://github.com/oil-oil/oil-find`，基线 `e63c7150ccbd401a1375c08215d1386b56dd9471`（1.7.1）。保留完整历史、MIT 许可证和原作者声明。
 - 两个平台入口并存，共享同一公开功能边界：
   - macOS：`Sources/` + `Package.swift`，Swift 5 语言模式 / SwiftPM 5.10+、AppKit、SwiftUI、C；Apple 芯片，macOS 14+；无第三方 Swift 包。
-  - Windows：`rust/`，Rust 1.92（`rust/rust-toolchain.toml` 固定）+ `windows-sys` 原生 Win32；第三方 crate 见 `rust/Cargo.toml`（pinyin/serde/serde_json/regex/walkdir/rayon，均 MIT/Apache）。仅 Windows 10/11 x64。`main` 分支的 Go 实现打标签 `v0.1-go` 保留，仅作对照与回退，不再演进。
+  - Windows：`rust/`，Rust 1.92（`rust/rust-toolchain.toml` 固定）+ `windows-sys` 原生 Win32；依赖和许可证分别见 `rust/crates/*/Cargo.toml` 与 `rust/THIRD_PARTY_NOTICES.txt`。仅 Windows 10/11 x64。Go 实现由标签 `v0.1-go` 保留，仅作对照与回退，不再演进。
 - 永久只构建公开模块；不要恢复私有 target 自动检测，不导入 Pro，也不下载或分发上游含 Pro 的安装包。
 - `OILFIND_OFFLINE_BUILD` 固定用于 macOS 应用库；在线更新检查、下载安装、更新官网跳转均禁用，由用户手动获取新版本。Windows 版不实现任何在线更新/遥测。
 - 保留中性 `ApplicationExtension`，不要把它误当 Pro 实现。上游官网 `site/` 仅作来源参考，不安装/部署其支付、授权或分析服务。
 - macOS 热路径保持 Unsafe 指针 / SoA 设计；代码注释用英文；界面文案维护 `L10n.swift` 的中英文对应项。
 - Windows 版硬边界：只读元数据（不读正文）；无删除/移动/重命名入口；默认不扫描任何目录，必须用户显式选择范围并点击开始索引；跳过 reparse/symlink、系统/AppData/依赖/私人运行器目录；拒绝 UNC、设备路径与网络映射盘；缓存/配置在 `%LOCALAPPDATA%\OilFind`，缓存不得是链接。
 - Windows 版首版只做本机搜索：不支持 SMB/NAS 共享盘、多人服务、正文检索。改变平台或共享索引架构先确认用户需求。
-- 现有 Bundle ID、数据路径和全局快捷键仍与上游一致，安装前必须进行隔离改造；不得覆盖已有 Oil Find。
+- Swift 副本使用独立 Bundle ID、应用名、数据路径和默认快捷键；不得迁移、覆盖或清理已有 Oil Find / Sift 的数据。外置卷索引首次默认关闭，用户设置排除项后可手动开启；实际安装、启动及真机验收仍须单独授权。
+- Rust macOS 预览默认不扫描；旧配置无法证明授权时保留原文件并要求重新选择，缓存只在对应范围明确索引并保存成功后加载。
 
 ## 构建与必要验证
 
@@ -28,14 +29,15 @@
 swift build -c release
 CI=true swift test --filter '^OilFindCoreTests\.(M1Tests|M3Tests|M5Tests)/|^OilFindUITests\.OfflineUpdateTests/'
 python3 Tests/Scripts/test_open_core.py
-bash -n scripts/build-app.sh scripts/package.sh
+python3 Tests/Scripts/test_uninstall.py
+bash -n scripts/build-app.sh scripts/package.sh scripts/install.sh scripts/uninstall.sh
 ```
 
 工作区执行 Python 时使用已配置的托管 Python 绝对路径。
 `CI=true` 不是安全沙箱；不直接运行全量测试。部分上游测试会读写真实 Desktop、访问本地 AI 会话缓存或挂载卷。白名单仅使用临时样例或内存数据；更大测试集先审查副作用。
 
 ```sh
-scripts/build-app.sh          # builds build/Oil Find.app; does not install
+scripts/build-app.sh          # builds build/Oil Find Intranet.app; does not install
 scripts/build-app.sh --debug
 scripts/package.sh            # archives this fork only; no upstream publication
 ```
@@ -49,6 +51,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check -p oilfind-win --target x86_64-pc-windows-msvc   # 只做类型检查，不链接
+python3 scripts/test_verify_pe.py
+python3 scripts/test_build_scripts.py
 ```
 
 ```powershell

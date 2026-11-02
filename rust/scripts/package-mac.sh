@@ -9,11 +9,15 @@ PROJECT_DIR="$(cd -- "$RUST_DIR/.." && pwd)"
 APP="$PROJECT_DIR/build/Oil Find Rust.app"
 OUTPUT="$PROJECT_DIR/outputs/OilFind-Rust-macOS-preview.zip"
 
-cargo build --release -p oilfind-mac --manifest-path "$RUST_DIR/Cargo.toml"
+cd "$RUST_DIR"
+TARGET_DIR="${CARGO_TARGET_DIR:-$RUST_DIR/target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$RUST_DIR/$TARGET_DIR" ;; esac
+HOST_TARGET="$(rustc -vV | grep '^host: ' | cut -d ' ' -f 2)"
+cargo build --release --target "$HOST_TARGET" --target-dir "$TARGET_DIR" -p oilfind-mac
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$RUST_DIR/crates/oilfind-mac/Info.plist" "$APP/Contents/Info.plist"
-cp "$RUST_DIR/target/release/oilfind-mac" "$APP/Contents/MacOS/oilfind-mac"
+cp "$TARGET_DIR/$HOST_TARGET/release/oilfind-mac" "$APP/Contents/MacOS/oilfind-mac"
 codesign --force --sign - "$APP"
 
 mkdir -p "$(dirname "$OUTPUT")"

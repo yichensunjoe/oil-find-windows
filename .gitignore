@@ -1,5 +1,6 @@
 .build/
 build/
+/.oilfind-build-temp-*/
 .swiftpm/
 .DS_Store
 *.oilfind

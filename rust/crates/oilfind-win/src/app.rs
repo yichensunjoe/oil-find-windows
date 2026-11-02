@@ -5,7 +5,8 @@
 //! - 扫描线程与搜索线程通过 `mpsc` 送回完成事件，再用 `PostMessageW` 唤醒 UI。
 //! - 进度通过 `PostMessage(WM_APP + 2)` 通知，UI 线程读取最新的进度快照。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -87,6 +88,9 @@ mod style {
     pub const LVS_REPORT: u32 = 0x0000_0001;
     pub const LVS_SINGLESEL: u32 = 0x0000_0004;
     pub const LVS_SHOWSELALWAYS: u32 = 0x0000_0008;
+    // No owner-data or owner-draw: the native control owns its item text.
+    pub const RESULTS_STYLE: u32 =
+        WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
     pub const LVS_EX_FULLROWSELECT: u32 = 0x0000_0020;
     pub const LVS_EX_GRIDLINES: u32 = 0x0000_0001;
     pub const LVS_EX_DOUBLEBUFFER: u32 = 0x0001_0000;
@@ -130,23 +134,130 @@ mod style {
     pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 }
 
-// UI 线程持有的 App 指针。
-//
-// Win32 的窗口过程没有「用户数据」以外的上下文，所有消息都在同一个 UI 线程
-// 上派发；这里沿用 Go 版的全局指针做法，避免在窗口过程里长期持有一个 `&mut`
-// 借用（`SetWindowPos` 等调用会同步重入 WM_SIZE）。
+// Win32 may call the window procedure synchronously from almost any control
+// operation, including modal dialogs. Never create a second mutable App borrow:
+// copy deferrable messages into this UI-thread queue and replay them after the
+// current borrow ends. Messages needing synchronous results are handled directly
+// in window_proc, using the separate read-only window snapshot below.
 thread_local! {
-    static APP: Cell<*mut App> = const { Cell::new(std::ptr::null_mut()) };
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    static PENDING: RefCell<VecDeque<Deferred>> = const { RefCell::new(VecDeque::new()) };
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
+    static DESTROYED: Cell<bool> = const { Cell::new(false) };
+    static WINDOW_DPI: Cell<i32> = const { Cell::new(96) };
+    static WINDOW_RESULTS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+    static WINDOW_HEADER: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+    static WINDOW_EMPTY: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Notification {
+    HeaderClicked(i32),
+    ResultDoubleClicked(i32),
+    ResultSelectionChanged,
+}
+
+#[derive(Clone, Copy)]
+enum Deferred {
+    Size,
+    DpiChanged { dpi: i32, suggested: RECT },
+    Command { id: usize, notification: u32 },
+    ContextMenu { control: HWND, position: LPARAM },
+    Notify(Notification),
+    Timer(usize),
+    Events,
+    Progress,
+    Close,
+    Destroyed,
+}
+
+impl Deferred {
+    fn coalesces_with(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Size, Self::Size)
+            | (Self::Events, Self::Events)
+            | (Self::Progress, Self::Progress)
+            | (
+                Self::Notify(Notification::ResultSelectionChanged),
+                Self::Notify(Notification::ResultSelectionChanged),
+            ) => true,
+            (Self::Timer(left), Self::Timer(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+enum AppAccess<R> {
+    Ready(R),
+    Busy,
+    Missing,
+}
+
+fn try_with_state<T, R>(slot: &RefCell<Option<T>>, f: impl FnOnce(&mut T) -> R) -> AppAccess<R> {
+    let Ok(mut borrowed) = slot.try_borrow_mut() else {
+        return AppAccess::Busy;
+    };
+    match borrowed.as_mut() {
+        Some(state) => AppAccess::Ready(f(state)),
+        None => AppAccess::Missing,
+    }
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    let pointer = APP.with(Cell::get);
-    if pointer.is_null() {
-        return None;
+    match APP.with(|slot| try_with_state(slot, f)) {
+        AppAccess::Ready(result) => {
+            drain_pending();
+            Some(result)
+        }
+        AppAccess::Busy | AppAccess::Missing => None,
     }
-    // SAFETY: 指针在 run() 期间指向栈上的 Box<App>，只在 UI 线程访问；
-    // 重入只发生在同一个线程的嵌套窗口消息里。
-    Some(f(unsafe { &mut *pointer }))
+}
+
+fn push_deferred(pending: &mut VecDeque<Deferred>, message: Deferred) {
+    if !pending
+        .iter()
+        .any(|existing| message.coalesces_with(*existing))
+    {
+        pending.push_back(message);
+    }
+}
+
+fn queue_deferred(message: Deferred) {
+    PENDING.with(|pending| push_deferred(&mut pending.borrow_mut(), message));
+}
+
+fn dispatch_deferred(message: Deferred) {
+    if DESTROYED.with(Cell::get) && !matches!(message, Deferred::Destroyed) {
+        return;
+    }
+    match APP.with(|slot| try_with_state(slot, |app| app.apply(message))) {
+        AppAccess::Ready(()) => drain_pending(),
+        AppAccess::Busy => queue_deferred(message),
+        AppAccess::Missing => {}
+    }
+}
+
+fn drain_pending() {
+    if DRAINING.with(|draining| draining.replace(true)) {
+        return;
+    }
+    loop {
+        let Some(message) = PENDING.with(|pending| pending.borrow_mut().pop_front()) else {
+            break;
+        };
+        match APP.with(|slot| try_with_state(slot, |app| app.apply(message))) {
+            AppAccess::Ready(()) => {}
+            AppAccess::Busy => {
+                PENDING.with(|pending| pending.borrow_mut().push_front(message));
+                break;
+            }
+            AppAccess::Missing => {
+                PENDING.with(|pending| pending.borrow_mut().clear());
+                break;
+            }
+        }
+    }
+    DRAINING.with(|draining| draining.set(false));
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -234,6 +345,7 @@ struct App {
     config: Config,
     config_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
+    storage_guard: Option<Arc<api::StorageGuard>>,
     index: Option<Arc<Index>>,
     rows: Vec<Entry>,
     scan_cancel: Option<Arc<AtomicBool>>,
@@ -283,10 +395,22 @@ pub fn run() -> Result<(), String> {
         return Err("加载应用程序模块失败".to_string());
     }
 
-    let mut app = Box::new(App::new(instance));
-    APP.with(|slot| slot.set(&mut *app as *mut App));
+    let app = match App::new(instance) {
+        Ok(app) => app,
+        Err(err) => {
+            unsafe { CoUninitialize() };
+            return Err(err);
+        }
+    };
+    WINDOW_DPI.with(|dpi| dpi.set(app.dpi));
+    DESTROYED.with(|destroyed| destroyed.set(false));
+    APP.with(|slot| *slot.borrow_mut() = Some(app));
     let outcome = run_window(instance);
-    APP.with(|slot| slot.set(std::ptr::null_mut()));
+    let app = APP.with(|slot| slot.borrow_mut().take());
+    PENDING.with(|pending| pending.borrow_mut().clear());
+    WINDOW_RESULTS.with(|handle| handle.set(std::ptr::null_mut()));
+    WINDOW_HEADER.with(|handle| handle.set(std::ptr::null_mut()));
+    WINDOW_EMPTY.with(|handle| handle.set(std::ptr::null_mut()));
     drop(app);
     unsafe { CoUninitialize() };
     outcome
@@ -382,6 +506,15 @@ fn run_window(instance: HWND) -> Result<(), String> {
         if result == 0 {
             break;
         }
+        if message.message == WM_KEYDOWN && message.wParam == 0x1B {
+            // SetWindowText synchronously sends EN_CHANGE. Do it outside the App
+            // borrow so the notification runs before cancel_search kills its timer.
+            if let Some(search) = with_app(|app| app.search) {
+                api::put_text(search, "");
+                with_app(|app| app.cancel_search());
+                continue;
+            }
+        }
         if with_app(|app| app.keyboard(&message)).unwrap_or(false) {
             continue;
         }
@@ -401,15 +534,158 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match with_app(|app| app.handle(hwnd, message, wparam, lparam)).flatten() {
-        Some(result) => result,
-        None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    match message {
+        // WM_CREATE must return its actual success/failure synchronously. This
+        // is the only creation of our top-level class, outside an App borrow.
+        WM_CREATE => match APP.with(|slot| try_with_state(slot, |app| app.create(hwnd))) {
+            AppAccess::Ready(result) => {
+                if result == -1 {
+                    PENDING.with(|pending| pending.borrow_mut().clear());
+                } else {
+                    drain_pending();
+                }
+                result
+            }
+            AppAccess::Busy => -1,
+            AppAccess::Missing => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        },
+        // These replies and output pointers must be filled before returning to
+        // Win32, even when another App operation is in progress.
+        WM_GETMINMAXINFO => {
+            if !lparam_is_null(lparam) {
+                let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+                let (width, height) = min_track_size(WINDOW_DPI.with(Cell::get));
+                info.ptMinTrackSize.x = width;
+                info.ptMinTrackSize.y = height;
+            }
+            0
+        }
+        style::WM_CTLCOLORSTATIC => {
+            let empty = WINDOW_EMPTY.with(Cell::get);
+            if !empty.is_null() && lparam == empty as isize {
+                let device = wparam as HDC;
+                unsafe {
+                    SetTextColor(device, 0x0080_8080);
+                    SetBkColor(device, 0x00FF_FFFF);
+                    GetSysColorBrush(COLOR_WINDOW) as LRESULT
+                }
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+        }
+        // This is not an owner-data or owner-draw list: item text is stored
+        // by the control. Return 0 synchronously, including CDRF_DODEFAULT for
+        // NM_CUSTOMDRAW, and never queue drawing/data-request pointers. Copy
+        // only our actionable notifications before their lparam expires.
+        WM_NOTIFY => {
+            let header = WINDOW_HEADER.with(Cell::get);
+            let results = WINDOW_RESULTS.with(Cell::get);
+            if let Some(notification) = unsafe { read_notification(lparam, header, results) } {
+                dispatch_deferred(Deferred::Notify(notification));
+            }
+            0
+        }
+        WM_SIZE => {
+            dispatch_deferred(Deferred::Size);
+            0
+        }
+        WM_DPICHANGED => {
+            if let Some(suggested) = unsafe { read_suggested_rect(lparam) } {
+                dispatch_deferred(Deferred::DpiChanged {
+                    dpi: (wparam & 0xFFFF) as i32,
+                    suggested,
+                });
+            }
+            0
+        }
+        WM_COMMAND => {
+            dispatch_deferred(Deferred::Command {
+                id: wparam & 0xFFFF,
+                notification: ((wparam >> 16) & 0xFFFF) as u32,
+            });
+            0
+        }
+        WM_CONTEXTMENU => {
+            dispatch_deferred(Deferred::ContextMenu {
+                control: wparam as HWND,
+                position: lparam,
+            });
+            0
+        }
+        WM_TIMER => {
+            dispatch_deferred(Deferred::Timer(wparam));
+            0
+        }
+        WM_APP_EVENT => {
+            dispatch_deferred(Deferred::Events);
+            0
+        }
+        WM_APP_PROGRESS => {
+            dispatch_deferred(Deferred::Progress);
+            0
+        }
+        WM_CLOSE => {
+            dispatch_deferred(Deferred::Close);
+            0
+        }
+        WM_DESTROY => {
+            // In particular, DestroyWindow from WM_CLOSE reenters here while
+            // App is borrowed. Quit immediately, discard stale HWND messages,
+            // and run idempotent shutdown once the borrow has ended.
+            DESTROYED.with(|destroyed| destroyed.set(true));
+            PENDING.with(|pending| pending.borrow_mut().clear());
+            unsafe { PostQuitMessage(0) };
+            dispatch_deferred(Deferred::Destroyed);
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
 
+fn min_track_size(dpi: i32) -> (i32, i32) {
+    (860 * dpi / 96, 620 * dpi / 96)
+}
+
+unsafe fn read_suggested_rect(lparam: LPARAM) -> Option<RECT> {
+    if lparam_is_null(lparam) {
+        None
+    } else {
+        // WM_DPICHANGED owns this pointer only until window_proc returns.
+        Some(unsafe { *(lparam as *const RECT) })
+    }
+}
+
+unsafe fn read_notification(lparam: LPARAM, header: HWND, results: HWND) -> Option<Notification> {
+    if lparam_is_null(lparam) {
+        return None;
+    }
+    let notice = unsafe { &*(lparam as *const NMHDR) };
+    if !header.is_null() && notice.hwndFrom == header {
+        if notice.code as i32 == HDN_ITEMCLICK as i32 {
+            let clicked = unsafe { &*(lparam as *const NMHEADERW) };
+            return Some(Notification::HeaderClicked(clicked.iItem));
+        }
+    } else if !results.is_null() && notice.hwndFrom == results {
+        if notice.code as i32 == NM_DBLCLK as i32 {
+            let clicked = unsafe { &*(lparam as *const NMITEMACTIVATE) };
+            return Some(Notification::ResultDoubleClicked(clicked.iItem));
+        }
+        if notice.code as i32 == LVN_ITEMCHANGED as i32 {
+            return Some(Notification::ResultSelectionChanged);
+        }
+    }
+    None
+}
+
 impl App {
-    fn new(instance: HWND) -> Self {
+    fn new(instance: HWND) -> Result<Self, String> {
         let (config_path, cache_path, startup_notice) = platform::config_paths();
+        // Acquire before reading either configuration or cache. Memory-only
+        // windows have no shared storage and need no lock.
+        let storage_guard = config_path
+            .as_ref()
+            .map(|path| api::StorageGuard::acquire(path).map(Arc::new))
+            .transpose()?;
         let dpi = unsafe { GetDpiForSystem() };
         let dpi = if (96..=480).contains(&dpi) {
             dpi as i32
@@ -443,6 +719,7 @@ impl App {
             config: Config::default(),
             config_path,
             cache_path,
+            storage_guard,
             index: None,
             rows: Vec::new(),
             scan_cancel: None,
@@ -470,101 +747,56 @@ impl App {
             }),
         };
         app.load_configuration();
-        app
+        Ok(app)
     }
 
-    fn handle(
-        &mut self,
-        hwnd: HWND,
-        message: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Option<LRESULT> {
-        match message {
-            WM_CREATE => {
-                self.hwnd = hwnd;
-                match self.create_ui(hwnd) {
-                    Ok(()) => Some(0),
-                    Err(err) => {
-                        self.init_error = Some(err);
-                        Some(-1)
-                    }
-                }
+    fn create(&mut self, hwnd: HWND) -> LRESULT {
+        self.hwnd = hwnd;
+        match self.create_ui(hwnd) {
+            Ok(()) => 0,
+            Err(err) => {
+                self.init_error = Some(err);
+                -1
             }
-            WM_SIZE => {
+        }
+    }
+
+    fn apply(&mut self, message: Deferred) {
+        if self.closing && !matches!(message, Deferred::Destroyed) {
+            return;
+        }
+        match message {
+            Deferred::Size => {
                 if !self.results.is_null() {
                     self.layout();
                 }
-                Some(0)
             }
-            WM_DPICHANGED => {
-                if !lparam_is_null(lparam) && !self.results.is_null() && !self.closing {
-                    let suggested = unsafe { *(lparam as *const RECT) };
-                    let dpi = (wparam & 0xFFFF) as i32;
+            Deferred::DpiChanged { dpi, suggested } => {
+                if !self.results.is_null() {
                     if let Err(err) = self.change_dpi(dpi, suggested) {
                         self.last_notice = format!("调整显示缩放失败，保留现有界面：{err}");
                         self.render_status();
                     }
                 }
-                Some(0)
             }
-            WM_GETMINMAXINFO => {
-                if !lparam_is_null(lparam) {
-                    let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
-                    info.ptMinTrackSize.x = self.px(860);
-                    info.ptMinTrackSize.y = self.px(620);
-                }
-                Some(0)
-            }
-            WM_COMMAND => {
-                self.command(wparam & 0xFFFF, ((wparam >> 16) & 0xFFFF) as u32);
-                Some(0)
-            }
-            WM_CONTEXTMENU => {
-                self.context_menu(wparam as HWND, lparam);
-                Some(0)
-            }
-            // 空状态提示用灰色文字、窗口底色；其余静态控件走默认处理。
-            style::WM_CTLCOLORSTATIC if lparam == self.empty as isize && !self.empty.is_null() => {
-                let device = wparam as HDC;
-                unsafe {
-                    SetTextColor(device, 0x0080_8080);
-                    SetBkColor(device, 0x00FF_FFFF);
-                }
-                Some(unsafe { GetSysColorBrush(COLOR_WINDOW) } as LRESULT)
-            }
-            WM_NOTIFY => {
-                self.notify(lparam);
-                Some(0)
-            }
-            WM_TIMER => {
-                if wparam == TIMER_SEARCH {
-                    unsafe { KillTimer(hwnd, TIMER_SEARCH) };
+            Deferred::Command { id, notification } => self.command(id, notification),
+            Deferred::ContextMenu { control, position } => self.context_menu(control, position),
+            Deferred::Notify(notification) => self.notify(notification),
+            Deferred::Timer(timer) => {
+                if timer == TIMER_SEARCH {
+                    unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
                     self.search_now();
-                } else if wparam == TIMER_SYNC && self.auto_sync && !self.scanning {
+                } else if timer == TIMER_SYNC && self.auto_sync && !self.scanning {
                     self.begin_scan();
                 }
-                Some(0)
             }
-            WM_APP_EVENT => {
-                self.drain_events();
-                Some(0)
-            }
-            WM_APP_PROGRESS => {
-                self.show_progress();
-                Some(0)
-            }
-            WM_CLOSE => {
+            Deferred::Events => self.drain_events(),
+            Deferred::Progress => self.show_progress(),
+            Deferred::Close => {
                 self.shutdown();
-                unsafe { DestroyWindow(hwnd) };
-                Some(0)
+                unsafe { DestroyWindow(self.hwnd) };
             }
-            WM_DESTROY => {
-                self.shutdown();
-                unsafe { PostQuitMessage(0) };
-                Some(0)
-            }
-            _ => None,
+            Deferred::Destroyed => self.shutdown(),
         }
     }
 
@@ -573,6 +805,7 @@ impl App {
         if (96..=480).contains(&window_dpi) {
             self.dpi = window_dpi as i32;
         }
+        WINDOW_DPI.with(|dpi| dpi.set(self.dpi));
         self.font = api::create_font(self.dpi)?;
 
         let make = |class: &str, label: &str, style: u32, ex_style: u32, id: usize| {
@@ -669,14 +902,11 @@ impl App {
         self.results = make(
             "SysListView32",
             "",
-            style::WS_TABSTOP
-                | style::WS_BORDER
-                | style::LVS_REPORT
-                | style::LVS_SINGLESEL
-                | style::LVS_SHOWSELALWAYS,
+            style::RESULTS_STYLE,
             style::WS_EX_CLIENTEDGE,
             ID_RESULTS,
         )?;
+        WINDOW_RESULTS.with(|handle| handle.set(self.results));
         api::send_message(
             self.results,
             style::LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -686,6 +916,7 @@ impl App {
         );
         // 表头句柄：排序点击通知由列表视图转发给父窗口。
         self.header = api::send_message(self.results, style::LVM_GETHEADER, 0, 0) as HWND;
+        WINDOW_HEADER.with(|handle| handle.set(self.header));
         for (position, label) in ["文件名", "完整路径", "大小", "修改日期"]
             .iter()
             .enumerate()
@@ -717,6 +948,7 @@ impl App {
 
         // 空状态提示：覆盖在结果列表上方，仅在没有行时显示（后创建 = 上层）。
         self.empty = make("STATIC", "", style::SS_CENTER, 0, 0)?;
+        WINDOW_EMPTY.with(|handle| handle.set(self.empty));
         unsafe { ShowWindow(self.empty, SW_HIDE) };
 
         self.refresh_roots();
@@ -898,6 +1130,7 @@ impl App {
         let previous = self.font;
         self.font = font;
         self.dpi = dpi;
+        WINDOW_DPI.with(|snapshot| snapshot.set(dpi));
         let mut controls = self.labels.clone();
         controls.extend([
             self.search,
@@ -957,16 +1190,6 @@ impl App {
                 return true;
             }
         }
-        if message.wParam == 0x1B {
-            // Esc：清空搜索并丢弃当前结果。
-            api::put_text(self.search, "");
-            unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
-            self.search_generation += 1;
-            self.set_rows(Vec::new());
-            self.last_notice = "已取消搜索；索引与文件未改动。".to_string();
-            self.render_status();
-            return true;
-        }
         if message.wParam == 0x0D {
             let focus = unsafe { GetFocus() };
             if focus == self.results {
@@ -981,6 +1204,17 @@ impl App {
             }
         }
         false
+    }
+
+    fn cancel_search(&mut self) {
+        if self.closing {
+            return;
+        }
+        unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
+        self.search_generation += 1;
+        self.set_rows(Vec::new());
+        self.last_notice = "已取消搜索；索引与文件未改动。".to_string();
+        self.render_status();
     }
 
     fn command(&mut self, id: usize, notification: u32) {
@@ -1033,30 +1267,15 @@ impl App {
         }
     }
 
-    fn notify(&mut self, lparam: LPARAM) {
-        if lparam_is_null(lparam) {
-            return;
-        }
-        let header = unsafe { &*(lparam as *const NMHDR) };
-        // 表头点击通知由列表视图转发给父窗口：切换排序列或方向。
-        if !self.header.is_null() && header.hwndFrom == self.header {
-            if header.code as i32 == HDN_ITEMCLICK as i32 {
-                let clicked = unsafe { &*(lparam as *const NMHEADERW) };
-                self.sort_by_column(clicked.iItem as usize);
+    fn notify(&mut self, notification: Notification) {
+        match notification {
+            Notification::HeaderClicked(column) => self.sort_by_column(column as usize),
+            Notification::ResultDoubleClicked(item) => {
+                if item >= 0 && (item as usize) < self.rows.len() {
+                    self.file_action(ID_OPEN);
+                }
             }
-            return;
-        }
-        if header.hwndFrom != self.results {
-            return;
-        }
-        let code = header.code as i32;
-        if code == NM_DBLCLK as i32 {
-            let activation = unsafe { &*(lparam as *const NMITEMACTIVATE) };
-            if activation.iItem >= 0 && (activation.iItem as usize) < self.rows.len() {
-                self.file_action(ID_OPEN);
-            }
-        } else if code == LVN_ITEMCHANGED as i32 {
-            self.selection_buttons();
+            Notification::ResultSelectionChanged => self.selection_buttons(),
         }
     }
 
@@ -1222,7 +1441,11 @@ impl App {
         let cache_path = self.cache_path.clone();
         let gate = Arc::clone(&self.scan_gate);
         let progress_slot = Arc::clone(&self.progress_slot);
+        let storage_guard = self.storage_guard.clone();
         std::thread::spawn(move || {
+            // Closing the window cancels but does not join this worker. Keep
+            // the process-wide storage lock until it can no longer write.
+            let _storage_guard = storage_guard;
             // 同一时刻只允许一个扫描线程写缓存；被取消的旧任务会很快释放。
             let _guard = lock(&gate);
             if cancel.load(Ordering::SeqCst) {
@@ -1636,14 +1859,17 @@ impl App {
         if control != self.results || self.results.is_null() {
             return;
         }
-        let mut point = POINT {
-            x: (lparam & 0xFFFF) as i16 as i32,
-            y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+        let (mut point, mouse) = match context_menu_position(lparam) {
+            Some((x, y)) => (POINT { x, y }, true),
+            None => (POINT { x: 0, y: 0 }, false),
         };
-        if point.x >= 0 && point.y >= 0 {
+        if mouse {
             let mut client = point;
-            unsafe { ScreenToClient(self.results, &mut client) };
-            let hit = LVHITTESTINFO {
+            if unsafe { ScreenToClient(self.results, &mut client) } == 0 {
+                return;
+            }
+            // LVM_HITTEST writes flags and item details back to this structure.
+            let mut hit = LVHITTESTINFO {
                 pt: client,
                 flags: 0,
                 iItem: -1,
@@ -1654,7 +1880,7 @@ impl App {
                 self.results,
                 style::LVM_HITTEST,
                 0,
-                &hit as *const LVHITTESTINFO as isize,
+                &mut hit as *mut LVHITTESTINFO as isize,
             );
             if item < 0 {
                 return;
@@ -1680,7 +1906,9 @@ impl App {
             point.x = (rect.left + rect.right) / 2;
             point.y = (rect.top + rect.bottom) / 2;
             let mut screen = point;
-            unsafe { ClientToScreen(self.results, &mut screen) };
+            if unsafe { ClientToScreen(self.results, &mut screen) } == 0 {
+                return;
+            }
             point = screen;
         }
         let menu = unsafe { CreatePopupMenu() };
@@ -1889,15 +2117,7 @@ impl App {
             return Err("当前用户配置目录不可用".to_string());
         };
         let data = serde_json::to_vec_pretty(&self.config).map_err(|err| err.to_string())?;
-        let parent = config_path
-            .parent()
-            .ok_or_else(|| "配置路径无效".to_string())?;
-        let temporary = parent.join(format!("config-{}.tmp", std::process::id()));
-        std::fs::write(&temporary, data).map_err(|err| err.to_string())?;
-        std::fs::rename(&temporary, config_path).map_err(|err| {
-            let _ = std::fs::remove_file(&temporary);
-            err.to_string()
-        })
+        api::write_configuration(config_path, &data).map_err(|err| err.to_string())
     }
 
     fn load_cache(&mut self) {
@@ -1914,7 +2134,9 @@ impl App {
         let sender = self.events_tx.clone();
         let hwnd = SendHwnd(self.hwnd);
         let roots: Vec<PathBuf> = self.config.roots.iter().map(PathBuf::from).collect();
+        let storage_guard = self.storage_guard.clone();
         std::thread::spawn(move || {
+            let _storage_guard = storage_guard;
             let outcome = (|| -> Result<(Index, SystemTime), String> {
                 let metadata = std::fs::symlink_metadata(&cache_path)
                     .map_err(|err| format!("缓存不可用：{err}"))?;
@@ -2013,6 +2235,18 @@ fn lparam_is_null(lparam: LPARAM) -> bool {
     lparam == 0
 }
 
+/// WM_CONTEXTMENU encodes signed 16-bit screen coordinates. Only (-1, -1)
+/// means keyboard invocation; negative coordinates can belong to a monitor.
+fn context_menu_position(lparam: LPARAM) -> Option<(i32, i32)> {
+    let x = (lparam & 0xFFFF) as i16 as i32;
+    let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+    if (x, y) == (-1, -1) {
+        None
+    } else {
+        Some((x, y))
+    }
+}
+
 /// 状态栏里的「快照 MM-DD HH:MM:SS」。
 fn system_time_label(time: SystemTime) -> String {
     let seconds = match time.duration_since(SystemTime::UNIX_EPOCH) {
@@ -2038,6 +2272,151 @@ fn month_day_label(date: &str, clock: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reentrant_borrow_is_deferred_without_losing_search_or_resize() {
+        let state = RefCell::new(Some(Vec::new()));
+        let mut pending = VecDeque::new();
+        let result = try_with_state(&state, |outer| {
+            outer.push("outer-start");
+            assert!(matches!(try_with_state(&state, |_| ()), AppAccess::Busy));
+            push_deferred(
+                &mut pending,
+                Deferred::Command {
+                    id: ID_SEARCH,
+                    notification: 0x0300,
+                },
+            );
+            push_deferred(&mut pending, Deferred::Size);
+            push_deferred(&mut pending, Deferred::Size);
+            outer.push("outer-end");
+        });
+        assert!(matches!(result, AppAccess::Ready(())));
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Deferred::Command {
+                id: ID_SEARCH,
+                notification: 0x0300
+            })
+        ));
+        assert!(matches!(pending.pop_front(), Some(Deferred::Size)));
+        assert!(matches!(
+            try_with_state(&state, |state| state.clone()),
+            AppAccess::Ready(value) if value == ["outer-start", "outer-end"]
+        ));
+    }
+
+    #[test]
+    fn synchronous_minimum_size_uses_the_current_dpi_snapshot() {
+        assert_eq!(min_track_size(96), (860, 620));
+        assert_eq!(min_track_size(144), (1290, 930));
+        assert_eq!(min_track_size(192), (1720, 1240));
+    }
+
+    #[test]
+    fn dpi_rectangle_is_copied_before_the_sender_returns() {
+        let mut suggested = RECT {
+            left: -100,
+            top: 20,
+            right: 700,
+            bottom: 600,
+        };
+        let captured =
+            unsafe { read_suggested_rect(&mut suggested as *mut RECT as LPARAM) }.unwrap();
+        suggested.left = 900;
+        assert_eq!(suggested.left, 900);
+        assert_eq!(
+            (captured.left, captured.top, captured.right, captured.bottom),
+            (-100, 20, 700, 600)
+        );
+        assert!(unsafe { read_suggested_rect(0) }.is_none());
+    }
+
+    #[test]
+    fn notification_payload_is_copied_before_the_sender_returns() {
+        let mut header_token = 0_u8;
+        let mut results_token = 0_u8;
+        let header = (&mut header_token as *mut u8).cast();
+        let results = (&mut results_token as *mut u8).cast();
+        let captured = {
+            let notice = NMHEADERW {
+                hdr: NMHDR {
+                    hwndFrom: header,
+                    code: HDN_ITEMCLICK,
+                    ..Default::default()
+                },
+                iItem: 2,
+                ..Default::default()
+            };
+            unsafe { read_notification(&notice as *const NMHEADERW as isize, header, results) }
+        };
+        assert_eq!(captured, Some(Notification::HeaderClicked(2)));
+        let captured = {
+            let notice = NMITEMACTIVATE {
+                hdr: NMHDR {
+                    hwndFrom: results,
+                    code: NM_DBLCLK,
+                    ..Default::default()
+                },
+                iItem: 7,
+                ..Default::default()
+            };
+            unsafe { read_notification(&notice as *const NMITEMACTIVATE as isize, header, results) }
+        };
+        assert_eq!(captured, Some(Notification::ResultDoubleClicked(7)));
+        assert_eq!(unsafe { read_notification(0, header, results) }, None);
+    }
+
+    #[test]
+    fn list_draw_and_data_requests_keep_the_synchronous_default() {
+        use windows_sys::Win32::UI::Controls::{
+            CDRF_DODEFAULT, LVN_GETDISPINFOW, LVS_OWNERDATA, LVS_OWNERDRAWFIXED, NM_CUSTOMDRAW,
+        };
+        assert_eq!(CDRF_DODEFAULT, 0);
+        assert_eq!(
+            style::RESULTS_STYLE & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED),
+            0
+        );
+        let mut result_token = 0_u8;
+        let results = (&mut result_token as *mut u8).cast();
+        for code in [NM_CUSTOMDRAW, LVN_GETDISPINFOW] {
+            let notice = NMHDR {
+                hwndFrom: results,
+                code,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe {
+                    read_notification(
+                        &notice as *const NMHDR as LPARAM,
+                        std::ptr::null_mut(),
+                        results,
+                    )
+                },
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn context_menu_accepts_signed_secondary_monitor_coordinates() {
+        fn packed(x: i16, y: i16) -> LPARAM {
+            ((u32::from(y as u16) << 16) | u32::from(x as u16)) as LPARAM
+        }
+        assert_eq!(context_menu_position(packed(-1, -1)), None);
+        assert_eq!(context_menu_position(-1), None);
+        for (x, y) in [(-1200, 500), (500, -800), (-900, -400), (-1, 0), (0, -1)] {
+            assert_eq!(
+                context_menu_position(packed(x, y)),
+                Some((i32::from(x), i32::from(y)))
+            );
+        }
+        assert_eq!(
+            context_menu_position(packed(i16::MIN, i16::MAX)),
+            Some((-32768, 32767))
+        );
+    }
 
     #[test]
     fn snapshot_label_drops_the_year() {

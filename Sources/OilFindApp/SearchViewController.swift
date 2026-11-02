@@ -103,7 +103,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     var hidePanel: (() -> Void)?
     var onSettings: (() -> Void)?
-    init(snapshot: Bool, preferences: UserDefaults = .standard) {
+    init(snapshot: Bool, preferences: UserDefaults = Application.preferences) {
         self.snapshot = snapshot
         self.preferences = preferences
         super.init(nibName: nil, bundle: nil)
@@ -123,8 +123,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         filters.onChange = { [weak self] in self?.refreshAdditionalFilter(); self?.searchField.focus(); self?.startSearch() }
         filters.onSortChange = { [weak self] in
             guard let self, !self.snapshot else { return }
-            UserDefaults.standard.set(FilterBar.sortName(self.filters.options.sort), forKey: "sortKey")
-            UserDefaults.standard.set(self.filters.options.ascending, forKey: "sortAscending")
+            self.preferences.set(FilterBar.sortName(self.filters.options.sort), forKey: "sortKey")
+            self.preferences.set(self.filters.options.ascending, forKey: "sortAscending")
         }
         filters.onMenuTracking = { [weak self] tracking in
             self?.menuTracking = tracking
@@ -155,7 +155,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         languageObserver = NotificationCenter.default.addObserver(forName: L10n.changed, object: nil, queue: .main) { [weak self] _ in self?.localize() }
         setState(.indexing)
         if !snapshot {
-            filters.options = SettingsPreferences.searchOptions()
+            filters.options = SettingsPreferences.searchOptions(in: preferences)
             timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.refreshProgress() }
         }
         localize()
@@ -223,6 +223,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
            Date().timeIntervalSince(result.createdAt) <= 600 { return }
         startSearch(preserveSelection: true)
     }
+    func invalidateIndexConfiguration() {
+        // Invalidate in-flight searches and clear even during scrolling or dragging.
+        _ = generation.next()
+        results.clear()
+        quickLook.close()
+        selectionAnchor = nil
+    }
     func indexChanged() {
         refreshProgress()
         supplementaryProvider?.sourcesDidChange(searchSources)
@@ -265,7 +272,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         let sources = filters.additionalSelected ? [] : searchSources
         let store = sources.first?.store
         var options = filters.options
-        if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
+        if !snapshot { options.pinyin = preferences.bool(forKey: "pinyinEnabled") }
         let query = editingQuery(store: store), previous = results.result
         let cancelled = { [generation] in !generation.current(token) }
         let supplementary = filters.additionalSelected ? nil : supplementaryProvider?.prepareSearch(query, options: options, sources: sources, isCancelled: cancelled)

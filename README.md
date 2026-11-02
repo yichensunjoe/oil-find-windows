@@ -2,12 +2,12 @@
 
 Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立本地元数据索引，按中文、拼音或语法筛选即时查找，双击打开、定位或复制路径。
 
-- **纯离线**：无网络请求、无遥测、无账号、无在线更新。
-- **只读**：只读取文件名、路径、大小、修改时间，不读文件正文，不删除/移动/重命名文件。
+- **离线索引**：索引和查询不联网，无遥测、账号或在线更新；打开文件时由系统关联程序处理，外部程序可能联网。
+- **只读源文件**：只索引文件名、路径、大小和修改时间，不读文件正文；配置与缓存会写入本机，手动指定 `-cache` 时会替换该路径的已有普通文件。
 - **不含闭源模块**：仅使用上游公开的 MIT 代码与自研实现，不包含任何 Pro 或私有二进制。
 - **无管理员权限要求**：以当前用户身份运行（manifest `asInvoker`）。
 
-> 实现语言：**Rust**（1.92，原生 Win32，无 GC）。仓库的 `main` 分支保留同功能的 Go 实现（标签 `v0.1-go`），用于对照与回退。
+> 实现语言：**Rust**（1.92，原生 Win32，无 GC）。此前的 Go 实现保留在标签 `v0.1-go`，用于对照与回退。
 
 ## 用途
 
@@ -15,7 +15,7 @@ Windows 10/11 x64 的本机文件名搜索工具：显式选择目录后建立�
 
 ## 当前状态
 
-Rust 版已作为主线（Go 版保留在 `v0.1-go` 标签对照/回退），三平台 CI 常绿；界面交互、DPI/多显示器与 ACL 拒绝场景仍待 Windows 真机验收，详见[已知限制](#已知限制)。
+Rust 版是主线（Go 版保留在 `v0.1-go` 标签对照/回退），配置了三平台 CI；界面交互、DPI/多显示器与 ACL 拒绝场景仍待 Windows 真机验收，详见[已知限制](#已知限制)。
 
 ## 技术栈
 
@@ -34,7 +34,7 @@ Rust 版已作为主线（Go 版保留在 `v0.1-go` 标签对照/回退），三
 
 ## 安全与边界
 
-- 默认不扫描任何目录，必须手动选择并点击“开始索引”。
+- Windows 与 Rust macOS 预览默认不扫描任何目录，必须手动选择并点击“开始索引”。预览版的旧配置无法确认授权时会保留原文件，但要求重新选择范围。
 - 跳过依赖与版本库目录（`node_modules`、`.git` 等）和私人运行器目录（`.claude`、`.codex`、`.workbuddy` 等），任意层级生效。
 - `C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`$RECYCLE.BIN` 等系统目录只在磁盘根一级跳过；`D:\code\myproject\windows` 这类普通项目目录仍可搜索。
 - 拒绝 UNC、设备路径与网络映射盘；跳过符号链接与目录联接。
@@ -61,6 +61,12 @@ bash scripts/package-mac.sh   # 产出 build/Oil Find Rust.app 与 outputs/OilFi
 
 产物在 `outputs/windows-amd64/`：`OilFind.exe`、`oilfind-cli.exe`、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`USAGE.txt`。
 
+### macOS Swift 基线
+
+`./scripts/build-app.sh` 仅构建 `build/Oil Find Intranet.app`，`./scripts/package.sh` 将其归档到 `build/Oil-Find-Intranet-<版本>.zip`。副本使用独立的 Bundle ID、偏好、数据目录和默认快捷键 `⌃⌥⇧F`，不迁移或清理原版数据。首次默认关闭外置卷索引，可先设置排除项再手动开启。安装和启动需单独授权并验收；安装脚本拒绝覆盖已有目标，暂不支持原地更新，卸载只移除已验证的隔离应用并保留数据和偏好。
+
+Swift 基线保留上游 AI 话题功能，来源可能按本机安装情况默认启用并读取本机对话；这不同于 Windows 客户端的纯元数据边界，详见 `docs/AI_TOPICS.md`。
+
 ## 常用命令
 
 ```sh
@@ -75,8 +81,8 @@ CI 同时覆盖三个平台（`.github/workflows/ci.yml`）：
 
 | 任务 | 运行器 | 内容 |
 |---|---|---|
-| lint-and-test | ubuntu-latest | `cargo fmt --check`、`clippy -D warnings`、`cargo test --workspace` |
-| windows | windows-latest | 打包 `OilFind.exe`、PE/内嵌 manifest 校验、上传未签名产物 |
+| lint-and-test | ubuntu-latest | `cargo fmt --check`、`clippy -D warnings`、`cargo test --workspace`、PE 与构建脚本回归 |
+| windows | windows-latest | 打包 `OilFind.exe`、PE/内嵌 manifest 校验、PowerShell 打包回归、上传未签名产物 |
 | macos | macos-latest | 构建并打包 `Oil Find Rust.app`、上传未签名预览包 |
 
 `Sources/` 里的 Swift macOS 基线不在 CI 中运行，仍由本机验收。
@@ -95,9 +101,10 @@ CI 同时覆盖三个平台（`.github/workflows/ci.yml`）：
 
 ## 配置
 
-- 索引范围、排除规则与显示偏好都存在本机 `%LOCALAPPDATA%\OilFind`，不入库、不上传。
-- 默认不扫描任何目录；必须手动添加范围并点“开始索引”，删除范围只改配置。
-- 无环境变量、无账号、无网络依赖；manifest 为 `asInvoker`，不请求管理员权限。
+- Windows 的索引范围和缓存默认保存在 `%LOCALAPPDATA%\OilFind`；排除目录由程序内置，列表排序不跨启动保存。
+- 删除范围不删除用户文件；同步暂停，旧结果清空，剩余范围需要重新点击“开始索引”。
+- CLI 的 `-cache` 可指定本机缓存文件，不接受网络路径、设备路径或链接；它会替换目标路径已有的普通文件，请勿指定个人文档。
+- 无需额外配置环境变量或账号；manifest 为 `asInvoker`，不请求管理员权限。
 
 ## 上游来源与许可
 
@@ -112,3 +119,5 @@ Windows 客户端基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 
 - 结果最多显示 2000 条。
 - 可执行文件未签名，Windows SmartScreen 或安全软件可能提示未知发布者。
 - 界面交互、DPI/多显示器、ACL 拒绝等仍需在 Windows 真机验收。
+- 路径逐级检查与随后打开/遍历之间仍有竞态，不应将其视为针对恶意本地进程的无竞态沙箱。
+- Swift 隔离副本的实际安装和 GUI 尚未验收；旧的在线更新收据启动测试已停用。

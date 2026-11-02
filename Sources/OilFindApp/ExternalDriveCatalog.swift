@@ -8,11 +8,19 @@ struct ExternalDriveRecord: Codable, Equatable, Identifiable {
     var path: String
     var lastConnected: Date
     var enabled = true
+    // Earlier mount names are kept with the UUID, not written into the user's exclusions.
+    var previousPaths: [String]? = nil
+}
+
+struct ExternalExclusionBinding: Codable, Equatable {
+    var id: String
+    var root: String
 }
 
 struct ExternalDrivePreferences: Codable {
-    var enabled = true
+    var enabled = false
     var drives: [ExternalDriveRecord] = []
+    var exclusionBindings: [String: ExternalExclusionBinding]? = nil
 }
 
 /// Only validated UUIDs are used as file names; the catalog survives volume renames.
@@ -52,12 +60,13 @@ protocol ExternalDriveIndex: AnyObject {
     var onIndexChange: (() -> Void)? { get set }
     func start()
     func stop()
+    func updateConfig(_ config: IndexConfig)
 }
 extension IndexManager: ExternalDriveIndex { }
 
 final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading {
     struct Row: Identifiable {
-        enum Status { case connected, indexing, offline, disabled }
+        enum Status { case connected, indexing, offline, disabled, exclusionReview }
         var record: ExternalDriveRecord
         var status: Status
         var count: Int
@@ -77,7 +86,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         var device: String
         var online: Bool
     }
-    @Published private(set) var enabled = true
+    @Published private(set) var enabled = false
     @Published private(set) var ready = false
     @Published private(set) var rows: [Row] = []
     private var discovered = false
@@ -96,6 +105,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
     private var lastKnownDrives: [ExternalDriveInfo] = []
     private let monitor: ExternalDriveMonitoring
     private let discover: () -> [ExternalVolume]
+    private let settingsDefaults: UserDefaults
     private let makeIndex: (IndexConfig, URL, String) -> ExternalDriveIndex
     private var started = false, stopped = false, monitoring = false, discovering = false, discoveryPending = false
     private var discoveryGeneration = 0
@@ -106,13 +116,15 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
     var allowDiskImages = false
     #endif
 
-    init(directory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Oil Find/external-drives", isDirectory: true),
+    init(directory: URL = Application.supportDirectory.appendingPathComponent("external-drives", isDirectory: true),
          monitor: ExternalDriveMonitoring = ExternalVolumeMonitor(),
          initialPreferences: ExternalDrivePreferences? = nil,
          discover: @escaping () -> [ExternalVolume] = ExternalVolumeMonitor.mounted,
-         makeIndex: @escaping (IndexConfig, URL, String) -> ExternalDriveIndex = { IndexManager(config: $0, dbURL: $1, volumeUUID: $2) }) {
+         settingsDefaults: UserDefaults = Application.preferences,
+         makeIndex: ((IndexConfig, URL, String) -> ExternalDriveIndex)? = nil) {
         persistence = ExternalDrivePersistence(directory: directory)
-        self.monitor = monitor; self.discover = discover; self.makeIndex = makeIndex
+        self.monitor = monitor; self.discover = discover; self.settingsDefaults = settingsDefaults
+        self.makeIndex = makeIndex ?? { IndexManager(config: $0, dbURL: $1, volumeUUID: $2, settingsDefaults: settingsDefaults) }
         if let initialPreferences {
             preferences = initialPreferences; enabled = initialPreferences.enabled; ready = true
         }
@@ -126,6 +138,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
     var changes: AnyPublisher<Void, Never> { catalogChanges.eraseToAnyPublisher() }
     var knownDrives: [ExternalDriveInfo] {
         guard usable, discovered else { return [] }
+        let blocked = exclusionReviewRequired
         return preferences.drives.map { record in
             let volume = volumes[record.id]
             let connected = withSessions {
@@ -134,7 +147,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
                 } ?? false)
             }
             return ExternalDriveInfo(id: record.id, name: record.name, path: record.path,
-                                     enabled: record.enabled, isConnected: connected, catalogURL: persistence.indexURL(record.id))
+                                     enabled: record.enabled && !blocked, isConnected: connected, catalogURL: persistence.indexURL(record.id))
         }
     }
     var usable: Bool { enabled && ready && !stopped }
@@ -205,7 +218,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         // Keep the mounted volume suppressed until its next mount notification.
         removedUntilDisconnect.insert(uuid)
         volumes.removeValue(forKey: uuid)
-        persist(); publish()
+        persist(); reconcile()
     }
     func confirmRemove(_ row: Row, window: NSWindow?) {
         guard usable, let window else { return }
@@ -259,6 +272,13 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         }
         for (uuid, volume) in volumes {
             if let i = preferences.drives.firstIndex(where: { $0.id == uuid }) {
+                let oldPath = preferences.drives[i].path
+                if oldPath != volume.path, let old = ExcludedFolders.normalized(oldPath), old != "/" {
+                    var paths = preferences.drives[i].previousPaths ?? []
+                    if !paths.contains(old) { paths.append(old) }
+                    if let current = ExcludedFolders.normalized(volume.path) { paths.removeAll { $0 == current } }
+                    preferences.drives[i].previousPaths = paths.isEmpty ? nil : paths
+                }
                 preferences.drives[i].name = volume.name; preferences.drives[i].path = volume.path
                 if previous[uuid] == nil || previous[uuid]?.path != volume.path { preferences.drives[i].lastConnected = now }
             } else {
@@ -267,27 +287,116 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         }
         persist(); reconcile()
     }
-    private func config(path: String) -> IndexConfig {
-        let standard = IndexConfig.standard()
-        return IndexConfig(rootPath: path, excludedNames: standard.excludedNames)
+    private var userExcludedPaths: [String] {
+        ExcludedFolders.adding(settingsDefaults.stringArray(forKey: "userExcludedPaths") ?? [], to: [])
+    }
+    private func bindings(for path: String) -> [(id: String, root: String)] {
+        if let binding = preferences.exclusionBindings?[path] {
+            guard let record = preferences.drives.first(where: { $0.id == binding.id.uppercased() }),
+                  let root = ExcludedFolders.normalized(binding.root), root != "/", root != "/Volumes",
+                  ExcludedFolders.contains(root, path: path),
+                  ([record.path] + (record.previousPaths ?? [])).contains(where: { ExcludedFolders.normalized($0) == root }) else { return [] }
+            return [(record.id, root)]
+        }
+        var result: [(id: String, root: String)] = []
+        for record in preferences.drives {
+            var seen = Set<String>()
+            for value in [record.path] + (record.previousPaths ?? []) {
+                guard let root = ExcludedFolders.normalized(value), root != "/", root != "/Volumes", seen.insert(root).inserted,
+                      ExcludedFolders.contains(root, path: path) else { continue }
+                result.append((record.id, root))
+            }
+        }
+        return result
+    }
+    var exclusionReviewRequired: Bool {
+        userExcludedPaths.contains { path in
+            let externalPath = path != "/Volumes" && ExcludedFolders.contains("/Volumes", path: path)
+            return (externalPath || preferences.exclusionBindings?[path] != nil) && bindings(for: path).count != 1
+        }
+    }
+    private func mappedExclusions(for record: ExternalDriveRecord, roots: [String]) -> [String] {
+        let originals = userExcludedPaths
+        var exclusions = originals
+        for original in originals {
+            let matches = bindings(for: original)
+            guard matches.count == 1, matches[0].id == record.id else { continue }
+            for value in roots {
+                guard let root = ExcludedFolders.normalized(value), root != "/", root != "/Volumes",
+                      root != matches[0].root else { continue }
+                exclusions.append(root + original.dropFirst(matches[0].root.count))
+            }
+        }
+        return ExcludedFolders.adding(exclusions, to: [])
+    }
+    private func config(for record: ExternalDriveRecord) -> IndexConfig {
+        var config = SettingsPreferences.indexConfig(limited: false, in: settingsDefaults)
+        let path = ExcludedFolders.normalized(record.path) ?? record.path
+        config.rootPath = path
+        // The startup-volume exclusion of /Volumes must not exclude this volume itself.
+        config.excludedPaths.removeAll { ExcludedFolders.contains($0, path: path) }
+        config.userExcludedPaths = mappedExclusions(for: record, roots: [path])
+        return config
+    }
+    func filteredExtensionSources(_ sources: [SearchSource]) -> [SearchSource] {
+        guard !exclusionReviewRequired else { return [] }
+        let exclusions = userExcludedPaths + preferences.drives.flatMap { mappedExclusions(for: $0, roots: [$0.path] + ($0.previousPaths ?? [])) }
+        return sources.filter { source in
+            let root = source.store.read { source.store.rootPath }
+            return !exclusions.contains { ExcludedFolders.contains(root, path: $0) || ExcludedFolders.contains($0, path: root) }
+        }
+    }
+    @discardableResult func bindSelectedExclusions(_ paths: [String]) -> Bool {
+        var saved = preferences.exclusionBindings ?? [:], changed = false
+        for value in paths {
+            guard let path = ExcludedFolders.normalized(value) else { continue }
+            let candidates: [ExternalExclusionBinding] = volumes.compactMap { entry in
+                let uuid = entry.key, volume = entry.value
+                guard let root = ExcludedFolders.normalized(volume.path), root != "/", root != "/Volumes",
+                      ExcludedFolders.contains(root, path: path),
+                      withSessions({ !unmountingVolumes.contains(uuid) && !ejectingDevices.contains(volume.device) }) else { return nil }
+                return ExternalExclusionBinding(id: uuid, root: root)
+            }
+            let depth = candidates.map { $0.root.count }.max()
+            let closest = candidates.filter { $0.root.count == depth }
+            if closest.count == 1 {
+                if saved[path] != closest[0] { saved[path] = closest[0]; changed = true }
+            } else if saved.removeValue(forKey: path) != nil { changed = true }
+        }
+        if changed { preferences.exclusionBindings = saved.isEmpty ? nil : saved; persist() }
+        return changed
+    }
+    func updateSettings() {
+        if let saved = preferences.exclusionBindings {
+            let active = Set(userExcludedPaths), retained = saved.filter { active.contains($0.key) }
+            if retained.count != saved.count { preferences.exclusionBindings = retained.isEmpty ? nil : retained; persist() }
+        }
+        if !exclusionReviewRequired {
+            let current = withSessions { sessions.map { ($0.key, $0.value.index) } }
+            for (id, index) in current {
+                if let record = preferences.drives.first(where: { $0.id == id }) { index.updateConfig(config(for: record)) }
+            }
+        }
+        reconcile()
     }
     private func reconcile() {
         #if DEBUG
         if snapshot { publish(); return }
         #endif
+        let blocked = exclusionReviewRequired
         for record in preferences.drives {
             let volume = volumes[record.id]
             let suppressed = withSessions { unmountingVolumes.contains(record.id) || (volume.map { ejectingDevices.contains($0.device) } ?? false) }
             let online = volume != nil && !suppressed
             let old = withSessions { sessions[record.id] }
-            if !usable || !record.enabled || !online || old?.path != record.path {
+            if !usable || !record.enabled || !online || blocked || old?.path != record.path {
                 if let old {
                     if old.online { old.index.stop() }
                     _ = withSessions { sessions.removeValue(forKey: record.id) }
                 }
             }
-            guard usable, record.enabled, online, withSessions({ sessions[record.id] == nil }) else { continue }
-            let index = makeIndex(config(path: record.path), persistence.indexURL(record.id), record.id)
+            guard usable, record.enabled, online, !blocked, withSessions({ sessions[record.id] == nil }) else { continue }
+            let index = makeIndex(config(for: record), persistence.indexURL(record.id), record.id)
             index.onStateChange = { [weak self, weak index] _ in
                 guard let self, let index, self.withSessions({ self.sessions[record.id]?.index === index }) else { return }
                 self.publish()
@@ -329,11 +438,11 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         }
     }
     func searchSources() -> [SearchSource] {
-        guard usable else { return [] }
+        guard usable, !exclusionReviewRequired else { return [] }
         return preferences.drives.filter(\.enabled).compactMap { record in
             let session = withSessions { sessions[record.id] }
             guard session?.online == true, let store = session?.index.store, store.rootPath == record.path else { return nil }
-            let config = config(path: store.rootPath)
+            let config = config(for: record)
             return SearchSource(id: record.id, displayName: record.name, isOnline: true, store: store,
                                 explainPath: { Coverage.explain(path: $0, config: config, store: store) })
         }
@@ -352,12 +461,16 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         #if DEBUG
         if snapshot { objectWillChange.send(); notifySources(); return }
         #endif
+        let blocked = exclusionReviewRequired
         rows = preferences.drives.sorted { $0.lastConnected > $1.lastConnected }.map { record in
             let session = withSessions { sessions[record.id] }
             let store = session?.index.store
             let count = store.map { value in value.read { max(0, value.liveCount - 1) } } ?? session?.index.scannedCount ?? 0
-            let status: Row.Status = !record.enabled ? .disabled : session?.online != true ? .offline
-                : session?.index.state == .ready ? .connected : .indexing
+            let online = volumes[record.id].map { volume in
+                withSessions { !unmountingVolumes.contains(record.id) && !ejectingDevices.contains(volume.device) }
+            } ?? false
+            let status: Row.Status = !record.enabled ? .disabled : blocked && usable && online ? .exclusionReview
+                : session?.online != true ? .offline : session?.index.state == .ready ? .connected : .indexing
             return Row(record: record, status: status, count: count)
         }
         if rows.contains(where: { $0.status == .indexing }), progressTimer == nil {

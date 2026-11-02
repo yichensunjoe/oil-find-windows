@@ -69,6 +69,64 @@ pub(crate) fn validate_local_volume(path: &Path) -> Result<(), crate::Error> {
     }
 }
 
+/// Validates a cache path before performing any filesystem I/O on it.
+/// Existing links in the path are never followed; missing directories may be
+/// created later by the cache writer.
+pub(crate) fn validated_cache_path(path: &Path) -> Result<PathBuf, crate::Error> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err(crate::Error::CacheUnsupported("索引缓存路径无效"));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return Err(crate::Error::CacheUnsupported("索引缓存路径必须是本机路径"));
+    }
+    #[cfg(windows)]
+    if !windows_local_cache_path(&absolute.to_string_lossy()) {
+        return Err(crate::Error::NetworkRoot);
+    }
+    validate_local_volume(&absolute)?;
+
+    // Inspect the original components before collapsing `..`, otherwise a
+    // link before a parent traversal could be hidden by lexical cleaning.
+    let mut current = PathBuf::new();
+    let mut components = absolute.components();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        if !current.is_absolute() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if is_link_or_reparse(&metadata) => {
+                return Err(crate::Error::CacheUnsupported(
+                    "索引缓存及其父目录不能是链接或重解析点",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if components.any(|part| matches!(part, std::path::Component::ParentDir)) {
+                    return Err(crate::Error::CacheUnsupported("无法验证缓存路径中的父目录"));
+                }
+                break;
+            }
+            Err(err) => return Err(crate::Error::Io(err)),
+        }
+    }
+    Ok(clean_path(&absolute))
+}
+
+#[cfg(any(windows, test))]
+fn windows_local_cache_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
 /// Atomically replaces `dest` with `source`, both in the same directory.
 pub(crate) fn replace_file(source: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(windows)]
@@ -175,6 +233,16 @@ mod tests {
         assert!(path_under(Path::new("/data/photos"), root));
         assert!(path_under(Path::new("/data/photos/2024"), root));
         assert!(!path_under(Path::new("/data/photos-old"), root));
+    }
+
+    #[test]
+    fn windows_cache_paths_reject_network_and_device_spelling() {
+        assert!(windows_local_cache_path(r"C:\Users\example\index.bin"));
+        assert!(windows_local_cache_path("D:/cache/index.bin"));
+        assert!(!windows_local_cache_path(r"\\server\share\index.bin"));
+        assert!(!windows_local_cache_path(r"\\?\C:\cache\index.bin"));
+        assert!(!windows_local_cache_path(r"\\.\device"));
+        assert!(!windows_local_cache_path(r"C:relative.bin"));
     }
 
     #[test]

@@ -4,13 +4,12 @@
 //! 只处理本机磁盘上的真实目录，不打开索引范围之外的目标（UNC、映射盘、
 //! 设备路径、重解析点）。
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::{Component, Path, PathBuf};
 
+use chrono::{Local, TimeZone};
+#[cfg(any(windows, test))]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
-};
 
 use crate::api::wide;
 
@@ -29,22 +28,27 @@ pub fn config_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
         Some(base) => PathBuf::from(base),
         None => return memory_only("无法读取当前用户配置目录；本次仅使用内存。"),
     };
-    if local_path(&base).is_err() {
+    config_paths_for_base(&base)
+}
+
+fn config_paths_for_base(base: &Path) -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
+    if validate_drive(base).is_err() {
         return memory_only("当前用户配置目录不在可用本机磁盘；为保持离线，本次仅使用内存。");
     }
-    let resolved = match resolve(&base) {
-        Ok(path) => path,
-        Err(err) => {
-            return memory_only(&format!("无法验证当前用户配置目录；本次仅使用内存：{err}"))
-        }
-    };
-    if local_path(&resolved).is_err() {
+    if let Err(err) = validate_directory_components(base) {
+        return memory_only(&format!("无法验证当前用户配置目录；本次仅使用内存：{err}"));
+    }
+    if local_path(base).is_err() {
         return memory_only("当前用户配置目录实际位于网络位置；本次仅使用内存。");
     }
-    let app_dir = base.join("OilFind");
-    if let Err(err) = std::fs::create_dir_all(&app_dir) {
-        return memory_only(&format!("无法创建当前用户配置目录；本次仅使用内存：{err}"));
-    }
+    let app_dir = match prepare_config_directory(base) {
+        Ok(path) => path,
+        Err(err) => {
+            return memory_only(&format!(
+                "无法验证或创建应用配置目录；本次仅使用内存：{err}"
+            ))
+        }
+    };
     let app_dir = match resolve(&app_dir) {
         Ok(path) => path,
         Err(_) => return memory_only("无法验证应用配置目录；本次仅使用内存。"),
@@ -59,12 +63,51 @@ pub fn config_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
     )
 }
 
+// The parent must already exist. Never create through an unverified ancestor,
+// and inspect an existing OilFind entry without following it.
+fn prepare_config_directory(base: &Path) -> Result<PathBuf, String> {
+    validate_directory_components(base)?;
+    let app_dir = base.join("OilFind");
+    match std::fs::symlink_metadata(&app_dir) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&metadata) {
+                return Err("不支持链接或重解析点，请选择真实本机目录".to_string());
+            }
+            if !metadata.is_dir() {
+                return Err("应用配置目录不是目录".to_string());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            create_config_directory(&app_dir)?;
+            return Ok(app_dir);
+        }
+        Err(err) => return Err(format!("无法读取应用配置目录：{err}")),
+    }
+    validate_directory_components(&app_dir)?;
+    Ok(app_dir)
+}
+
+// Another process may create the directory after the existence check. Whether
+// we created it or lost that race, verify all components before reusing it.
+fn create_config_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法验证应用配置目录的父目录".to_string())?;
+    validate_directory_components(parent)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(format!("无法创建应用配置目录：{err}")),
+    }
+    validate_directory_components(path)
+}
+
 fn memory_only(notice: &str) -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
     (None, None, Some(notice.to_string()))
 }
 
-/// 只接受「盘符 + 反斜杠」开头的本机路径，并校验卷类型。
-pub fn local_path(path: &Path) -> Result<(), String> {
+// Check only the drive root before inspecting any path components.
+fn validate_drive(path: &Path) -> Result<(), String> {
     let text = path.to_string_lossy();
     let bytes = text.as_bytes();
     if text.contains('\0')
@@ -85,6 +128,13 @@ pub fn local_path(path: &Path) -> Result<(), String> {
     if drive_type == DRIVE_UNKNOWN || drive_type == DRIVE_NO_ROOT_DIR {
         return Err("所选盘符不可用，请选择可访问的本机目录".to_string());
     }
+    Ok(())
+}
+
+/// Accept only absolute local drive paths and verify the volume type.
+pub fn local_path(path: &Path) -> Result<(), String> {
+    validate_drive(path)?;
+    let text = path.to_string_lossy();
     // GetVolumePathNameW 不做长路径转换：超过 MAX_PATH 的路径会在这里失败，
     // 但上面的盘符检查已经证明卷类型，此时跳过更细的校验即可。
     if text.len() < 260 {
@@ -109,21 +159,39 @@ pub fn local_path(path: &Path) -> Result<(), String> {
 
 /// 校验并规范化一个索引根目录。
 pub fn local_directory(path: &Path) -> Result<PathBuf, String> {
-    local_path(path)?;
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|err| format!("目录路径无效：{err}"))?
-            .join(path)
-    };
-    let resolved = resolve(&absolute).map_err(|err| format!("目录不存在或无法访问：{err}"))?;
+    validate_drive(path)?;
+    validate_directory_components(path)?;
+    let resolved = resolve(path).map_err(|err| format!("目录不存在或无法访问：{err}"))?;
     local_path(&resolved)?;
     let metadata = std::fs::metadata(&resolved).map_err(|err| format!("读取目录失败：{err}"))?;
     if !metadata.is_dir() {
         return Err("请选择本机目录，而不是单个文件".to_string());
     }
     Ok(resolved)
+}
+
+// Inspect each original component before any operation that follows it. Keep
+// `..` in the sequence: resolving it first could hide a link that precedes it.
+fn validate_directory_components(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("仅支持带盘符的本机目录，不支持相对路径".to_string());
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|err| format!("目录不存在或无法访问：{err}"))?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err("不支持链接或重解析点，请选择真实本机目录".to_string());
+        }
+        if !metadata.is_dir() {
+            return Err("请选择本机目录，而不是单个文件".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// 解析符号链接/联接点，并去掉 `\\?\` 前缀，得到可直接交给 Shell 的路径。
@@ -138,12 +206,29 @@ pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// 是否为链接或重解析点（junction 在 Windows 上也按符号链接处理）。
+/// Return true for links, reparse points, and errors other than NotFound.
 pub fn is_link_or_reparse(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.file_type().is_symlink(),
-        Err(_) => false,
+        Ok(metadata) => metadata_is_link_or_reparse(&metadata),
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_type().is_symlink() || has_reparse_attribute(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn has_reparse_attribute(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// `path` 是否等于 `root` 或位于其下（Windows 路径大小写不敏感）。
@@ -206,88 +291,271 @@ pub fn format_size(size: u64) -> String {
 
 /// 把 Unix 秒格式化为本机时间。`with_seconds` 控制是否带秒。
 pub fn format_timestamp(seconds: i64, with_seconds: bool) -> String {
-    let local = seconds - i64::from(local_offset_minutes()) * 60;
-    let days = local.div_euclid(86_400);
-    let rest = local.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = rest / 3_600;
-    let minute = (rest % 3_600) / 60;
-    let second = rest % 60;
-    if with_seconds {
-        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-    } else {
-        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
-    }
-}
-
-/// 当前时区相对 UTC 的偏移分钟数（东八区为 +480）。
-///
-/// 读注册表里的 `ActiveTimeBias`，避免为此引入日期库或额外 Win32 feature；
-/// 它反映当前生效的偏移，因此对不实行夏令时的时区（含中国）始终准确。
-fn local_offset_minutes() -> i32 {
-    static OFFSET: OnceLock<i32> = OnceLock::new();
-    *OFFSET.get_or_init(|| read_active_bias().map(|bias| -bias).unwrap_or(0))
-}
-
-fn read_active_bias() -> Option<i32> {
-    const KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation";
-    let subkey = wide(KEY);
-    let name = wide("ActiveTimeBias");
-    let mut key: HKEY = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE,
-            &mut key,
-        )
+    let Some(timestamp) = Local.timestamp_opt(seconds, 0).single() else {
+        return "无效时间".to_string();
     };
-    if status != 0 || key.is_null() {
-        return None;
-    }
-    let mut value: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    let mut kind: u32 = 0;
-    let status = unsafe {
-        RegQueryValueExW(
-            key,
-            name.as_ptr(),
-            std::ptr::null(),
-            &mut kind,
-            (&mut value as *mut u32).cast::<u8>(),
-            &mut size,
-        )
+    let Some(local) = timestamp
+        .naive_utc()
+        .checked_add_offset(*timestamp.offset())
+    else {
+        return "无效时间".to_string();
     };
-    unsafe {
-        RegCloseKey(key);
-    }
-    // REG_DWORD = 4
-    if status == 0 && kind == 4 && size == 4 {
-        Some(value as i32)
+    let format = if with_seconds {
+        "%Y-%m-%d %H:%M:%S"
     } else {
-        None
-    }
-}
-
-/// Howard Hinnant 的 civil_from_days：把 Unix 天数转成公历年月日。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month as u32, day as u32)
+        "%Y-%m-%d %H:%M"
+    };
+    local.format(format).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let base = resolve(&std::env::temp_dir()).expect("temporary directory must exist");
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = base.join(format!("oilfind-win-{}-{nonce}-{id}", std::process::id()));
+            std::fs::create_dir(&path).expect("create temporary test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_directory_is_created_and_existing_directory_reused() {
+        let tmp = TestDir::new();
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let expected = base.join("OilFind");
+
+        assert_eq!(prepare_config_directory(&base).unwrap(), expected);
+        assert!(std::fs::symlink_metadata(&expected).unwrap().is_dir());
+        assert_eq!(prepare_config_directory(&base).unwrap(), expected);
+        assert!(create_config_directory(&expected).is_ok());
+    }
+
+    #[test]
+    fn concurrent_config_directory_creation_reuses_one_directory() {
+        let tmp = TestDir::new();
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        prepare_config_directory(&base)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap(), base.join("OilFind"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_directory_rejects_links_and_missing_or_invalid_parents() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        let linked_base = tmp.path().join("linked-base");
+        symlink(&target, &linked_base).unwrap();
+        for base in [
+            linked_base.clone(),
+            linked_base.join("nested"),
+            linked_base.join("..").join("target"),
+        ] {
+            let err = prepare_config_directory(&base).unwrap_err();
+            assert!(err.contains("链接或重解析点"), "{base:?}: {err}");
+        }
+        assert!(!target.join("OilFind").exists());
+        assert!(!target.join("nested").join("OilFind").exists());
+        let err = create_config_directory(&linked_base.join("nested")).unwrap_err();
+        assert!(err.contains("链接或重解析点"), "{err}");
+
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        symlink(&target, base.join("OilFind")).unwrap();
+        let err = prepare_config_directory(&base).unwrap_err();
+        assert!(err.contains("链接或重解析点"), "{err}");
+        let err = create_config_directory(&base.join("OilFind")).unwrap_err();
+        assert!(err.contains("链接或重解析点"), "{err}");
+        assert!(!target.join("OilFind").exists());
+        std::fs::remove_file(base.join("OilFind")).unwrap();
+        symlink(tmp.path().join("missing-target"), base.join("OilFind")).unwrap();
+        let err = prepare_config_directory(&base).unwrap_err();
+        assert!(err.contains("链接或重解析点"), "{err}");
+        std::fs::remove_file(base.join("OilFind")).unwrap();
+        std::fs::write(base.join("OilFind"), b"test").unwrap();
+        assert!(prepare_config_directory(&base).is_err());
+        assert!(create_config_directory(&base.join("OilFind")).is_err());
+        assert_eq!(std::fs::read(base.join("OilFind")).unwrap(), b"test");
+
+        let missing = tmp.path().join("missing");
+        assert!(prepare_config_directory(&missing).is_err());
+        assert!(!missing.exists());
+        assert!(prepare_config_directory(&base.join("OilFind").join("child")).is_err());
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let output = std::process::Command::new(cmd)
+            .args(["/D", "/V:OFF", "/C"])
+            .raw_arg(r#"mklink /J "%OILFIND_TEST_LINK%" "%OILFIND_TEST_TARGET%""#)
+            .env("OILFIND_TEST_LINK", link)
+            .env("OILFIND_TEST_TARGET", target)
+            .output()
+            .expect("create temporary junction");
+        assert!(
+            output.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_paths_reject_junctions_without_creating_through_them() {
+        for path in [
+            r"\\server\share",
+            r"\\?\C:\device",
+            r"relative\dir",
+            r"C:relative",
+        ] {
+            let (config, cache, notice) = config_paths_for_base(Path::new(path));
+            assert!(config.is_none() && cache.is_none() && notice.is_some());
+        }
+        let tmp = TestDir::new();
+        let base = tmp.path().join("base");
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let (config, cache, notice) = config_paths_for_base(&base);
+        assert!(config.is_some() && cache.is_some() && notice.is_none());
+        assert!(create_config_directory(&base.join("OilFind")).is_ok());
+
+        let linked_base = tmp.path().join("linked-base");
+        create_junction(&linked_base, &target);
+        let (config, cache, notice) = config_paths_for_base(&linked_base);
+        assert!(config.is_none() && cache.is_none() && notice.is_some());
+        assert!(!target.join("OilFind").exists());
+
+        let other_base = tmp.path().join("other-base");
+        std::fs::create_dir(&other_base).unwrap();
+        create_junction(&other_base.join("OilFind"), &target);
+        let (config, cache, notice) = config_paths_for_base(&other_base);
+        assert!(config.is_none() && cache.is_none() && notice.is_some());
+        assert!(create_config_directory(&other_base.join("OilFind")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_detection_distinguishes_missing_from_other_metadata_errors() {
+        let tmp = TestDir::new();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"test").unwrap();
+
+        assert!(!is_link_or_reparse(&file));
+        assert!(!is_link_or_reparse(&tmp.path().join("missing")));
+        assert!(is_link_or_reparse(&file.join("child")));
+    }
+
+    #[test]
+    fn reparse_attribute_is_detected_independently_of_symlink_type() {
+        assert!(!has_reparse_attribute(0));
+        assert!(!has_reparse_attribute(0x10));
+        assert!(has_reparse_attribute(FILE_ATTRIBUTE_REPARSE_POINT));
+        assert!(has_reparse_attribute(FILE_ATTRIBUTE_REPARSE_POINT | 0x10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_validation_rejects_links_before_following_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let target = tmp.path().join("target");
+        let child = target.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+        let dangling = tmp.path().join("dangling");
+        symlink(tmp.path().join("missing-target"), &dangling).unwrap();
+
+        assert!(!is_link_or_reparse(&target));
+        assert!(is_link_or_reparse(&link));
+        assert!(is_link_or_reparse(&dangling));
+        assert!(validate_directory_components(&child).is_ok());
+        assert!(validate_directory_components(&child.join("..").join("child")).is_ok());
+        for path in [
+            link.clone(),
+            link.join("child"),
+            link.join("missing"),
+            link.join("..").join("target"),
+            dangling,
+        ] {
+            let err = validate_directory_components(&path).unwrap_err();
+            assert!(err.contains("链接或重解析点"), "{path:?}: {err}");
+        }
+
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"test").unwrap();
+        let err = validate_directory_components(&file.join("child")).unwrap_err();
+        assert!(err.contains("单个文件"), "{err}");
+        let err = validate_directory_components(&tmp.path().join("missing")).unwrap_err();
+        assert!(err.contains("目录不存在或无法访问"), "{err}");
+        assert!(validate_directory_components(Path::new("relative")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_directory_rejects_junction_on_any_component() {
+        let tmp = TestDir::new();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("child")).unwrap();
+        assert_eq!(local_directory(&target).unwrap(), resolve(&target).unwrap());
+
+        let junction = tmp.path().join("junction");
+        create_junction(&junction, &target);
+        assert!(is_link_or_reparse(&junction));
+        for path in [
+            junction.clone(),
+            junction.join("child"),
+            junction.join("missing"),
+            junction.join("..").join("target"),
+        ] {
+            let err = local_directory(&path).unwrap_err();
+            assert!(err.contains("链接或重解析点"), "{path:?}: {err}");
+        }
+    }
 
     #[test]
     fn formats_sizes_like_the_go_client() {
@@ -299,9 +567,77 @@ mod tests {
     }
 
     #[test]
-    fn converts_unix_days_to_civil_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+    fn out_of_range_timestamps_do_not_panic() {
+        assert_eq!(format_timestamp(i64::MIN, false), "无效时间");
+        assert_eq!(format_timestamp(i64::MAX, true), "无效时间");
+    }
+
+    // A child process sets TZ before chrono initializes; other tests never
+    // share a mutated process-wide environment or timezone cache.
+    #[cfg(unix)]
+    #[test]
+    fn formats_local_time_with_historical_timezone_rules() {
+        use chrono::{TimeZone, Utc};
+
+        const CASE_ENV: &str = "OILFIND_PLATFORM_TIME_TEST";
+        let utc = |year, month, day, hour, minute, second| {
+            Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+                .single()
+                .unwrap()
+                .timestamp()
+        };
+        match std::env::var(CASE_ENV).as_deref() {
+            Ok("Asia/Shanghai") => {
+                assert_eq!(format_timestamp(0, true), "1970-01-01 08:00:00");
+                assert_eq!(format_timestamp(-1, true), "1970-01-01 07:59:59");
+                assert_eq!(
+                    format_timestamp(chrono::DateTime::<Utc>::MAX_UTC.timestamp(), true),
+                    "无效时间"
+                );
+                assert_eq!(
+                    format_timestamp(utc(2024, 1, 1, 17, 30, 41), false),
+                    "2024-01-02 01:30"
+                );
+                assert_eq!(
+                    format_timestamp(utc(1991, 6, 1, 0, 0, 0), true),
+                    "1991-06-01 09:00:00"
+                );
+            }
+            Ok("America/New_York") => {
+                for (time, expected) in [
+                    (utc(2024, 3, 10, 6, 59, 59), "2024-03-10 01:59:59"),
+                    (utc(2024, 3, 10, 7, 0, 0), "2024-03-10 03:00:00"),
+                    (utc(2024, 11, 3, 5, 59, 59), "2024-11-03 01:59:59"),
+                    (utc(2024, 11, 3, 6, 0, 0), "2024-11-03 01:00:00"),
+                    (utc(2006, 3, 20, 12, 0, 0), "2006-03-20 07:00:00"),
+                    (utc(2007, 3, 20, 12, 0, 0), "2007-03-20 08:00:00"),
+                ] {
+                    assert_eq!(format_timestamp(time, true), expected);
+                }
+            }
+            _ => {
+                for zone in ["Asia/Shanghai", "America/New_York"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "platform::tests::formats_local_time_with_historical_timezone_rules",
+                            "--nocapture",
+                        ])
+                        .env("TZ", zone)
+                        .env(CASE_ENV, zone)
+                        .output()
+                        .expect("run timezone test in a child process");
+                    assert!(
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout)
+                                .contains("1 passed; 0 failed"),
+                        "timezone {zone}:\n{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
     }
 
     // 需要真实 Win32 卷查询，只能在 Windows 上运行。

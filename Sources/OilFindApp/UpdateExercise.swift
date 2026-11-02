@@ -8,6 +8,9 @@ enum UpdateExercise {
         arguments.contains("--update-e2e") || arguments.contains("--update-e2e-restarted")
     }
     static func start(_ arguments: [String]) throws {
+#if OILFIND_OFFLINE_BUILD
+        throw SnapshotError.failed("Online update exercises are disabled in offline builds")
+#else
         func value(_ flag: String) throws -> String {
             guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { throw UpdateFailure.other }
             return arguments[index + 1]
@@ -56,7 +59,9 @@ enum UpdateExercise {
             archive = nil
             app.terminate(nil)
         }
+#endif
     }
+#if !OILFIND_OFFLINE_BUILD
     private static func write(_ output: URL, phase: String, failure: UpdateFailure? = nil) throws {
         var record: [String: Any] = ["phase": phase, "version": UpdateManager.current.version.text, "build": UpdateManager.current.build,
                                    "pid": ProcessInfo.processInfo.processIdentifier]
@@ -64,5 +69,6 @@ enum UpdateExercise {
         record["signatureValid"] = (try? SystemUpdateSignature().validate(Bundle.main.bundleURL)) != nil
         try JSONSerialization.data(withJSONObject: record, options: [.prettyPrinted, .sortedKeys]).write(to: output, options: .atomic)
     }
+#endif
 }
 #endif

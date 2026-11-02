@@ -40,6 +40,7 @@ final class SettingsModel: ObservableObject {
     var additionalSources: (() -> [SearchSource])?
     private var inspectionGeneration = 0
     var onConfigChange: (() -> Void)?
+    var onExcludedFoldersSelected: (([String]) -> Bool)?
     var onPinyinChange: (() -> Void)?
     var suspendHotKey: (() -> Void)?
     var registerHotKey: ((UInt32, UInt32) -> Bool)?
@@ -48,7 +49,7 @@ final class SettingsModel: ObservableObject {
     private var keyMonitor: Any?
     private var timer: Timer?
 
-    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard, preferences: UserDefaults = .standard, topics: AITopicManager? = nil) {
+    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = Application.preferences, preferences: UserDefaults = Application.preferences, topics: AITopicManager? = nil) {
         self.topics = topics ?? AITopicManager(defaults: preferences)
         self.snapshot = snapshot
         self.preferences = preferences
@@ -56,8 +57,8 @@ final class SettingsModel: ObservableObject {
         self.language = L10n.language
         self.update = snapshot ? UpdateManager(snapshot: true) : .shared
         launchAtLogin = snapshot ? false : SMAppService.mainApp.status == .enabled
-        if !snapshot { SettingsPreferences.register() }
-        let defaults = UserDefaults.standard
+        if !snapshot { SettingsPreferences.register(in: preferences) }
+        let defaults = preferences
         indexDependencyDirs = !snapshot && defaults.bool(forKey: "indexDependencyDirs")
         indexPackageContents = !snapshot && defaults.bool(forKey: "indexPackageContents")
         indexUserLibrary = !snapshot && defaults.bool(forKey: "indexUserLibrary")
@@ -155,7 +156,7 @@ final class SettingsModel: ObservableObject {
         excludedExtensionsText = SettingsPreferences.setExcludedExtensions(excludedExtensionsText, in: preferences)
     }
     func setPinyin(_ enabled: Bool) {
-        pinyinEnabled = enabled; UserDefaults.standard.set(enabled, forKey: "pinyinEnabled")
+        pinyinEnabled = enabled; preferences.set(enabled, forKey: "pinyinEnabled")
         onPinyinChange?()
     }
     func setLanguage(_ value: AppLanguage) { L10n.setLanguage(value, in: languageDefaults) }
@@ -167,7 +168,7 @@ final class SettingsModel: ObservableObject {
         case "indexSystemDirs": indexSystemDirs = enabled
         default: preconditionFailure("Unknown scope key")
         }
-        UserDefaults.standard.set(enabled, forKey: key)
+        preferences.set(enabled, forKey: key)
         onConfigChange?(); refresh()
     }
     func addFolders(in window: NSWindow?) {
@@ -176,13 +177,17 @@ final class SettingsModel: ObservableObject {
         panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = true
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .OK else { return }
-            self.setExcluded(ExcludedFolders.adding(panel.urls.map(\.path), to: self.excludedPaths))
+            let selected = panel.urls.map(\.path)
+            let bindingChanged = self.onExcludedFoldersSelected?(selected) ?? false
+            let paths = ExcludedFolders.adding(selected, to: self.excludedPaths)
+            if paths != self.excludedPaths { self.setExcluded(paths) }
+            else if bindingChanged { self.onConfigChange?(); self.onContentChange?() }
         }
     }
     func removeFolder(_ path: String) { setExcluded(excludedPaths.filter { $0 != path }) }
     private func setExcluded(_ paths: [String]) {
         guard paths != excludedPaths else { return }
-        excludedPaths = paths; UserDefaults.standard.set(paths, forKey: "userExcludedPaths")
+        excludedPaths = paths; preferences.set(paths, forKey: "userExcludedPaths")
         onConfigChange?(); onContentChange?()
     }
     func rebuild() { manager?.rescan(); rebuilding = manager != nil }
@@ -214,8 +219,8 @@ final class SettingsModel: ObservableObject {
         }
         if registerHotKey?(code, mask) == true {
             keyCode = code; modifiers = mask
-            UserDefaults.standard.set(Int(code), forKey: "hotKeyCode")
-            UserDefaults.standard.set(Int(mask), forKey: "hotKeyModifiers")
+            preferences.set(Int(code), forKey: "hotKeyCode")
+            preferences.set(Int(mask), forKey: "hotKeyModifiers")
             shortcutError = nil
         } else {
             _ = registerHotKey?(keyCode, modifiers)
@@ -491,7 +496,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.model = model
         model.externalDrives = externalDrives
         model.additionalSources = { [weak appExtension, weak externalDrives] in
-            (externalDrives?.searchSources() ?? []) + (appExtension?.searchSources() ?? [])
+            guard let externalDrives else { return [] }
+            return externalDrives.searchSources() + externalDrives.filteredExtensionSources(appExtension?.searchSources() ?? [])
         }
         let window = SettingsWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: model.contentHeight), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.settingsModel = model

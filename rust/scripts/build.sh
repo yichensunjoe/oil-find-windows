@@ -12,7 +12,11 @@ RUST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_DIR="$(cd "$RUST_DIR/.." && pwd)"
 TARGET="x86_64-pc-windows-msvc"
 OUTPUT_DIR="$PROJECT_DIR/outputs/windows-amd64"
-RELEASE_DIR="$RUST_DIR/target/$TARGET/release"
+TARGET_DIR="${CARGO_TARGET_DIR:-$RUST_DIR/target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$RUST_DIR/$TARGET_DIR" ;; esac
+RELEASE_DIR="$TARGET_DIR/$TARGET/release"
+
+cd "$RUST_DIR"
 
 for source in "$PROJECT_DIR/LICENSE" "$RUST_DIR/THIRD_PARTY_NOTICES.txt" "$RUST_DIR/USAGE.txt"; do
     if [ ! -f "$source" ]; then
@@ -33,13 +37,11 @@ if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
     exit 1
 fi
 
-cd "$RUST_DIR"
-
 # 非 Windows 上 oilfind-win 只编译 stub main（Win32 代码仍参与类型检查），
 # 因此工作区测试可以在本机跑完；真正的界面行为仍需 Windows 真机验收。
-cargo test --workspace
+cargo test --workspace --target-dir "$TARGET_DIR"
 
-if ! cargo build --release --target "$TARGET" -p oilfind-win -p oilfind-cli; then
+if ! cargo build --release --target "$TARGET" --target-dir "$TARGET_DIR" -p oilfind-win -p oilfind-cli; then
     echo "" >&2
     echo "交叉编译失败：需要 Windows 工具链。" >&2
     echo "  - 链接 x86_64-pc-windows-msvc 需要 MSVC 链接器（如 cargo-xwin / xwin 提供的 lld-link）；" >&2

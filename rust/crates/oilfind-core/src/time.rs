@@ -4,7 +4,7 @@
 //! user's today, not UTC's. The cache timestamp stays RFC 3339 so the file is
 //! still readable by the earlier implementation.
 
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Duration, Local, Months, NaiveDate, TimeZone};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SECS_PER_DAY: i64 = 86_400;
@@ -34,6 +34,18 @@ pub(crate) fn local_month_start(secs: i64) -> i64 {
     local_midnight_of(first).unwrap_or(fallback)
 }
 
+/// First instant of a local calendar day relative to the day containing `secs`.
+pub(crate) fn offset_local_day(secs: i64, days: i64) -> Option<i64> {
+    let date = local_date(secs)?.checked_add_signed(Duration::days(days))?;
+    local_midnight_of(date)
+}
+
+/// First instant of the local calendar month after the one containing `secs`.
+pub(crate) fn next_local_month_start(secs: i64) -> Option<i64> {
+    let first = local_date(secs)?.with_day(1)?;
+    local_midnight_of(first.checked_add_months(Months::new(1))?)
+}
+
 /// Parses `YYYY-MM-DD` as the first second of that local day.
 pub(crate) fn parse_local_date(text: &str) -> Option<i64> {
     // Require the strict YYYY-MM-DD shape; chrono alone would accept "2026-1-1".
@@ -57,11 +69,16 @@ fn local_midnight(secs: i64) -> Option<i64> {
 }
 
 fn local_midnight_of(date: NaiveDate) -> Option<i64> {
-    let naive = date.and_hms_opt(0, 0, 0)?;
-    naive
-        .and_local_timezone(Local)
-        .earliest()
-        .map(|dt| dt.timestamp())
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    // Some time zones advance their clocks at midnight. In that case the
+    // first valid instant of the calendar day is later than 00:00.
+    (0..24 * 60).find_map(|minute| {
+        midnight
+            .checked_add_signed(Duration::minutes(minute))?
+            .and_local_timezone(Local)
+            .earliest()
+            .map(|dt| dt.timestamp())
+    })
 }
 
 /// Number of whole days since 1970-01-01.

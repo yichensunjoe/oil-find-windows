@@ -5,7 +5,7 @@ import os
 import OilFindCore
 
 enum AppLog {
-    static let logger = Logger(subsystem: "com.oiloil.find", category: "app")
+    static let logger = Logger(subsystem: "com.reasonix.oilfind.intranet", category: "app")
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -36,10 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var indexStateStartedAt = ProcessInfo.processInfo.systemUptime
     private var limited = false
     private var countItem: NSMenuItem?, limitedItem: NSMenuItem?, loginItem: NSMenuItem?, rescanItem: NSMenuItem?
-    static let dbURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Oil Find/index.oilfind")
-    private static let showRequest = Notification.Name("com.oiloil.find.show")
+    static let dbURL = Application.supportDirectory.appendingPathComponent("index.oilfind")
+    private static let showRequest = Notification.Name("com.reasonix.oilfind.intranet.show")
     func applicationDidFinishLaunching(_ notification: Notification) {
-        LegacyAuthorizationCleanup.run()
         DispatchQueue.global(qos: .utility).async { _ = Pinyin.shared }
         if let id = Bundle.main.bundleIdentifier, NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
             secondaryInstance = true
@@ -51,15 +50,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UpdateManager.shared.onChange = { [weak self] in self?.refreshUpdateMenu() }
         NSApp.setActivationPolicy(.accessory)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(reopenRequested(_:)), name: Self.showRequest, object: nil)
-        let defaults = UserDefaults.standard
-        let key = (defaults.object(forKey: "hotKeyCode") as? NSNumber)?.uint32Value ?? UInt32(kVK_ANSI_F)
-        let modifiers = (defaults.object(forKey: "hotKeyModifiers") as? NSNumber)?.uint32Value ?? UInt32(cmdKey | shiftKey)
+        let defaults = Application.preferences
+        let key = (defaults.object(forKey: "hotKeyCode") as? NSNumber)?.uint32Value ?? Shortcut.defaultKeyCode
+        let modifiers = (defaults.object(forKey: "hotKeyModifiers") as? NSNumber)?.uint32Value ?? Shortcut.defaultModifiers
         hotKey = HotKey(keyCode: key, modifiers: modifiers) { [weak self] in self?.handleHotKey() }
         buildMenu(keyCode: key, modifiers: modifiers)
         panel.searchController.supplementaryProvider = appExtension?.supplementarySearchProvider
         panel.searchController.additionalSearchProvider = topicSearch
         topics.start()
-        panel.searchController.additionalSources = { [weak self] in (self?.externalDrives.searchSources() ?? []) + (self?.appExtension?.searchSources() ?? []) }
+        panel.searchController.additionalSources = { [weak self] in
+            guard let self else { return [] }
+            return self.externalDrives.searchSources() + self.externalDrives.filteredExtensionSources(self.appExtension?.searchSources() ?? [])
+        }
         let sourcesChanged: () -> Void = { [weak self] in
             self?.panel.searchController.sourcesChanged()
             self?.settingsController?.model.refresh()
@@ -90,16 +92,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if let limited = indexRequest { startIndex(limited: limited) }
+#if !OILFIND_OFFLINE_BUILD
         if let failure = SystemUpdateFiles().cleanupAfterLaunch(application: Bundle.main.bundleURL, current: UpdateManager.current) {
             UpdateManager.shared.reportLaunchFailure(failure)
         }
+#endif
     }
     private func finishWelcome(source: PanelSource = .welcome) {
         guard welcomeState?.isShowing == true else { return }
         let detected = welcomeState?.permissionDetected(Permissions.hasFullDiskAccess())
         let finished = welcomeState?.finish()
         let request = detected ?? finished
-        let defaults = UserDefaults.standard
+        let defaults = Application.preferences
         defaults.set(true, forKey: "didFinishOnboarding")
         defaults.set(welcomeState?.skippedFullDiskAccess == true, forKey: "skippedFullDiskAccess")
         permissionTimer?.invalidate(); permissionTimer = nil
@@ -115,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startIndex(limited: Bool) {
         guard manager == nil else { return }
         self.limited = limited
-        let manager = IndexManager(config: SettingsPreferences.indexConfig(limited: limited), dbURL: Self.dbURL)
+        let manager = IndexManager(config: SettingsPreferences.indexConfig(limited: limited, in: Application.preferences), dbURL: Self.dbURL, settingsDefaults: Application.preferences)
         self.manager = manager; panel.searchController.manager = manager
         settingsController?.model.manager = manager
         panel.searchController.setState(.indexing)
@@ -140,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem?.button?.image = image
         statusItem?.menu = makeMenu(keyCode: keyCode, modifiers: modifiers, hotKeyAvailable: hotKey != nil)
     }
-    func makeMenu(keyCode: UInt32 = UInt32(kVK_ANSI_F), modifiers: UInt32 = UInt32(cmdKey | shiftKey), hotKeyAvailable: Bool = true) -> NSMenu {
+    func makeMenu(keyCode: UInt32 = Shortcut.defaultKeyCode, modifiers: UInt32 = Shortcut.defaultModifiers, hotKeyAvailable: Bool = true) -> NSMenu {
         let menu = NSMenu(); menu.autoenablesItems = false; menu.delegate = self
         statusMenu = menu
         localizedMenuItems.removeAll()
@@ -200,9 +204,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let model = SettingsModel(topics: topics); model.manager = manager
             model.suspendHotKey = { [weak self] in self?.hotKey?.unregister(); self?.hotKey = nil }
             model.registerHotKey = { [weak self] code, mask in self?.registerHotKey(keyCode: code, modifiers: mask) ?? false }
+            model.onExcludedFoldersSelected = { [weak self] paths in self?.externalDrives.bindSelectedExclusions(paths) ?? false }
             model.onConfigChange = { [weak self] in
                 guard let self else { return }
-                self.manager?.updateConfig(SettingsPreferences.indexConfig(limited: self.limited))
+                self.panel.searchController.invalidateIndexConfiguration()
+                self.manager?.updateConfig(SettingsPreferences.indexConfig(limited: self.limited, in: Application.preferences))
+                self.externalDrives.updateSettings()
+                self.panel.searchController.startSearch()
             }
             model.onPinyinChange = { [weak self] in self?.panel.searchController.startSearch(preserveSelection: true) }
             settingsController = SettingsWindowController(model: model, appExtension: appExtension, externalDrives: externalDrives)

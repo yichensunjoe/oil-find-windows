@@ -17,6 +17,8 @@ public final class IndexManager {
     private let saveQueue = DispatchQueue(label: "com.oiloil.find.save", qos: .background)
     private let eventKey = DispatchSpecificKey<Bool>(), saveKey = DispatchSpecificKey<Bool>()
     private var currentState: State = .idle, currentStore: IndexStore?, currentScanner: Scanner?
+    // Compare the sorted exclusions used by the config fingerprint before exposing a catalog.
+    private var requestedExcludedPaths: [String], currentStoreExcludedPaths: [String]
     private var rescanning = false, active = false, generation = 0, summary: ApplySummary?
     private var scanWatcher: FSWatcher?, bufferedEvents: [String: FSChange] = [:], bufferingToken: Int?, bufferedRescan = false
     private var bufferedEventBytes = 0
@@ -42,6 +44,7 @@ public final class IndexManager {
     private var replayCount = 0, dataPrefix = false, hashMs = 0.0
     public init(config: IndexConfig, dbURL: URL, volumeUUID: String? = nil, settingsDefaults: UserDefaults? = .standard) {
         self.config = config; self.dbURL = dbURL; self.volumeUUID = volumeUUID
+        self.requestedExcludedPaths = config.userExcludedPaths.sorted(); self.currentStoreExcludedPaths = config.userExcludedPaths.sorted()
         self.settingsDefaults = settingsDefaults
         if let values = settingsDefaults?.stringArray(forKey: "excludedExtensions") { self.config.excludedExtensions = Set(values) }
         eventQueue.setSpecific(key: eventKey, value: true); saveQueue.setSpecific(key: saveKey, value: true)
@@ -60,7 +63,7 @@ public final class IndexManager {
     deinit { if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) }; timer?.cancel(); pendingNotification?.cancel(); currentScanner?.cancel() }
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     public var state: State { locked { currentState } }
-    public var store: IndexStore? { locked { currentStore } }
+    public var store: IndexStore? { locked { currentStoreExcludedPaths == requestedExcludedPaths ? currentStore : nil } }
     public var scannedCount: Int { let scanner = locked { currentScanner }; return scanner?.scannedCount ?? 0 }
     public var isRescanning: Bool { locked { rescanning } }
     public var lastSummary: ApplySummary? { locked { summary } }
@@ -142,7 +145,7 @@ public final class IndexManager {
                         if changed { loaded.version &+= 1 }
                     }
                 }
-                self.locked { self.currentStore = loaded }
+                self.locked { self.currentStore = loaded; self.currentStoreExcludedPaths = config.userExcludedPaths.sorted() }
                 self.saveQueue.sync { self.savedStore = loaded; self.savedVersion = loaded.version }
                 self.setState(.ready); self.notifyIndex(replaced: true)
             }
@@ -167,7 +170,7 @@ public final class IndexManager {
                     if self.volumeUUID != nil { s.rebase(to: config.rootPath) }
                     self.eventQueue.async {
                         guard self.valid(token) else { return }
-                        self.locked { self.currentStore = s; self.hashMs = 0 }
+                        self.locked { self.currentStore = s; self.currentStoreExcludedPaths = config.userExcludedPaths.sorted(); self.hashMs = 0 }
                         self.saveQueue.sync { self.savedStore = s; self.savedVersion = rootChanged ? UInt64.max : s.version }
                         self.setState(.ready); self.notifyIndex(replaced: true)
                         DispatchQueue.global(qos: .utility).async { _ = Pinyin.shared }
@@ -272,7 +275,7 @@ public final class IndexManager {
             self.bufferedEvents.removeAll(keepingCapacity: true); self.bufferedEventBytes = 0; self.bufferedRescan = false
             self.unresolvedLossCursor = lost ? startId : nil
             self.recoveryRescanPending = lost
-            self.locked { self.currentStore = installed; self.currentScanner = nil; self.rescanning = false; self.hashMs = ms }
+            self.locked { self.currentStore = installed; self.currentStoreExcludedPaths = config.userExcludedPaths.sorted(); self.currentScanner = nil; self.rescanning = false; self.hashMs = ms }
             if let batch {
                 let callback = self.locked { self.summary = batch; return self.batchCallback }
                 DispatchQueue.main.async { callback?(batch) }
@@ -347,7 +350,7 @@ public final class IndexManager {
             else { beginRescan(reason: "lost-events") }
             return
         }
-        guard !changes.isEmpty, let store = self.store, let updater = locked({ self.updater }) else { return }
+        guard !changes.isEmpty, let store = locked({ self.currentStore }), let updater = locked({ self.updater }) else { return }
         let result = updater.apply(changes, to: store)
         guard !updater.isCancelled else { return }
         let callback = locked { self.summary = result; return batchCallback }
@@ -368,12 +371,15 @@ public final class IndexManager {
         }
     }
     public func updateConfig(_ config: IndexConfig) {
-        eventQueue.async { [weak self] in
-            guard let self, self.fingerprint(self.config) != self.fingerprint(config) else { return }
-            self.config = config
-            if let values = self.settingsDefaults?.stringArray(forKey: "excludedExtensions") { self.config.excludedExtensions = Set(values) }
-            if self.locked({ self.offline }) { self.reloadOffline() }
-            else { self.beginRescan() }
+        locked {
+            requestedExcludedPaths = config.userExcludedPaths.sorted()
+            eventQueue.async { [weak self] in
+                guard let self, self.fingerprint(self.config) != self.fingerprint(config) else { return }
+                self.config = config
+                if let values = self.settingsDefaults?.stringArray(forKey: "excludedExtensions") { self.config.excludedExtensions = Set(values) }
+                if self.locked({ self.offline }) { self.reloadOffline() }
+                else { self.beginRescan() }
+            }
         }
     }
     private func scanLatestConfigIfNeeded() {

@@ -516,19 +516,22 @@ fn size_predicate(value: &str) -> Result<Predicate, Error> {
 }
 
 fn date_predicate(value: &str, now: i64) -> Result<Predicate, Error> {
-    const DAY: i64 = 86_400;
     let today = time::local_day_start(now);
+    let next_day = |start| time::offset_local_day(start, 1).ok_or(Error::InvalidDate);
     let (start, end) = match value {
-        "today" => (today, time::local_day_start(today + DAY)),
-        "yesterday" => (time::local_day_start(today - DAY), today),
-        "week" => (
-            time::local_day_start(today - 6 * DAY),
-            time::local_day_start(today + DAY),
+        "today" => (today, next_day(today)?),
+        "yesterday" => (
+            time::offset_local_day(today, -1).ok_or(Error::InvalidDate)?,
+            today,
         ),
-        "month" => {
-            let start = time::local_month_start(now);
-            (start, time::local_month_start(start + 32 * DAY))
-        }
+        "week" => (
+            time::offset_local_day(today, -6).ok_or(Error::InvalidDate)?,
+            next_day(today)?,
+        ),
+        "month" => (
+            time::local_month_start(now),
+            time::next_local_month_start(now).ok_or(Error::InvalidDate)?,
+        ),
         _ => {
             if let Some((low, high)) = value.split_once("..") {
                 let start = time::parse_local_date(low).ok_or(Error::InvalidDate)?;
@@ -536,10 +539,10 @@ fn date_predicate(value: &str, now: i64) -> Result<Predicate, Error> {
                 if end < start {
                     return Err(Error::InvalidDateRange);
                 }
-                (start, time::local_day_start(end + DAY))
+                (start, next_day(end).map_err(|_| Error::InvalidDateRange)?)
             } else {
                 let start = time::parse_local_date(value).ok_or(Error::InvalidDate)?;
-                (start, time::local_day_start(start + DAY))
+                (start, next_day(start)?)
             }
         }
     };
@@ -594,6 +597,80 @@ mod tests {
         let bracket: Vec<char> = "[a].txt".chars().collect();
         assert!(glob_match(&bracket, &"[a].txt".chars().collect::<Vec<_>>()));
         assert!(!glob_match(&bracket, &"a.txt".chars().collect::<Vec<_>>()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn date_predicates_follow_local_calendar_across_dst() {
+        const CHILD: &str = "OILFIND_DST_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for (case, zone) in [
+                ("fall", "America/Los_Angeles"),
+                ("midnight", "America/Sao_Paulo"),
+            ] {
+                let output =
+                    std::process::Command::new(std::env::current_exe().expect("test executable"))
+                        .args([
+                            "--exact",
+                            "search::tests::date_predicates_follow_local_calendar_across_dst",
+                        ])
+                        .env(CHILD, case)
+                        .env("TZ", zone)
+                        .output()
+                        .expect("run isolated timezone test");
+                assert!(
+                    output.status.success(),
+                    "timezone test {zone} failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+
+        use chrono::{Local, TimeZone};
+        use std::path::PathBuf;
+        if std::env::var(CHILD).as_deref() == Ok("midnight") {
+            let noon = Local
+                .with_ymd_and_hms(2018, 11, 4, 12, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp();
+            let first = time::parse_local_date("2018-11-04").expect("first valid instant");
+            let local = Local.timestamp_opt(first, 0).single().unwrap();
+            assert_eq!(local.format("%H:%M").to_string(), "01:00");
+            let entry = Entry::new(PathBuf::from("/fixture.txt"), String::new(), 0, noon, false);
+            assert!(date_predicate("2018-11-04", noon).unwrap()(&entry));
+            return;
+        }
+        let stamp = |month, day| {
+            Local
+                .with_ymd_and_hms(2026, month, day, 12, 0, 0)
+                .single()
+                .expect("local noon")
+                .timestamp()
+        };
+        let entry = |modified| {
+            Entry::new(
+                PathBuf::from("/fixture.txt"),
+                String::new(),
+                0,
+                modified,
+                false,
+            )
+        };
+
+        let fall = entry(stamp(11, 1));
+        assert!(date_predicate("2026-11-01", stamp(11, 2)).unwrap()(&fall));
+        assert!(date_predicate("2026-11-01..2026-11-01", stamp(11, 2)).unwrap()(&fall));
+        assert!(date_predicate("today", stamp(11, 1)).unwrap()(&fall));
+
+        let yesterday = date_predicate("yesterday", stamp(3, 9)).unwrap();
+        assert!(yesterday(&entry(stamp(3, 8))));
+        assert!(!yesterday(&entry(stamp(3, 7))));
+        let week = date_predicate("week", stamp(3, 9)).unwrap();
+        assert!(week(&entry(stamp(3, 3))));
+        assert!(!week(&entry(stamp(3, 2))));
     }
 
     #[test]

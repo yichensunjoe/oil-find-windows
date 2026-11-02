@@ -30,6 +30,10 @@ jobs:
       - name: Test
         working-directory: rust
         run: cargo test --workspace
+      - name: Test PE verification
+        run: python3 rust/scripts/test_verify_pe.py
+      - name: Test packaging scripts
+        run: python3 rust/scripts/test_build_scripts.py
 
   windows:
     name: Windows x64 build, test and package
@@ -50,6 +54,9 @@ jobs:
       - name: Verify PE subsystem and embedded manifest
         shell: pwsh
         run: python ./rust/scripts/verify-pe.py ./outputs/windows-amd64/OilFind.exe --arch amd64
+      - name: Test packaging scripts
+        shell: pwsh
+        run: python ./rust/scripts/test_build_scripts.py
       - name: Upload unsigned preview artifacts
         uses: actions/upload-artifact@v7
         with:

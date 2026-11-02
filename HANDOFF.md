@@ -2,7 +2,17 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-10-25 16:55，分支 `main`）
+## 当前状态（2026-11-02，分支 `fix/review-remediation-20261102`）
+
+- 已修复审查中的 Windows 重入、多实例、时间、链接与配置写入问题；核心缓存、日期过滤、扫描范围和构建/PE 校验已补回归。
+- Swift 副本隔离为 `Oil Find Intranet.app`、`com.reasonix.oilfind.intranet` 和独立数据/偏好；不迁移或清理上游数据。按用户选择，外置卷首次默认关闭；安装拒绝已有目标，卸载保留数据。
+- Rust macOS 预览不自动添加或扫描范围；无法确认授权的旧配置保留原文件，需重新选择。外置卷排除按 UUID 处理重挂载，歧义时暂停并提示。
+- 本机验证：Rust 工作区 125 项、Swift 白名单及定向测试 44 项通过；fmt、Clippy、Windows 目标类型检查通过；Python 脚本测试 23 项通过、2 项跳过。
+- 已构建本地 ad-hoc 签名的 `build/Oil Find Intranet.app` 和 ZIP，并检查身份、签名与 ZIP 完整性；未安装或启动应用。
+- 未验证：Windows 真机 GUI/DPI/ACL/锁/PE 打包、PowerShell 实机脚本、真实外置卷、Swift GUI 和本轮 CI；本机缺 `llvm-rc`。路径检查与打开/遍历之间仍有竞态；旧 GUI 启动测试已停用。
+- 下一步：获授权后在隔离环境做 macOS GUI/安装验收及 Windows 真机验收；正式签名与分发另行确认。
+
+## 历史状态（2026-10-25 16:55，分支 `main`）
 
 - **rust 已合入 main**（2026-10-25，快进 8e41983..55dd481，无合并提交）：默认分支 `origin/HEAD → main` 现承载 Rust 实现；Go 版由标签 `v0.1-go`（指向 8e41983）与完整历史保留，仅作对照回退。`rust` 分支暂留且与 main 同点，确认稳定后可删。main 上 CI run 40178286284 三平台全绿。
 

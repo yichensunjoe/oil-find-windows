@@ -2314,6 +2314,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "chrono",
+ "libc",
  "pinyin",
  "rayon",
  "regex",
@@ -2337,6 +2338,7 @@ dependencies = [
 name = "oilfind-win"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "embed-resource",
  "oilfind-core",
  "serde",

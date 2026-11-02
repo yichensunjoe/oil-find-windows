@@ -12,6 +12,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod safe_config;
+#[cfg(test)]
+mod tests;
+
 const KINDS: [(&str, &str); 8] = [
     ("全部类型", ""),
     ("仅文件", "file"),
@@ -24,6 +28,7 @@ const KINDS: [(&str, &str); 8] = [
 ];
 
 const RESULT_LIMIT: usize = 2000;
+const CONFIG_VERSION: u32 = 1;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -49,6 +54,7 @@ struct App {
     query: String,
     kind: usize,
     roots: Vec<PathBuf>,
+    cache_roots: Vec<PathBuf>,
     index: Option<Arc<Index>>,
     rows: Vec<Entry>,
     total: usize,
@@ -69,10 +75,15 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         let (config_path, cache_path) = storage_paths();
+        Self::from_storage(config_path, cache_path)
+    }
+
+    fn from_storage(config_path: Option<PathBuf>, cache_path: Option<PathBuf>) -> Self {
         let mut app = App {
             query: String::new(),
             kind: 0,
             roots: Vec::new(),
+            cache_roots: Vec::new(),
             index: None,
             rows: Vec::new(),
             total: 0,
@@ -93,17 +104,6 @@ impl App {
             cache_path,
         };
         app.load_state();
-        if app.roots.is_empty() {
-            // First launch: index the user's own files like a normal desktop
-            // search tool, instead of starting empty.
-            app.roots = default_roots();
-            app.save_config();
-            if !app.roots.is_empty() {
-                app.start_scan();
-            }
-        } else if app.index.is_none() {
-            app.start_scan();
-        }
         app
     }
 
@@ -112,20 +112,42 @@ impl App {
             self.notice = "配置目录不可用：本次仅使用内存。".into();
             return;
         };
-        if let Ok(text) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<Config>(&text) {
-                self.roots = config
-                    .roots
-                    .into_iter()
-                    .filter(|root| root.is_dir())
-                    .take(MAX_ROOTS)
-                    .collect();
-            }
+        match safe_config::read(&config_path) {
+            Ok(data) => match serde_json::from_slice::<Config>(&data) {
+                Ok(config) if config.version != CONFIG_VERSION => {
+                    self.notice = "旧配置无法确认授权，请重新选择目录并点“开始索引”。".into();
+                    return;
+                }
+                Ok(config) if config.roots.len() > MAX_ROOTS => {
+                    self.notice = "目录配置超出安全上限，不会自动扫描。".into();
+                    return;
+                }
+                Ok(config) => {
+                    for root in config.roots {
+                        if let Some(root) = clean_root(&root) {
+                            insert_root(&mut self.roots, root);
+                        } else {
+                            self.notice = "已跳过不可访问或包含链接的目录，请重新选择。".into();
+                        }
+                    }
+                    self.cache_roots = config.cache_roots;
+                }
+                Err(err) => self.notice = format!("配置损坏，不会自动扫描：{err}"),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => self.notice = format!("读取配置失败，不会自动扫描：{err}"),
         }
         let Some(cache_path) = self.cache_path.clone() else {
             return;
         };
-        if !cache_path.is_file() || self.roots.is_empty() {
+        if self.roots.is_empty() {
+            return;
+        }
+        if !same_roots(&self.cache_roots, &self.roots) {
+            self.notice = "当前范围没有已授权缓存，请点“开始索引”。".into();
+            return;
+        }
+        if !cache_path.is_file() {
             return;
         }
         match Index::load(&cache_path) {
@@ -139,36 +161,50 @@ impl App {
         }
     }
 
-    fn save_config(&self) {
-        let Some(path) = self.config_path.clone() else {
+    fn save_config(&mut self) {
+        let Some(path) = self.config_path.as_ref() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let config = Config {
+            version: CONFIG_VERSION,
             roots: self.roots.clone(),
+            cache_roots: self.cache_roots.clone(),
         };
-        if let Ok(text) = serde_json::to_string_pretty(&config) {
-            let _ = std::fs::write(path, text);
+        let result = serde_json::to_vec_pretty(&config)
+            .map_err(|err| err.to_string())
+            .and_then(|data| safe_config::save(path, &data).map_err(|err| err.to_string()));
+        if let Err(err) = result {
+            self.notice = format!("保存目录配置失败：{err}");
         }
     }
 
     fn add_root(&mut self) {
-        if self.roots.len() >= MAX_ROOTS {
-            self.notice = format!("最多 {MAX_ROOTS} 个目录。");
-            return;
-        }
         let Some(folder) = rfd::FileDialog::new()
             .set_title("选择要索引的目录")
             .pick_folder()
         else {
             return;
         };
-        if self.roots.iter().any(|root| root == &folder) {
+        self.add_selected_root(folder);
+    }
+
+    fn add_selected_root(&mut self, folder: PathBuf) {
+        let Some(folder) = clean_root(&folder) else {
+            self.notice = "请选择可访问且不包含链接的本机目录。".into();
+            return;
+        };
+        let mut roots = self.roots.clone();
+        if !insert_root(&mut roots, folder) {
+            self.notice = "该目录已包含在当前范围内。".into();
             return;
         }
-        self.roots.push(folder);
+        if roots.len() > MAX_ROOTS {
+            self.notice = format!("最多 {MAX_ROOTS} 个目录。");
+            return;
+        }
+        self.roots = roots;
+        self.cache_roots.clear();
+        self.notice.clear();
         self.save_config();
         self.invalidate("已添加目录，请点“开始索引”。");
     }
@@ -178,6 +214,8 @@ impl App {
             return;
         }
         self.roots.remove(position);
+        self.cache_roots.clear();
+        self.notice.clear();
         self.save_config();
         self.invalidate("已删除目录（不会删除任何文件），请重新索引。");
     }
@@ -236,12 +274,13 @@ impl App {
                     match result {
                         Ok(index) => {
                             let count = index.entries.len();
+                            let cache_roots = index.roots.clone();
                             let saved = self
                                 .cache_path
                                 .as_ref()
                                 .map(|path| index.save_cancellable(&self.cancel, path));
                             self.index = Some(Arc::new(index));
-                            self.status = match saved {
+                            self.status = match &saved {
                                 Some(Err(err)) => {
                                     format!("索引完成：{count} 项；缓存未保存：{err}")
                                 }
@@ -249,6 +288,14 @@ impl App {
                             };
                             self.notice.clear();
                             self.run_search();
+                            if let Some(Ok(())) = saved {
+                                self.cache_roots = if same_roots(&cache_roots, &self.roots) {
+                                    cache_roots
+                                } else {
+                                    Vec::new()
+                                };
+                                self.save_config();
+                            }
                         }
                         Err(Error::Cancelled) => self.status = "已取消索引，保留原状态。".into(),
                         Err(err) => self.status = format!("索引失败：{err}"),
@@ -489,7 +536,11 @@ impl eframe::App for App {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Config {
     #[serde(default)]
+    version: u32,
+    #[serde(default)]
     roots: Vec<PathBuf>,
+    #[serde(default)]
+    cache_roots: Vec<PathBuf>,
 }
 
 /// egui ships Latin-only fonts; without this every Chinese label renders as tofu.
@@ -520,20 +571,6 @@ fn install_cjk_font(ctx: &egui::Context) {
     }
 }
 
-/// `<home>` plus `/Applications`: everything the user thinks of as "my files",
-/// without walking `/System` and `/private`.
-fn default_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        roots.push(home);
-    }
-    let applications = PathBuf::from("/Applications");
-    if applications.is_dir() {
-        roots.push(applications);
-    }
-    roots
-}
-
 fn storage_paths() -> (Option<PathBuf>, Option<PathBuf>) {
     let base = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
         home.join("Library")
@@ -549,18 +586,52 @@ fn storage_paths() -> (Option<PathBuf>, Option<PathBuf>) {
     }
 }
 
-fn same_roots(left: &[PathBuf], right: &[PathBuf]) -> bool {
-    if left.len() != right.len() {
+// Validate the original components before matching the scanner's lexical cleaning.
+fn clean_root(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let text = path.to_str()?;
+    if !path.is_absolute() || text.starts_with("//") || text.starts_with(r"\\") {
+        return None;
+    }
+    safe_config::validate_directory(path).ok()?;
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => cleaned.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            Component::Normal(part) => cleaned.push(part),
+        }
+    }
+    Some(cleaned)
+}
+
+// The core deduplicates case-insensitively, including on macOS.
+fn path_under(path: &Path, root: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase();
+    let root = root.to_string_lossy().to_lowercase();
+    #[cfg(windows)]
+    let (path, root) = (path.replace('/', "\\"), root.replace('/', "\\"));
+    let separator = std::path::MAIN_SEPARATOR;
+    let root = root.trim_end_matches(separator);
+    path.trim_end_matches(separator) == root || path.starts_with(&format!("{root}{separator}"))
+}
+
+fn insert_root(roots: &mut Vec<PathBuf>, root: PathBuf) -> bool {
+    if roots.iter().any(|existing| path_under(&root, existing)) {
         return false;
     }
-    let mut left: Vec<String> = left
-        .iter()
-        .map(|path| path.to_string_lossy().to_lowercase())
-        .collect();
-    let mut right: Vec<String> = right
-        .iter()
-        .map(|path| path.to_string_lossy().to_lowercase())
-        .collect();
+    roots.retain(|existing| !path_under(existing, &root));
+    roots.push(root);
+    true
+}
+
+fn same_roots(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
     left.sort();
     right.sort();
     left == right

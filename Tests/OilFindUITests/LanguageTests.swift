@@ -50,7 +50,7 @@ final class LanguageTests: XCTestCase {
         settle(window)
         XCTAssertEqual(model.language, .english)
         XCTAssertEqual(AppLanguage.load(from: store), .english)
-        XCTAssertEqual(window.title, "Oil Find Settings")
+        XCTAssertEqual(window.title, "Oil Find Intranet Settings")
         XCTAssertTrue(picker.itemTitles.contains("Follow System"))
         model.setLanguage(.system)
         XCTAssertEqual(AppLanguage.load(from: store), .system)
@@ -118,29 +118,11 @@ final class LanguageTests: XCTestCase {
         XCTAssertEqual(update.state, .latest)
     }
 
-    func testLegacyAuthorizationCleanupRemovesOldLocalRecords() throws {
-        let store = defaults()
-        let path = FileManager.default.temporaryDirectory.appendingPathComponent("OilFind-license-\(UUID().uuidString).json")
-        try Data("legacy".utf8).write(to: path)
-        store.set(1.0, forKey: "trialStartedAt")
-        store.set(2.0, forKey: "trialLastSeenAt")
-        store.set("https://example.com", forKey: "licenseAPI")
-        store.set("old-device", forKey: "deviceFallbackID")
-        store.set("legacy-key", forKey: "licenseKeyCache")
-        store.set(true, forKey: "pinyinEnabled")
-        store.set("en", forKey: AppLanguage.preferenceKey)
-        var deletedKeychain = false
-
-        LegacyAuthorizationCleanup.run(licenseFile: path, defaults: store) { deletedKeychain = true }
-
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
-        XCTAssertNil(store.object(forKey: "trialStartedAt"))
-        XCTAssertNil(store.object(forKey: "trialLastSeenAt"))
-        XCTAssertNil(store.object(forKey: "licenseAPI"))
-        XCTAssertNil(store.object(forKey: "deviceFallbackID"))
-        XCTAssertNil(store.object(forKey: "licenseKeyCache"))
-        XCTAssertEqual(store.object(forKey: "pinyinEnabled") as? Bool, true)
-        XCTAssertEqual(store.string(forKey: AppLanguage.preferenceKey), "en")
-        XCTAssertTrue(deletedKeychain)
+    func testForkUsesIsolatedPreferencesAndDataLocations() {
+        XCTAssertEqual(Application.preferenceDomain, "com.reasonix.oilfind.intranet")
+        XCTAssertEqual(Application.supportDirectory.lastPathComponent, "Oil Find Intranet")
+        XCTAssertEqual(Application.cacheDirectory.lastPathComponent, "Oil Find Intranet")
+        XCTAssertEqual(AppDelegate.dbURL.deletingLastPathComponent(), Application.supportDirectory)
+        XCTAssertEqual(AITopicManager.defaultURL.deletingLastPathComponent().deletingLastPathComponent(), Application.supportDirectory)
     }
 }

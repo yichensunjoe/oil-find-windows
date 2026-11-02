@@ -7,7 +7,7 @@ enum L10n {
     static let changed = Notification.Name("com.oiloil.find.languageChanged")
     private(set) static var language = AppLanguage.load()
     static var chinese: Bool { snapshotChinese ?? language.usesChinese() }
-    static func setLanguage(_ value: AppLanguage, in defaults: UserDefaults = .standard) {
+    static func setLanguage(_ value: AppLanguage, in defaults: UserDefaults = Application.preferences) {
         defaults.set(value.rawValue, forKey: AppLanguage.preferenceKey)
         guard language != value else { return }
         language = value
@@ -62,11 +62,13 @@ enum L10n {
         "action.cancel": ("取消", "Cancel"),
         "drivesTitle": ("外置磁盘", "External Drives"),
         "drivesEnabled": ("索引外置磁盘", "Index external drives"),
-        "drivesDescription": ("插上就建立索引并实时更新，可以逐个关闭。", "Drives are indexed when you plug them in and kept up to date. You can turn off any drive."),
+        "drivesDescription": ("默认关闭。设置排除文件夹后，可开启外置磁盘索引；也可以逐个关闭磁盘。", "Off by default. After setting excluded folders, enable external drive indexing; individual drives can also be turned off."),
         "driveConnected": ("已连接 · %@ 个文件", "Connected · %@ files"),
         "driveIndexing": ("正在建立索引 · %@ 个文件", "Indexing · %@ files"),
         "driveOffline": ("未连接 · 上次连接 %@", "Not connected · Last connected %@"),
         "driveDisabled": ("不索引", "Not indexed"),
+        "driveExclusionPaused": ("已暂停，等待确认排除路径", "Paused pending exclusion review"),
+        "driveExclusionReview": ("部分排除文件夹无法唯一关联到外置磁盘，外置索引已暂停。请先在当前挂载路径重新添加排除文件夹，再移除无法识别的旧路径。", "External indexing is paused because an excluded folder cannot be matched to a single drive. First add it again at the current mount path, then remove the unrecognized old path."),
         "drivesEmpty": ("还没有连接过外置磁盘。", "No external drives connected yet."),
         "driveRemoveAction": ("移除…", "Remove…"),
         "driveRemoveTitle": ("移除「%@」？", "Remove “%@”?"),
@@ -152,7 +154,7 @@ enum L10n {
         "welcome.changeHotkey": ("更改快捷键…", "Change Shortcut…"),
         "welcome.permission": ("完全磁盘访问权限", "Full Disk Access"),
         "welcome.permission.caption": ("不授权也能用，只是搜不到邮件和其他应用的数据。", "Optional. Without it, Mail and other apps' data can't be searched."),
-        "welcome.permission.waiting": ("在列表里打开 Oil Find 的开关，系统会提示重新打开应用。", "Turn on Oil Find in the list. macOS will ask to reopen the app."),
+        "welcome.permission.waiting": ("在列表里打开 Oil Find Intranet 的开关，系统会提示重新打开应用。", "Turn on Oil Find Intranet in the list. macOS will ask to reopen the app."),
         "welcome.permission.open": ("打开系统设置", "Open System Settings"),
         "welcome.permission.granted": ("已授权", "Granted"),
         "welcome.start": ("开始使用", "Get Started"),
@@ -168,11 +170,11 @@ enum L10n {
         "menu.limited": ("未获得完全磁盘访问权限…", "Full Disk Access not granted…"),
         "menu.hotkeyFailed": ("快捷键已被其他应用占用", "Shortcut is in use by another app"),
         "menu.loginItem": ("登录时启动", "Launch at Login"), "menu.settings": ("设置…", "Settings…"),
-        "menu.quit": ("退出 Oil Find", "Quit Oil Find"),
+        "menu.quit": ("退出 Oil Find Intranet", "Quit Oil Find Intranet"),
         "ctx.open": ("打开", "Open"), "ctx.reveal": ("在访达中显示", "Show in Finder"),
         "ctx.preview": ("快速查看", "Quick Look"), "ctx.copyPath": ("拷贝路径", "Copy Path"),
         "ctx.copyName": ("拷贝名称", "Copy Name"), "ctx.trash": ("移到废纸篓", "Move to Trash"),
-        "settings.title": ("Oil Find 设置", "Oil Find Settings"),
+        "settings.title": ("Oil Find Intranet 设置", "Oil Find Intranet Settings"),
         "settings.general": ("通用", "General"),
         "settings.language": ("语言", "Language"),
         "settings.language.system": ("跟随系统", "Follow System"),

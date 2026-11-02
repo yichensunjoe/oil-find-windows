@@ -84,6 +84,7 @@ impl Index {
             return Err(Error::Cancelled);
         }
         self.validate_for_save()?;
+        let path = platform::validated_cache_path(path)?;
         let (directories, index) = self.directory_table();
 
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -128,40 +129,27 @@ impl Index {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
-        platform::replace_file(&temp.path, path)?;
+        platform::validated_cache_path(&path)?;
+        platform::replace_file(&temp.path, &path)?;
         Ok(())
     }
 
     /// Reads and validates a cache written by [`Index::save`], or the legacy
     /// JSON document written by the Go implementation.
     pub fn load(path: &Path) -> Result<Index, Error> {
-        let metadata = fs::symlink_metadata(path)?;
-        if platform::is_link_or_reparse(&metadata) {
-            return Err(Error::CacheUnsupported("索引缓存不能是链接或重解析点"));
-        }
-        if !metadata.is_file() {
-            return Err(Error::CacheUnsupported("索引缓存必须是普通文件"));
-        }
-        if metadata.len() > MAX_CACHE_BYTES {
+        let path = platform::validated_cache_path(path)?;
+        let file = open_cache_file(&path)?;
+        let size = file.metadata()?.len();
+        if size > MAX_CACHE_BYTES {
             return Err(Error::CacheTooLarge);
         }
-        let file = File::open(path)?;
-        // A file that grew between the stat and the read cannot exceed the cap.
-        let mut reader =
-            BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
-        let mut magic = [0u8; MAGIC.len()];
-        match reader.read_exact(&mut magic) {
-            Ok(()) => {}
-            // Too short to be either format: let the JSON parser reject it.
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
-            Err(err) => return Err(Error::Io(err)),
+        // Keep one open handle for probing and decoding, and bound the decoder
+        // by the actual file length before it can allocate a declared string.
+        let mut reader = BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(size));
+        if reader.fill_buf()?.starts_with(&MAGIC) {
+            reader.consume(MAGIC.len());
+            return load_binary(reader, size - MAGIC.len() as u64);
         }
-        if magic == MAGIC {
-            return load_binary(reader);
-        }
-        // Legacy JSON: the magic probe consumed bytes, so reopen the file.
-        let file = File::open(path)?;
-        let reader = BufReader::with_capacity(WRITE_BUFFER_BYTES, file.take(MAX_CACHE_BYTES + 1));
         load_json(reader)
     }
 
@@ -198,6 +186,33 @@ impl Index {
         }
         Ok(())
     }
+}
+
+/// Opens the final cache component without following a link, even if it changed
+/// after the path was checked. Ancestor directories are checked separately.
+fn open_cache_file(path: &Path) -> Result<File, Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if platform::is_link_or_reparse(&metadata) {
+        return Err(Error::CacheUnsupported("索引缓存不能是链接或重解析点"));
+    }
+    if !metadata.is_file() {
+        return Err(Error::CacheUnsupported("索引缓存必须是普通文件"));
+    }
+    Ok(file)
 }
 
 /// Binary document, borrowed from the index being saved.
@@ -519,8 +534,9 @@ where
 
 /// Decodes the binary document and refuses trailing bytes, which would mean
 /// the file was written by a different layout.
-fn load_binary<R: BufRead>(mut reader: R) -> Result<Index, Error> {
+fn load_binary<R: BufRead>(mut reader: R, bytes: u64) -> Result<Index, Error> {
     let document: BinaryCache = binary_options()
+        .with_limit(bytes)
         .deserialize_from(&mut reader)
         .map_err(|err| Error::CacheCorrupt(err.to_string()))?;
     let trailing = reader.fill_buf().map_err(Error::Io)?;
@@ -844,4 +860,35 @@ fn restrict_permissions(_path: &Path) -> Result<(), Error> {
     // The cache directory is already private to the user on Windows; the file
     // inherits the ACL of its parent.
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cache_open_does_not_follow_a_final_symlink() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = Fixture(
+            std::env::temp_dir().join(format!("oilfind-open-{}-{unique}", std::process::id())),
+        );
+        fs::create_dir(&dir.0).expect("create temporary fixture");
+        let target = dir.0.join("target");
+        let link = dir.0.join("link");
+        fs::write(&target, b"fixture").expect("write fixture");
+        symlink(&target, &link).expect("create symlink");
+        assert!(open_cache_file(&target).is_ok());
+        assert!(open_cache_file(&link).is_err());
+        assert_eq!(fs::read(&target).expect("read fixture"), b"fixture");
+    }
 }

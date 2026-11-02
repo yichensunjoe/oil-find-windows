@@ -4,7 +4,7 @@ import OilFindCore
 import COilFind
 
 let args = Array(CommandLine.arguments.dropFirst())
-let dbDefault = NSHomeDirectory() + "/Library/Caches/Oil Find/cli-index.oilfind"
+let dbDefault = NSHomeDirectory() + "/Library/Caches/Oil Find Intranet/cli-index.oilfind"
 func option(_ key: String, fallback: String = "") -> String {
     guard let i = args.firstIndex(of: key), i + 1 < args.count else { return fallback }
     return args[i+1]
@@ -77,7 +77,7 @@ case "watch":
     var config = IndexConfig.standard(limited: args.contains("--limited"))
     fullScope(&config)
     config.rootPath = IndexConfig(rootPath: option("--root", fallback: "/")).rootPath
-    let manager = IndexManager(config: config, dbURL: URL(fileURLWithPath: db))
+    let manager = IndexManager(config: config, dbURL: URL(fileURLWithPath: db), settingsDefaults: nil)
     let began = CFAbsoluteTimeGetCurrent()
     manager.onStateChange = { state in
         print(String(format: "state=%@ elapsed=%.3fs", String(describing: state), CFAbsoluteTimeGetCurrent()-began))

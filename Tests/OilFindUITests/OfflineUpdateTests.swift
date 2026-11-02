@@ -3,9 +3,16 @@ import OilFindCore
 @testable import OilFindApp
 
 final class OfflineUpdateTests: XCTestCase {
-    func testOnlineUpdatesAreDisallowed() {
+    private func isolatedPreferences() throws -> UpdatePreferences {
+        let suite = "OilFindOfflineTests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return UpdatePreferences(defaults: defaults)
+    }
+
+    func testOnlineUpdatesAreDisallowed() throws {
         XCTAssertFalse(UpdateManager.onlineUpdatesAllowed)
-        let model = UpdateManager(snapshot: true)
+        let model = UpdateManager(snapshot: true, preferences: try isolatedPreferences())
         XCTAssertFalse(model.automatic)
         XCTAssertFalse(model.canCheck)
     }
@@ -22,8 +29,19 @@ final class OfflineUpdateTests: XCTestCase {
         XCTAssertTrue(preferences.automatic, "Initialization must not rewrite another installation's preferences.")
     }
 
-    func testUpdateActionsRemainIdleInReleaseAndDebug() {
-        let model = UpdateManager(snapshot: true)
+    #if DEBUG
+    func testDebugUpdateExercisesAreRejectedWithoutNetworkOrGUI() {
+        for flag in ["--update-e2e", "--update-e2e-restarted"] {
+            XCTAssertTrue(UpdateExercise.handles([flag, "/unused"]))
+            XCTAssertThrowsError(try UpdateExercise.start([flag, "/unused"])) { error in
+                XCTAssertTrue(String(describing: error).contains("disabled in offline builds"))
+            }
+        }
+    }
+    #endif
+
+    func testUpdateActionsRemainIdleInReleaseAndDebug() throws {
+        let model = UpdateManager(snapshot: true, preferences: try isolatedPreferences())
         model.start()
         model.check()
         model.install()

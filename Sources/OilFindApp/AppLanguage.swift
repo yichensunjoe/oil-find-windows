@@ -6,7 +6,7 @@ enum AppLanguage: String, CaseIterable {
     case english = "en"
 
     static let preferenceKey = "appLanguage"
-    static func load(from defaults: UserDefaults = .standard) -> AppLanguage {
+    static func load(from defaults: UserDefaults = Application.preferences) -> AppLanguage {
         defaults.string(forKey: preferenceKey).flatMap(AppLanguage.init(rawValue:)) ?? .system
     }
     func usesChinese(systemLanguages: [String] = Locale.preferredLanguages) -> Bool {
