@@ -6,7 +6,7 @@ Windows 10/11 64 位电脑上的本机文件名搜索。
 不是共享盘/NAS 搜索工具，不搜索文件正文或 AI 会话。
 
 首次使用
-1. 将 ZIP 完整解压到普通用户可写的文件夹。
+1. 把 OilFind.exe 放到普通用户可写的文件夹；交付物就是这一个文件，无需解压其他内容。
 2. 双击 OilFind.exe，无需安装任何运行时或管理员权限。
 3. 添加你允许索引的本机目录，再点击“开始索引”。默认没有选择任何扫描范围，不会自动扫描全盘。
 4. 完成后在搜索框输入文件名、中文或拼音。双击结果打开；也可定位文件夹或复制路径。
@@ -53,22 +53,18 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
 安装与签名
 预览版可执行文件未代码签名，Windows SmartScreen 或安全软件可能提示未知发布者。
 下载渠道与是否签名由分发者决定；不要为此关闭系统防护或绕过安全策略。
+单文件交付不写注册表、不装服务、不创建开始菜单项；退出后删除 exe 即可移除程序，
+%LOCALAPPDATA%\OilFind 下的配置与索引需自行清理。
 
 当前验收范围
 核心引擎测试在本地与 GitHub Actions 的 windows-latest 上执行通过，Windows 产物由 CI 构建并做 PE/manifest 校验；
 界面交互、目录选择、DPI/多显示器、权限拒绝、取消/重启仍需在真机上逐项确认。
 如程序无法启动或索引异常，请保留错误文本、Windows 版本、目录类型和截图（不要附敏感文件正文）。
 
-离线包包含
-OilFind.exe              原生桌面客户端
-oilfind-cli.exe         诊断 CLI（默认只查缓存；扫描必须显式 -scan -root）
-LICENSE                 上游 MIT 许可
-THIRD_PARTY_NOTICES.txt  第三方 crate 许可证清单
-USAGE.txt               本说明
-
-CLI 示例（仅对显式授权的目录操作）
-oilfind-cli.exe -scan -root "D:\Work" -query "ext:pdf" -limit 100
-oilfind-cli.exe -query "baogao"
+交付物
+OilFind.exe   单文件：原生桌面客户端，C 运行库静态链接，不依赖 VC++ 运行库或同目录 DLL/数据文件。
+             上游 MIT 许可与第三方 crate 声明已编入 exe；构建脚本只输出这一个文件。
+未随包分发：oilfind-cli 诊断工具（需从源码构建：cargo build --release -p oilfind-cli）。
 
 源码位置
 Windows 实现在 rust/（cargo workspace：oilfind-core / oilfind-win / oilfind-cli）；macOS 源码保留在 Sources/。

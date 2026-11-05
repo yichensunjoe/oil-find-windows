@@ -41,7 +41,7 @@ fi
 # 因此工作区测试可以在本机跑完；真正的界面行为仍需 Windows 真机验收。
 cargo test --workspace --target-dir "$TARGET_DIR"
 
-if ! cargo build --release --target "$TARGET" --target-dir "$TARGET_DIR" -p oilfind-win -p oilfind-cli; then
+if ! cargo build --release --target "$TARGET" --target-dir "$TARGET_DIR" -p oilfind-win; then
     echo "" >&2
     echo "交叉编译失败：需要 Windows 工具链。" >&2
     echo "  - 链接 x86_64-pc-windows-msvc 需要 MSVC 链接器（如 cargo-xwin / xwin 提供的 lld-link）；" >&2
@@ -50,14 +50,10 @@ if ! cargo build --release --target "$TARGET" --target-dir "$TARGET_DIR" -p oilf
     exit 1
 fi
 
+# 单文件交付：清掉上一轮遗留的 CLI、文档等文件，只保留 OilFind.exe。
+rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 cp "$RELEASE_DIR/oilfind-win.exe" "$OUTPUT_DIR/OilFind.exe"
-cp "$RELEASE_DIR/oilfind-cli.exe" "$OUTPUT_DIR/oilfind-cli.exe"
-cp "$PROJECT_DIR/LICENSE" "$OUTPUT_DIR/LICENSE"
-cp "$RUST_DIR/THIRD_PARTY_NOTICES.txt" "$OUTPUT_DIR/THIRD_PARTY_NOTICES.txt"
-cp "$RUST_DIR/USAGE.txt" "$OUTPUT_DIR/USAGE.txt"
-rm -rf "$OUTPUT_DIR/LICENSES"
-cp -R "$RUST_DIR/LICENSES" "$OUTPUT_DIR/LICENSES"
 
 PYTHON="${PYTHON_BIN:-python3}"
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
@@ -72,5 +68,5 @@ if ! "$PYTHON" "$SCRIPT_DIR/verify-pe.py" --arch amd64 "$OUTPUT_DIR/OilFind.exe"
     exit 1
 fi
 
-echo "交叉编译完成：$OUTPUT_DIR"
+echo "交叉编译完成：$OUTPUT_DIR/OilFind.exe（单文件）"
 echo "注意：该产物未经 Windows 真机验收，正式发布请使用 build.ps1 的结果。"

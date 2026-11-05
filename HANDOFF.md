@@ -2,7 +2,16 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-11-02，分支 `fix/review-remediation-20261102`）
+## 当前状态（2026-11-05，分支 `main`，未推送）
+
+- Windows 交付改为单文件：`x86_64-pc-windows-msvc` 加 `+crt-static`（`rust/.cargo/config.toml`），`build.ps1`/`build.sh` 只输出 `outputs/windows-amd64/OilFind.exe`，不再复制 CLI、LICENSE 与说明文件。
+- `verify-pe.py` 新增导入表检查：出现 `vcruntime*`/`msvcp*`/`msvcr*`/`concrt*`/`api-ms-win-crt-*`/`ucrtbase.dll` 导入即失败，防止单文件承诺退回“缺 VC++ 运行库打不开”。
+- MIT 许可与 `THIRD_PARTY_NOTICES.txt` 编入 exe（`#[used]` 静态），单文件分发仍带版权声明；`oilfind-cli` 仍可从源码构建，只是不再随包。
+- 本机验证：`test_verify_pe.py`、`test_build_scripts.py`（无 pwsh，PowerShell 用例跳过）、`cargo fmt --check`、`cargo clippy`、Windows 目标类型检查。
+- 未验证：真实 Windows 产物（本机无 MSVC 链接器/rc.exe）、未装 VC++ 运行库的干净机器启动、SmartScreen；需 Windows 或 CI 重建后验收。
+- 下一步：Windows/CI 生成单文件 exe 并做真机启动验收；如需界面可见许可，再加“关于”入口。
+
+## 历史状态（2026-11-02，分支 `fix/review-remediation-20261102`）
 
 - 已修复审查中的 Windows 重入、多实例、时间、链接与配置写入问题；核心缓存、日期过滤、扫描范围和构建/PE 校验已补回归。
 - Swift 副本隔离为 `Oil Find Intranet.app`、`com.reasonix.oilfind.intranet` 和独立数据/偏好；不迁移或清理上游数据。按用户选择，外置卷首次默认关闭；安装拒绝已有目标，卸载保留数据。

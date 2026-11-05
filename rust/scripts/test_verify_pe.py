@@ -24,9 +24,9 @@ VALID_MANIFEST = (
 )
 
 
-def synthetic_pe(manifest=VALID_MANIFEST, machine=0x8664, subsystem=2):
-    """Build just enough PE32+ headers and resources for the verifier."""
-    raw_size = max(0x400, (0x80 + len(manifest) + 0x1FF) & ~0x1FF)
+def synthetic_pe(manifest=VALID_MANIFEST, machine=0x8664, subsystem=2, imports=()):
+    """Build just enough PE32+ headers, resources and imports for the verifier."""
+    raw_size = max(0x400, (0x80 + len(manifest) + 0x400) & ~0x1FF)
     data = bytearray(0x200 + raw_size)
     pe, optional, section, resource = 0x80, 0x98, 0x188, 0x200
     data[:2] = b"MZ"
@@ -46,6 +46,20 @@ def synthetic_pe(manifest=VALID_MANIFEST, machine=0x8664, subsystem=2):
     struct.pack_into("<II", data, resource + 0x40, 1033, 0x48)
     struct.pack_into("<IIII", data, resource + 0x48, 0x1080, len(manifest), 0, 0)
     data[resource + 0x80 : resource + 0x80 + len(manifest)] = manifest
+
+    if imports:
+        # 导入表放在清单之后（同一节区），节区偏移 x 对应 RVA 0x1000 + x。
+        base = (0x80 + len(manifest) + 7) & ~7
+        table_size = (len(imports) + 1) * 20
+        cursor = base + table_size
+        for index, name in enumerate(imports):
+            # IMAGE_IMPORT_DESCRIPTOR: OriginalFirstThunk, TimeDateStamp,
+            # ForwarderChain, Name, FirstThunk（各 4 字节）。
+            struct.pack_into("<I", data, resource + base + index * 20 + 12, 0x1000 + cursor)
+            encoded = name.encode("ascii") + b"\0"
+            data[resource + cursor : resource + cursor + len(encoded)] = encoded
+            cursor += len(encoded)
+        struct.pack_into("<II", data, optional + 112 + 1 * 8, 0x1000 + base, table_size)
     return bytes(data)
 
 
@@ -89,6 +103,30 @@ class VerifyPeTests(unittest.TestCase):
                     with self.subTest(size=len(manifest), mode=mode):
                         result = run_verifier(path, "amd64", mode)
                         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_system_imports_are_accepted(self):
+        data = synthetic_pe(imports=("KERNEL32.dll", "USER32.dll", "COMCTL32.dll"))
+        with tempfile.TemporaryDirectory(prefix="oilfind-pe-") as temporary:
+            path = Path(temporary) / "fixture.exe"
+            path.write_bytes(data)
+            result = run_verifier(path, "amd64", "normal")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dynamic_c_runtime_imports_are_rejected(self):
+        for name in (
+            "VCRUNTIME140.dll",
+            "vcruntime140_1.dll",
+            "MSVCP140.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "ucrtbase.dll",
+        ):
+            with self.subTest(dll=name):
+                with tempfile.TemporaryDirectory(prefix="oilfind-pe-") as temporary:
+                    path = Path(temporary) / "fixture.exe"
+                    path.write_bytes(synthetic_pe(imports=("KERNEL32.dll", name)))
+                    result = run_verifier(path, "amd64", "normal")
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("Dynamic C runtime import", result.stderr)
 
     def test_amd64_is_rejected_when_arm64_is_requested(self):
         with tempfile.TemporaryDirectory(prefix="oilfind-pe-") as temporary:

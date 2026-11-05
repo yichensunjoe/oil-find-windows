@@ -2,6 +2,16 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
+## 2026-11-05 · 单文件交付：静态 CRT 与“目标机没装运行库”的默认假设（Oil Find for Windows）
+
+- 场景：要求像 Everything 一样“一个 exe 打开即用”；此前产物是 exe + CLI + LICENSE/说明 的文件夹。
+- 要点 1（Rust MSVC 默认动态 CRT）：`x86_64-pc-windows-msvc` 默认导入 `vcruntime140.dll`，干净 Windows 不预装 VC++ 运行库时双击直接报缺 DLL。加 `[target.x86_64-pc-windows-msvc] rustflags = ["-C", "target-feature=+crt-static"]` 后单文件才成立，代价是 exe 略大。
+- 要点 2（config 的 rustflags 会被 RUSTFLAGS 覆盖）：环境里一旦有 `RUSTFLAGS`，cargo 就忽略 `.cargo/config.toml` 的 rustflags；靠 `verify-pe.py` 检查产物导入表（禁 vcruntime/msvcp/msvcr/concrt/api-ms-win-crt-*/ucrtbase）兜底，而不是相信构建配置。
+- 要点 3（许可随二进制）：MIT 要求副本携带版权与许可；单文件交付用 `#[used] static ... = [include_str!(LICENSE), include_str!(THIRD_PARTY_NOTICES)]` 编入 exe，构建脚本不再复制文本文件。
+- 要点 4（PE 导入表解析）：导入目录是 DataDirectory[1]；描述符 20 字节（OriginalFirstThunk/TimeDateStamp/ForwarderChain/Name/FirstThunk），全零结束；按 Name RVA 走节区映射取 DLL 名。
+- 验证：`test_verify_pe.py`（新增导入用例）、`test_build_scripts.py`（断言输出目录只有一个文件）、fmt/clippy/msvc check；真实 exe 需 Windows 或 CI 重建。
+- 适用边界：任何要“单文件、免安装”的 Windows Rust 桌面程序；尤其别假设目标机一定装了 VC++ 运行库。
+
 ## 2026-10-24 · 内存第三轮与一条测量纪律（Oil Find for Windows）
 
 - 场景：第三轮把 `Entry` 的两个 `Arc<str>`（dir/lower_dir）合并为单一 `SharedDir`（原始/小写拼接在同一 `String`，一个 `Arc` 指向），条目内联 80B→72B。

@@ -8,6 +8,17 @@ import xml.etree.ElementTree as ET
 # 资源目录里的清单类型/ID：RT_MANIFEST = 24，ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID。
 RT_MANIFEST = 24
 MANIFEST_ID = 1
+# 数据目录序号：1 = 导入表，2 = 资源表。
+IMPORT_DIRECTORY = 1
+# 单文件交付要求静态 CRT：这些导入说明产物仍依赖 VC++ 运行库 / 动态 UCRT。
+DYNAMIC_RUNTIME_PREFIXES = (
+    "vcruntime",
+    "msvcp",
+    "msvcr",
+    "concrt",
+    "api-ms-win-crt-",
+)
+DYNAMIC_RUNTIME_DLLS = frozenset(("ucrtbase.dll",))
 
 
 def require(condition, message):
@@ -64,6 +75,23 @@ def verify_manifest(manifest):
     )
 
 
+def verify_static_runtime(names):
+    forbidden = sorted(
+        {
+            name
+            for name in names
+            if name.lower().startswith(DYNAMIC_RUNTIME_PREFIXES)
+            or name.lower() in DYNAMIC_RUNTIME_DLLS
+        }
+    )
+    require(
+        not forbidden,
+        "Dynamic C runtime imports: "
+        + ", ".join(forbidden)
+        + " (link with +crt-static to keep the executable single-file)",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("exe", type=pathlib.Path)
@@ -101,6 +129,23 @@ def main():
                     return offset
         raise ValueError("RVA outside file-backed sections")
 
+    def imported_names(rva, size):
+        names = []
+        for index in range(size // 20):
+            offset = raw(rva + index * 20, 20)
+            original, stamp, chain, name_rva, first = struct.unpack_from(
+                "<IIIII", data, offset
+            )
+            # 全零描述符结束导入表。
+            if not (original or stamp or chain or name_rva or first):
+                break
+            require(name_rva, "Import descriptor has no name")
+            start = raw(name_rva, 1)
+            end = data.find(b"\0", start)
+            require(end != -1 and end - start <= 260, "Import name is not terminated")
+            names.append(data[start:end].decode("ascii", "replace"))
+        return names
+
     def resource(offset, length):
         require(offset + length <= resource_size, "Resource directory is truncated")
         return raw(resource_rva + offset, length)
@@ -133,11 +178,18 @@ def main():
     manifest = data[content : content + size]
 
     verify_manifest(manifest)
+
+    import_rva, import_size = struct.unpack_from(
+        "<II", data, optional + 112 + IMPORT_DIRECTORY * 8
+    )
+    imported = imported_names(import_rva, import_size) if import_rva and import_size else []
+    verify_static_runtime(imported)
+
     print(
         "PE verified:",
         args.exe.name,
         args.arch,
-        "GUI, embedded v6/asInvoker/DPI manifest",
+        "GUI, embedded v6/asInvoker/DPI manifest, static C runtime",
     )
 
 

@@ -10,6 +10,15 @@ mod api;
 mod app;
 mod platform;
 
+// 单文件交付：MIT 许可与第三方 crate 声明必须随二进制一起分发，因此编入 exe。
+// `#[used]` 阻止链接器裁掉这两段只读数据（构建脚本不再输出独立许可文件）。
+#[used]
+#[allow(dead_code)]
+static EMBEDDED_LICENSES: [&str; 2] = [
+    include_str!("../../../../LICENSE"),
+    include_str!("../../../THIRD_PARTY_NOTICES.txt"),
+];
+
 #[cfg(windows)]
 fn main() {
     if let Err(err) = app::run() {

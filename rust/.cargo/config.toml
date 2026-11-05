@@ -1,0 +1,8 @@
+# 单文件交付：Windows 产物静态链接 C 运行库，不依赖 vcruntime140.dll /
+# VC++ 运行库，解压后双击即可在干净系统上启动。
+#
+# 注意：环境变量 RUSTFLAGS 一旦存在，cargo 会忽略这里的 rustflags，所以
+# 不能只靠本文件；`scripts/verify-pe.py` 会检查产物导入表，出现动态 CRT
+# 依赖就让构建失败，避免“看起来单文件、真机报缺 DLL”。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

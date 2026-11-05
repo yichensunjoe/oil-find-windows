@@ -296,8 +296,8 @@ class BuildScriptTests(unittest.TestCase):
                 self.run_script(["bash", str(self.scripts / "build.sh")], env)
                 release = target / WINDOWS_TARGET / "release"
                 output = self.project / "outputs" / "windows-amd64"
+                self.assertEqual(sorted(path.name for path in output.iterdir()), ["OilFind.exe"])
                 self.assertEqual((output / "OilFind.exe").read_bytes(), (release / "oilfind-win.exe").read_bytes())
-                self.assertEqual((output / "oilfind-cli.exe").read_bytes(), (release / "oilfind-cli.exe").read_bytes())
                 self.assertNotEqual((output / "OilFind.exe").read_bytes(), (stale / "oilfind-win.exe").read_bytes())
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "Windows PowerShell is unavailable")
@@ -332,12 +332,10 @@ class BuildScriptTests(unittest.TestCase):
                 )
                 used.add(self.run_powershell(env, expect_success=True))
                 gui = [p for p in target.rglob("oilfind-win.exe") if p.parent.name == "release"]
-                cli = [p for p in target.rglob("oilfind-cli.exe") if p.parent.name == "release"]
                 self.assertEqual(len(gui), 1, gui)
-                self.assertEqual(len(cli), 1, cli)
                 output = self.project / "outputs" / "windows-amd64"
+                self.assertEqual(sorted(path.name for path in output.iterdir()), ["OilFind.exe"])
                 self.assertEqual((output / "OilFind.exe").read_bytes(), gui[0].read_bytes())
-                self.assertEqual((output / "oilfind-cli.exe").read_bytes(), cli[0].read_bytes())
         self.assertEqual(len(used), 2, used)
         self.assertEqual(sentinel.read_text(), "do not delete")
         self.assertEqual(set(self.project.glob(".oilfind-build-temp-*")), {existing})

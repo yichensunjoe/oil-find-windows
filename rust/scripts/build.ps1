@@ -57,6 +57,17 @@ function Invoke-Cargo {
     }
 }
 
+# 还原进程环境变量：原值为空说明变量本来不存在，要删除而不是写入空字符串
+# （PowerShell 把 $null 绑到 [string] 参数会变成 ""）。
+function Restore-ProcessVariable {
+    param([string]$Name, [string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+    } else {
+        [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+    }
+}
+
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 $PreviousTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
@@ -75,35 +86,28 @@ try {
 
     Invoke-Cargo @("test", "--workspace", "--target-dir", $TargetDir)
     Invoke-Cargo @("build", "--release", "--target", $Target, "--target-dir", $TargetDir, "-p", "oilfind-win")
-    Invoke-Cargo @("build", "--release", "--target", $Target, "--target-dir", $TargetDir, "-p", "oilfind-cli")
 
     $GuiBinary = Join-Path $ReleaseDir "oilfind-win.exe"
-    $CliBinary = Join-Path $ReleaseDir "oilfind-cli.exe"
-    foreach ($Binary in @($GuiBinary, $CliBinary)) {
-        if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
-            throw "Build output is missing: $Binary"
-        }
+    if (-not (Test-Path -LiteralPath $GuiBinary -PathType Leaf)) {
+        throw "Build output is missing: $GuiBinary"
     }
 
+    # 单文件交付：输出目录只放 OilFind.exe，先清掉上一轮遗留的 CLI、文档等文件。
+    Get-ChildItem -LiteralPath $OutputDir -Force | Remove-Item -Recurse -Force
     Copy-Item -LiteralPath $GuiBinary -Destination (Join-Path $OutputDir "OilFind.exe") -Force
-    Copy-Item -LiteralPath $CliBinary -Destination (Join-Path $OutputDir "oilfind-cli.exe") -Force
 
     & $PythonExe (Join-Path $ScriptDir "verify-pe.py") --arch amd64 (Join-Path $OutputDir "OilFind.exe")
     if ($LASTEXITCODE -ne 0) {
-        throw "PE verification failed: the GUI binary is not an amd64 GUI executable with an embedded asInvoker/PerMonitorV2 manifest."
+        throw "PE verification failed: the GUI binary is not a single-file amd64 GUI executable with an embedded asInvoker/PerMonitorV2 manifest."
     }
 
-    Copy-Item -LiteralPath (Join-Path $ProjectDir "LICENSE") -Destination (Join-Path $OutputDir "LICENSE") -Force
-    Copy-Item -LiteralPath (Join-Path $RustDir "THIRD_PARTY_NOTICES.txt") -Destination (Join-Path $OutputDir "THIRD_PARTY_NOTICES.txt") -Force
-    Copy-Item -LiteralPath (Join-Path $RustDir "USAGE.txt") -Destination (Join-Path $OutputDir "USAGE.txt") -Force
-    Copy-Item -LiteralPath (Join-Path $RustDir "LICENSES") -Destination (Join-Path $OutputDir "LICENSES") -Recurse -Force
-
-    Write-Host "Local Windows build completed: $OutputDir"
+    Write-Host "Local Windows build completed: $OutputDir\OilFind.exe"
+    Write-Host "Single file: static C runtime; no installer, sidecar DLL, or data file."
     Write-Host "No installation, publication, or runtime dependency download was performed."
 }
 finally {
-    [Environment]::SetEnvironmentVariable("TEMP", $PreviousTemp, "Process")
-    [Environment]::SetEnvironmentVariable("TMP", $PreviousTmp, "Process")
+    Restore-ProcessVariable "TEMP" $PreviousTemp
+    Restore-ProcessVariable "TMP" $PreviousTmp
     try {
         if ($LocationPushed) {
             Pop-Location
