@@ -64,6 +64,7 @@ regex:^IMG_\d+    不区分大小写的正则；用带空格的 | 组合正则�
 交付物
 OilFind.exe   单文件：原生桌面客户端，C 运行库静态链接，不依赖 VC++ 运行库或同目录 DLL/数据文件。
              上游 MIT 许可与第三方 crate 声明已编入 exe；构建脚本只输出这一个文件。
+许可文本：运行 `OilFind.exe --license` 弹出只读说明，内含 MIT 许可与第三方声明。
 未随包分发：oilfind-cli 诊断工具（需从源码构建：cargo build --release -p oilfind-cli）。
 
 源码位置

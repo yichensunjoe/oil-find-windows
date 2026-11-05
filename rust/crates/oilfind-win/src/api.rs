@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetWindowTextLengthW, GetWindowTextW, MessageBoxW, SendMessageW,
-    SetWindowTextW, MB_ICONWARNING, MB_OK, SW_SHOWNORMAL, WM_SETFONT,
+    SetWindowTextW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, SW_SHOWNORMAL, WM_SETFONT,
 };
 
 /// 剪贴板文本格式（CF_UNICODETEXT）。
@@ -473,6 +473,22 @@ pub fn warn(owner: HWND, message: &str) {
             text_buffer.as_ptr(),
             title_buffer.as_ptr(),
             MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+/// 只读说明对话框（用于 `--license`）。
+///
+/// 单文件交付不附带独立许可文件，`--license` 是这个副本里唯一可读的许可入口。
+pub fn info(owner: HWND, message: &str) {
+    let text_buffer = wide(message);
+    let title_buffer = wide("Oil Find for Windows");
+    unsafe {
+        MessageBoxW(
+            owner,
+            text_buffer.as_ptr(),
+            title_buffer.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
         );
     }
 }

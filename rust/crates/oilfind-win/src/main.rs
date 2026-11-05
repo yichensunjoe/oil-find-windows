@@ -19,8 +19,27 @@ static EMBEDDED_LICENSES: [&str; 2] = [
     include_str!("../../../THIRD_PARTY_NOTICES.txt"),
 ];
 
+fn license_requested() -> bool {
+    std::env::args_os().any(|argument| argument.to_string_lossy() == "--license")
+}
+
+/// 许可文本必须真的被引用，否则 MSVC 链接器会把 `#[used]` 静态数据裁掉。
+/// `--license` 既满足 MIT 的可读入口，也保证两段文本留在 exe 里。
+fn licenses() -> String {
+    format!(
+        "Oil Find for Windows {}\n\n{}\n\n{}",
+        env!("CARGO_PKG_VERSION"),
+        EMBEDDED_LICENSES[0],
+        EMBEDDED_LICENSES[1]
+    )
+}
+
 #[cfg(windows)]
 fn main() {
+    if license_requested() {
+        api::info(std::ptr::null_mut(), &licenses());
+        return;
+    }
     if let Err(err) = app::run() {
         api::warn(std::ptr::null_mut(), &err);
     }
@@ -28,6 +47,10 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
+    if license_requested() {
+        println!("{}", licenses());
+        return;
+    }
     println!("Oil Find for Windows 是 Windows 原生客户端，只能在 Windows 上运行。");
     println!("请在 Windows 上构建：cargo build --release -p oilfind-win");
 }
