@@ -457,7 +457,8 @@ pub fn create_control(
         )
     };
     if hwnd.is_null() {
-        return Err(format!("创建界面控件失败（{class}）"));
+        let error = io::Error::last_os_error();
+        return Err(format!("创建界面控件失败（{class}）：{error}"));
     }
     set_font(hwnd, font);
     Ok(hwnd)

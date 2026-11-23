@@ -35,13 +35,19 @@ fn licenses() -> String {
 }
 
 #[cfg(windows)]
-fn main() {
+fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+
     if license_requested() {
         api::info(std::ptr::null_mut(), &licenses());
-        return;
+        return ExitCode::SUCCESS;
     }
-    if let Err(err) = app::run() {
-        api::warn(std::ptr::null_mut(), &err);
+    match app::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            api::warn(std::ptr::null_mut(), &err);
+            ExitCode::FAILURE
+        }
     }
 }
 

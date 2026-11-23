@@ -2,6 +2,12 @@
 
 > 最新记录置顶；本仓库独立维护，不依赖外部工作区。
 
+## 2026-11-23 · Win32 控件注册与启动错误被退出消息遮蔽
+
+- 原生控件类名优先引用 SDK 常量。`ICC_PROGRESS_CLASS` 对应 `msctls_progress32`，类名缺字会在显示主窗口之前让 `WM_CREATE` 返回失败。
+- 只在主消息循环运行时通过 `WM_DESTROY` 发送 `WM_QUIT`。窗口创建失败时的退出消息会提前结束后续错误对话框。保留原始错误并返回非零退出码。
+- 许可入口验证进程已进入自身代码。主窗口启动另走控件创建路径，可用纯状态回归和 Windows 线程消息队列回归验证错误清理，无需创建测试窗口。
+
 ## 2026-11-23 · 表头排序与 Windows EXE 替换
 
 - 结果上限应在排序之后应用。将列比较器传到搜索工作线程，沿用有界堆遍历全部命中。回归用超过 2000 条的输入覆盖四列升降序，并独立校验总命中数和查询筛选。
@@ -41,7 +47,7 @@
 - 要点 3（结构体 Default 不统一）：`LVITEMW`/`LVCOLUMNW` 有 `Default`，`HDITEMW`/`LVHITTESTINFO`/`NMHEADERW` 没有，必须逐字段构造；windows-sys 0.5x 的 FLAGS 类型都是 `u32` 别名（MENU_ITEM_FLAGS、TRACK_POPUP_MENU_FLAGS、LVHITTESTINFO_FLAGS…），常量可直接用、可直接按位或。
 - 要点 4（纯逻辑可跨平台单测）：`cargo test -p oilfind-win` 在 macOS 上能编译并运行（实测 9 项通过），排序比较器、千分位格式化这类纯函数放进 app.rs 的 tests 模块即可在开发机验证，不必等真机。
 - 要点 5（clippy 1.92 与 MSRV 冲突）：`manual_is_multiple_of` 要求 `% 3 == 0` 改 `is_multiple_of(3)`，但后者 MSRV 1.87 > 工作区声明的 1.75；倒序计数（`since_separator == 3`）可绕开且更易读，不要为过 lint 抬 MSRV。
-- 要点 6（marquee 进度条）：`ICC_PROGRESS_CLASS` 要加进 `InitCommonControlsEx`；建 `msctls_progress2` 时带 `PBS_MARQUEE`(0x08)，用 `PBM_SETMARQUEE`(WM_USER+10, wParam=开关, lParam=毫秒) 启停；平时 `ShowWindow(SW_HIDE)`，布局里固定在客户区底部细条，不扰动其他控件。
+- 要点 6（marquee 进度条）：`ICC_PROGRESS_CLASS` 要加进 `InitCommonControlsEx`；用 SDK 的 `PROGRESS_CLASSA/W`（`msctls_progress32`）创建控件并带上 `PBS_MARQUEE`(0x08)，用 `PBM_SETMARQUEE`(WM_USER+10, wParam=开关, lParam=毫秒) 启停；平时 `ShowWindow(SW_HIDE)`，布局里固定在客户区底部细条，不扰动其他控件。
 - 经验：`TrackPopupMenu` + `TPM_RETURNCMD` 同步返回菜单 ID，不用自定义消息回路；右键菜单先 `LVM_HITTEST` + `LVM_SETITEMSTATE` 选中命中项，与资源管理器行为一致。空状态提示用后创建的 STATIC 覆盖在列表上（隐藏时不吃鼠标），`WM_CTLCOLORSTATIC` 里按 `lParam==控件句柄` 只给自己改灰色文字，其余静态控件必须落到 DefWindowProc。
 - 验证：`cargo test --workspace` 76 项 + clippy `-D warnings` + fmt + msvc target check；界面交互属真机验收项。
 - 适用边界：任何用 windows-sys 写原生界面的 Rust 项目；尤其是"跨平台开发 + 目标平台才能跑"的桌面工具。

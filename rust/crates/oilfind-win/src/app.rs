@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::collections::VecDeque;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -54,6 +55,15 @@ const MAX_ROOTS: usize = 64;
 const SEARCH_DEBOUNCE_MS: u32 = 250;
 const SYNC_INTERVAL_MS: u32 = 30_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+
+fn progress_control_class() -> &'static str {
+    use windows_sys::Win32::UI::Controls::PROGRESS_CLASSA;
+
+    // SAFETY: the SDK constant points to a static NUL-terminated ASCII name.
+    unsafe { std::ffi::CStr::from_ptr(PROGRESS_CLASSA.cast()) }
+        .to_str()
+        .expect("the SDK's progress control class is ASCII")
+}
 
 // 控件 ID（与 Go 版一致）。
 const ID_SEARCH: usize = 100;
@@ -144,11 +154,22 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static PENDING: RefCell<VecDeque<Deferred>> = const { RefCell::new(VecDeque::new()) };
     static DRAINING: Cell<bool> = const { Cell::new(false) };
-    static DESTROYED: Cell<bool> = const { Cell::new(false) };
+    static WINDOW_STATE: Cell<WindowState> = const { Cell::new(WindowState::Starting) };
     static WINDOW_DPI: Cell<i32> = const { Cell::new(96) };
     static WINDOW_RESULTS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_HEADER: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_EMPTY: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowState {
+    Starting,
+    Running,
+    Stopped,
+}
+
+fn mark_window_stopped(state: &Cell<WindowState>) -> bool {
+    state.replace(WindowState::Stopped) == WindowState::Running
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,7 +249,9 @@ fn queue_deferred(message: Deferred) {
 }
 
 fn dispatch_deferred(message: Deferred) {
-    if DESTROYED.with(Cell::get) && !matches!(message, Deferred::Destroyed) {
+    if WINDOW_STATE.with(Cell::get) == WindowState::Stopped
+        && !matches!(message, Deferred::Destroyed)
+    {
         return;
     }
     match APP.with(|slot| try_with_state(slot, |app| app.apply(message))) {
@@ -443,9 +466,10 @@ pub fn run() -> Result<(), String> {
         }
     };
     WINDOW_DPI.with(|dpi| dpi.set(app.dpi));
-    DESTROYED.with(|destroyed| destroyed.set(false));
+    WINDOW_STATE.with(|state| state.set(WindowState::Starting));
     APP.with(|slot| *slot.borrow_mut() = Some(app));
     let outcome = run_window(instance);
+    WINDOW_STATE.with(|state| state.set(WindowState::Stopped));
     let app = APP.with(|slot| slot.borrow_mut().take());
     PENDING.with(|pending| pending.borrow_mut().clear());
     WINDOW_RESULTS.with(|handle| handle.set(std::ptr::null_mut()));
@@ -484,7 +508,8 @@ fn run_window(instance: HWND) -> Result<(), String> {
         hIconSm: std::ptr::null_mut(),
     };
     if unsafe { RegisterClassExW(&class) } == 0 {
-        return Err("注册应用窗口失败".to_string());
+        let error = io::Error::last_os_error();
+        return Err(format!("注册应用窗口失败：{error}"));
     }
 
     let title = api::wide("Oil Find for Windows");
@@ -519,8 +544,9 @@ fn run_window(instance: HWND) -> Result<(), String> {
         )
     };
     if hwnd.is_null() {
+        let error = io::Error::last_os_error();
         let init_error = with_app(|app| app.init_error.clone()).flatten();
-        return Err(init_error.unwrap_or_else(|| "创建应用窗口失败".to_string()));
+        return Err(init_error.unwrap_or_else(|| format!("创建应用窗口失败：{error}")));
     }
 
     unsafe {
@@ -536,12 +562,18 @@ fn run_window(instance: HWND) -> Result<(), String> {
         app.load_cache();
     });
 
+    if WINDOW_STATE.with(Cell::get) == WindowState::Stopped {
+        return Err("主窗口在完成启动前关闭。".to_string());
+    }
+    WINDOW_STATE.with(|state| state.set(WindowState::Running));
     let mut message = MSG::default();
     loop {
         let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
         if result == -1 {
+            let error = io::Error::last_os_error();
+            WINDOW_STATE.with(|state| state.set(WindowState::Stopped));
             unsafe { DestroyWindow(hwnd) };
-            break;
+            return Err(format!("读取窗口消息失败：{error}"));
         }
         if result == 0 {
             break;
@@ -669,12 +701,13 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
-            // In particular, DestroyWindow from WM_CLOSE reenters here while
-            // App is borrowed. Quit immediately, discard stale HWND messages,
-            // and run idempotent shutdown once the borrow has ended.
-            DESTROYED.with(|destroyed| destroyed.set(true));
+            // A failed WM_CREATE also destroys the window. Only request quit
+            // for an active message loop so a startup error dialog can display.
+            let post_quit = WINDOW_STATE.with(mark_window_stopped);
             PENDING.with(|pending| pending.borrow_mut().clear());
-            unsafe { PostQuitMessage(0) };
+            if post_quit {
+                unsafe { PostQuitMessage(0) };
+            }
             dispatch_deferred(Deferred::Destroyed);
             0
         }
@@ -982,7 +1015,7 @@ impl App {
         self.status = make("STATIC", "", style::SS_LEFT, 0, 0)?;
 
         // 扫描进度条：indeterminate marquee，平时隐藏，扫描时显示。
-        self.progress = make("msctls_progress2", "", style::PBS_MARQUEE, 0, 0)?;
+        self.progress = make(progress_control_class(), "", style::PBS_MARQUEE, 0, 0)?;
         unsafe { ShowWindow(self.progress, SW_HIDE) };
 
         // 空状态提示：覆盖在结果列表上方，仅在没有行时显示（后创建 = 上层）。
@@ -2293,6 +2326,48 @@ fn month_day_label(date: &str, clock: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_progress_control_uses_the_registered_win32_class() {
+        assert_eq!(progress_control_class(), "msctls_progress32");
+    }
+
+    #[test]
+    fn startup_cleanup_only_requests_quit_for_a_running_window() {
+        let state = Cell::new(WindowState::Starting);
+        assert!(!mark_window_stopped(&state));
+        assert_eq!(state.get(), WindowState::Stopped);
+
+        state.set(WindowState::Running);
+        assert!(mark_window_stopped(&state));
+        assert!(!mark_window_stopped(&state));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_window_destruction_posts_quit_only_after_startup() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, PM_NOREMOVE, PM_REMOVE, WM_QUIT,
+        };
+
+        for (initial, expected) in [(WindowState::Starting, false), (WindowState::Running, true)] {
+            let quit_posted = std::thread::spawn(move || {
+                WINDOW_STATE.with(|state| state.set(initial));
+                let mut message = MSG::default();
+                let hwnd = std::ptr::null_mut();
+                unsafe {
+                    // Initialize the fresh thread's queue without creating a window.
+                    PeekMessageW(&mut message, hwnd, 0, 0, PM_NOREMOVE);
+                    window_proc(hwnd, WM_DESTROY, 0, 0);
+                    PeekMessageW(&mut message, hwnd, WM_QUIT, WM_QUIT, PM_REMOVE) != 0
+                        && message.message == WM_QUIT
+                }
+            })
+            .join()
+            .expect("join message-queue test");
+            assert_eq!(quit_posted, expected, "{initial:?}");
+        }
+    }
 
     #[test]
     fn reentrant_borrow_is_deferred_without_losing_search_or_resize() {
