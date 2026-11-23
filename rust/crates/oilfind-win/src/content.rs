@@ -1,6 +1,6 @@
 //! Local document extraction and literal substring search for approved folders.
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read};
 use std::ops::Range;
@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+mod pdf;
 
 const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOC_BYTES: usize = 2 * 1024 * 1024;
@@ -99,14 +101,20 @@ pub struct Preview {
 }
 
 impl ContentIndex {
-    pub fn build(
+    pub fn refresh(
         cancel: &AtomicBool,
         roots: &[PathBuf],
         approved_volumes: &BTreeMap<String, String>,
+        previous: Option<&Self>,
     ) -> Result<Self, String> {
         // Reuse the scan's root validation, protected directories, traversal and
         // cancellation. Reading starts only with the files it has accepted.
         let scan = oilfind_core::scan(cancel, roots, |_| {}).map_err(|err| err.to_string())?;
+        let previously_indexed: HashSet<&Path> = previous
+            .filter(|index| index.roots == roots)
+            .into_iter()
+            .flat_map(|index| index.documents.iter().map(|doc| doc.path.as_path()))
+            .collect();
         let mut index = Self {
             version: CACHE_VERSION,
             roots: roots.to_vec(),
@@ -135,9 +143,25 @@ impl ContentIndex {
                 index.skipped += 1;
                 continue;
             }
-            let Ok((raw, stamp)) = read_source(&path, approved_volumes) else {
-                index.skipped += 1;
-                continue;
+            let (raw, stamp) = match read_source(&path, approved_volumes) {
+                Ok(source) => source,
+                Err(err) => {
+                    if previously_indexed.contains(path.as_path())
+                        && !matches!(
+                            err.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::Unsupported
+                                | io::ErrorKind::InvalidData
+                        )
+                    {
+                        return Err(format!(
+                            "“{}”暂时无法读取，保留上次索引：{err}",
+                            entry.name()
+                        ));
+                    }
+                    index.skipped += 1;
+                    continue;
+                }
             };
             let Some(units) = extract(format, &raw, cancel) else {
                 index.skipped += 1;
@@ -329,7 +353,7 @@ fn valid_units(units: &[String]) -> bool {
 
 fn extract(format: Format, raw: &[u8], cancel: &AtomicBool) -> Option<Vec<String>> {
     let units = match format {
-        Format::Pdf => pdf_units(raw, cancel)?,
+        Format::Pdf => pdf::units(raw, cancel)?,
         Format::Word => word_units(raw)?,
         Format::Text => vec![normalize_text(&text_file(raw)?)],
     };
@@ -356,37 +380,6 @@ fn text_file(bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {
         }
     })?;
     (!text.contains('\0')).then_some(text)
-}
-
-fn pdf_units(bytes: &[u8], cancel: &AtomicBool) -> Option<Vec<String>> {
-    const PDF_STREAM_LIMIT: usize = 8 * 1024 * 1024;
-    const MAX_PAGES: usize = 4096;
-    let options = lopdf::LoadOptions::with_max_decompressed_size(PDF_STREAM_LIMIT);
-    let pdf = lopdf::Document::load_mem_with_options(bytes, options).ok()?;
-    if pdf.is_encrypted() {
-        return None;
-    }
-    let page_count = pdf.page_iter().take(MAX_PAGES + 1).count();
-    if page_count > MAX_PAGES {
-        return None;
-    }
-    let mut total = 0;
-    let mut units = Vec::with_capacity(page_count);
-    for page in 1..=page_count as u32 {
-        if cancel.load(Relaxed) {
-            return None;
-        }
-        let page_text = pdf
-            .extract_text_with_limit(&[page], PDF_STREAM_LIMIT)
-            .ok()?;
-        let page_text = normalize_text(&page_text);
-        total += page_text.len();
-        if total > MAX_DOC_BYTES {
-            return None;
-        }
-        units.push(page_text);
-    }
-    Some(units)
 }
 
 fn word_units(bytes: &[u8]) -> Option<Vec<String>> {
@@ -465,6 +458,19 @@ fn read_source(
     path: &Path,
     approved_volumes: &BTreeMap<String, String>,
 ) -> io::Result<(Vec<u8>, FileStamp)> {
+    let file = open_indexed_file(path, approved_volumes)?;
+    let stamp = FileStamp::from_metadata(&file.metadata()?)?;
+    let data = read_limited(&file, MAX_FILE_BYTES)?;
+    if stamp.bytes != data.len() as u64 || stamp != FileStamp::from_metadata(&file.metadata()?)? {
+        return Err(io::Error::other("读取正文时文件发生变化"));
+    }
+    Ok((data, stamp))
+}
+
+pub fn open_indexed_file(
+    path: &Path,
+    approved_volumes: &BTreeMap<String, String>,
+) -> io::Result<File> {
     #[cfg(windows)]
     let volume_path = {
         let text = path
@@ -487,52 +493,110 @@ fn read_source(
         let _ = approved_volumes;
         None
     };
-    let file = open_local_file(path, volume_path.as_deref())?;
-    let stamp = FileStamp::from_metadata(&file.metadata()?)?;
-    let data = read_limited(&file, MAX_FILE_BYTES)?;
-    if stamp.bytes != data.len() as u64 || stamp != FileStamp::from_metadata(&file.metadata()?)? {
-        return Err(io::Error::other("读取正文时文件发生变化"));
-    }
-    Ok((data, stamp))
+    open_local_file(path, volume_path.as_deref())
 }
 
 fn read_limited(file: &File, limit: usize) -> io::Result<Vec<u8>> {
     if file.metadata()?.len() > limit as u64 {
-        return Err(io::Error::other("文件超出大小限制"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "文件超出大小限制",
+        ));
     }
     let mut data = Vec::new();
     file.take(limit as u64 + 1).read_to_end(&mut data)?;
     if data.len() > limit {
-        return Err(io::Error::other("文件超出大小限制"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "文件超出大小限制",
+        ));
     }
     Ok(data)
 }
 
 #[cfg(windows)]
 fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtOpenFile, FILE_NON_DIRECTORY_FILE, FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_SUCCESS, UNICODE_STRING,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         GetFinalPathNameByHandleW, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_NO_RECALL,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, VOLUME_NAME_GUID,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        VOLUME_NAME_GUID,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const UNSAFE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_REPARSE_POINT
         | FILE_ATTRIBUTE_OFFLINE
         | FILE_ATTRIBUTE_RECALL_ON_OPEN
         | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_attributes() & UNSAFE_ATTRIBUTES != 0 {
-        return Err(io::Error::other("不读取链接或离线文件"));
+    let expected = volume_path
+        .or_else(|| path.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "文件路径无效"))?;
+    let expected = expected.strip_prefix(r"\\?\").unwrap_or(expected);
+    let expected = expected.replace('/', "\\");
+    let mut nt_path: Vec<u16> = format!(r"\??\{expected}").encode_utf16().collect();
+    let length = u16::try_from(nt_path.len() * 2)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "文件路径过长"))?;
+    let name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: nt_path.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        ..Default::default()
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut information = IO_STATUS_BLOCK::default();
+    // The object name and I/O status storage stay alive during this synchronous
+    // request. OBJ_DONT_REPARSE applies to ancestors as well as the leaf.
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut information,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_NON_DIRECTORY_FILE
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_NO_RECALL,
+        )
+    };
+    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "不读取链接或重解析点",
+        ));
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL)
-        .open(path)?;
+    if status != STATUS_SUCCESS {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    if handle.is_null() {
+        return Err(io::Error::other("无法打开文件"));
+    }
+    // Successful NtOpenFile transfers ownership of the handle.
+    let file = unsafe { File::from_raw_handle(handle) };
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_attributes() & UNSAFE_ATTRIBUTES != 0 {
-        return Err(io::Error::other("不读取链接或离线文件"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "不读取链接或离线文件",
+        ));
     }
 
     // Validate the opened handle before reading any bytes. This prevents a
@@ -565,16 +629,14 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
     } else {
         return Err(io::Error::other("无法验证已打开的文件"));
     };
-    let expected = volume_path.map_or(path, Path::new);
-    let resolved = if volume_path.is_some() {
-        Path::new(&resolved)
-    } else {
-        Path::new(resolved.strip_prefix(r"\\?\").unwrap_or(&resolved))
-    };
-    if !crate::platform::within_root(resolved, expected)
-        || !crate::platform::within_root(expected, resolved)
+    let resolved = resolved.strip_prefix(r"\\?\").unwrap_or(&resolved);
+    let expected_components = expected.split_once('\\');
+    let actual_components = resolved.split_once('\\');
+    if !matches!((expected_components, actual_components),
+        (Some((volume, path)), Some((actual_volume, actual_path)))
+            if volume.eq_ignore_ascii_case(actual_volume) && path == actual_path)
     {
-        return Err(io::Error::other("文件位置已变化"));
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "文件位置已变化"));
     }
     Ok(file)
 }
@@ -582,7 +644,7 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
 #[cfg(not(windows))]
 fn open_local_file(path: &Path, _: Option<&str>) -> io::Result<File> {
     if !fs::symlink_metadata(path)?.is_file() || fs::canonicalize(path)? != path {
-        return Err(io::Error::other("文件位置已变化"));
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "文件位置已变化"));
     }
     File::open(path)
 }
@@ -593,8 +655,5 @@ fn under_root(root: &Path, path: &Path) -> bool {
         && !path
             .components()
             .any(|component| matches!(component, Component::ParentDir));
-    #[cfg(windows)]
-    return safe && crate::platform::within_root(root, path);
-    #[cfg(not(windows))]
-    return safe && path.starts_with(root);
+    safe && path.starts_with(root)
 }

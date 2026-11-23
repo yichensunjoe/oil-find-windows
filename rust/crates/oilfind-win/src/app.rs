@@ -1949,12 +1949,17 @@ impl App {
 
     fn invalidate_scope(&mut self) {
         self.pause_scan();
-        self.search_generation += 1;
         self.index = None;
         self.config.cache_roots.clear();
         self.config.approved_volumes.clear();
         self.last_update = None;
-        self.set_rows(Vec::new());
+        if self.content.searching {
+            self.rows.clear();
+        } else {
+            self.search_generation += 1;
+            self.rows_generation = None;
+            self.set_rows(Vec::new());
+        }
     }
 
     fn use_fixed_roots(&mut self) {

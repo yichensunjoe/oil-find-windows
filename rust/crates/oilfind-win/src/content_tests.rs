@@ -11,6 +11,14 @@ impl Fixture {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let base = crate::platform::resolve(&std::env::temp_dir()).unwrap();
+        // A volume-root /tmp is intentionally excluded by the scanner. Use
+        // the other system temporary directory on Linux without changing policy.
+        #[cfg(target_os = "linux")]
+        let base = if oilfind_core::validate_scan_roots(std::slice::from_ref(&base)).is_ok() {
+            base
+        } else {
+            crate::platform::resolve(std::path::Path::new("/var/tmp")).unwrap()
+        };
         loop {
             let path = base.join(format!(
                 "oilfind-content-{}-{}",
@@ -35,7 +43,7 @@ impl Fixture {
         let volumes = crate::platform::volume_ids(roots).unwrap();
         #[cfg(not(windows))]
         let volumes = Default::default();
-        ContentIndex::build(&AtomicBool::new(false), roots, &volumes).unwrap()
+        ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, None).unwrap()
     }
 }
 
@@ -97,6 +105,7 @@ fn word_phrase_spanning_formatting_runs_points_to_its_paragraph() {
     let index = fixture.scan();
     let (hits, total) = index.search("海水淡化", 10, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(total, 1);
+    assert_eq!(hits[0].count, 1);
     assert_eq!(hits[0].location, 2);
     let preview = index.document(&hits[0]).preview("海水淡化", 0).unwrap();
     assert!(preview.text.contains("标题"));
@@ -107,11 +116,18 @@ fn word_phrase_spanning_formatting_runs_points_to_its_paragraph() {
 fn missing_root_is_an_error_and_cancelled_scan_returns_no_snapshot() {
     let fixture = Fixture::new();
     let absent = fixture.0.join("absent");
-    assert!(ContentIndex::build(&AtomicBool::new(false), &[absent], &Default::default()).is_err());
-    assert!(ContentIndex::build(
+    assert!(ContentIndex::refresh(
+        &AtomicBool::new(false),
+        &[absent],
+        &Default::default(),
+        None
+    )
+    .is_err());
+    assert!(ContentIndex::refresh(
         &AtomicBool::new(true),
         std::slice::from_ref(&fixture.0),
-        &Default::default()
+        &Default::default(),
+        None
     )
     .is_err());
 }
@@ -179,9 +195,35 @@ fn opening_body_requires_the_expected_volume_guid() {
     for volume in volumes.values_mut() {
         *volume = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\".to_string();
     }
-    let index = ContentIndex::build(&AtomicBool::new(false), roots, &volumes).unwrap();
+    let index = ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, None).unwrap();
     assert_eq!(index.len(), 0);
     assert_eq!(index.skipped, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn refresh_cannot_publish_an_empty_snapshot_when_an_indexed_file_is_locked() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = Fixture::new();
+    fixture.write("实验.txt", "海水淡化");
+    let previous = fixture.scan();
+    let roots = std::slice::from_ref(&fixture.0);
+    let volumes = crate::platform::volume_ids(roots).unwrap();
+    let path = fixture.0.join("实验.txt");
+    let _lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let refresh = ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, Some(&previous));
+    assert!(refresh.is_err());
+    assert_eq!(
+        previous
+            .search("海水淡化", 10, |_, _| std::cmp::Ordering::Equal)
+            .1,
+        1
+    );
 }
 
 #[test]
@@ -211,6 +253,7 @@ fn pdf_hit_uses_the_page_number_and_highlights_decoded_chinese_text() {
     let index = fixture.scan();
     let (hits, total) = index.search("海水淡化", 10, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(total, 1);
+    assert_eq!(hits[0].count, 1);
     assert_eq!(hits[0].location, 2);
     let doc = index.document(&hits[0]);
     let preview = doc.preview("海水淡化", 0).unwrap();
@@ -261,17 +304,30 @@ end"#
         "Encoding" => "Identity-H",
         "ToUnicode" => cmap,
     });
+    let form = pdf.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 500.into(), 500.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        b"BT /F1 14 Tf 20 40 Td <0001000200030004> Tj ET".to_vec(),
+    ));
     let mut kids = Vec::new();
     for content in [
-        "BT /F1 14 Tf 20 40 Td <0005> Tj ET",
-        "BT /F1 14 Tf 20 40 Td <0001000200030004> Tj ET",
+        "BT /F1 14 Tf 20 40 Td <00010002> Tj 0 -14 Td <00030004> Tj ET",
+        "/ChineseText Do",
+        "BI /W",
     ] {
         let stream = pdf.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
         let page = pdf.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages,
             "Contents" => stream,
-            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "ChineseText" => form },
+            },
             "MediaBox" => vec![0.into(), 0.into(), 500.into(), 500.into()],
         });
         kids.push(Object::Reference(page));
@@ -279,7 +335,7 @@ end"#
     pdf.objects.insert(
         pages,
         Object::Dictionary(dictionary! {
-            "Type" => "Pages", "Count" => 2, "Kids" => kids,
+            "Type" => "Pages", "Count" => 3, "Kids" => kids,
         }),
     );
     let root = pdf.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });

@@ -588,7 +588,7 @@ impl App {
                 continue;
             }
             let path = slot_path(config, slot);
-            if path.is_file()
+            if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
                 && !platform::is_link_or_reparse(&path)
                 && std::fs::remove_file(&path).is_err()
             {
@@ -630,6 +630,7 @@ impl App {
             return;
         }
         let scope = self.content.approval.clone();
+        let previous = self.content.index.clone();
         let slot = self
             .content
             .config
@@ -650,7 +651,8 @@ impl App {
                 if automatic && volumes != scope.volumes {
                     return Err("正文范围所在的磁盘已变化，请重新确认范围".into());
                 }
-                let index = ContentIndex::build(cancel, &scope.roots, &volumes)?;
+                let previous = previous.as_deref().filter(|_| scope.volumes == volumes);
+                let index = ContentIndex::refresh(cancel, &scope.roots, &volumes, previous)?;
                 if checked_volumes(&scope.roots)? != volumes {
                     return Err("正文范围在扫描期间发生变化".into());
                 }
@@ -789,9 +791,10 @@ impl App {
             return;
         };
         let document = index.document(hit);
-        match self.validate_content_path(&document.path) {
-            Ok(path)
-                if std::fs::metadata(&path)
+        match self.open_content_path(&document.path) {
+            Ok(file)
+                if file
+                    .metadata()
                     .is_ok_and(|metadata| document.matches_metadata(&metadata)) => {}
             Ok(_) => {
                 api::warn(self.hwnd, "文件已修改。请先刷新正文索引，再查看命中位置。");
@@ -862,10 +865,9 @@ impl App {
         }
     }
 
-    fn validate_content_path(&self, path: &Path) -> Result<PathBuf, String> {
-        platform::local_path(path)?;
+    fn open_content_path(&self, path: &Path) -> Result<std::fs::File, String> {
         let approval = &self.content.approval;
-        if !approval.contains(path)
+        if !approval.roots.iter().any(|root| path.starts_with(root))
             || !platform::volume_ids(&[path.to_path_buf()]).is_ok_and(|actual| {
                 actual
                     .iter()
@@ -874,26 +876,15 @@ impl App {
         {
             return Err("此文件的正文索引授权已变化，请重新索引。".into());
         }
-        let metadata = std::fs::symlink_metadata(path).map_err(|err| err.to_string())?;
-        let resolved = platform::resolve(path).map_err(|err| err.to_string())?;
-        if !metadata.is_file()
-            || platform::is_link_or_reparse(path)
-            || !platform::within_root(path, &resolved)
-            || !platform::within_root(&resolved, path)
-        {
-            return Err("文件位置已变化，请重新索引。".into());
-        }
-        Ok(resolved)
+        content::open_indexed_file(path, &approval.volumes).map_err(|err| err.to_string())
     }
 
     pub(super) fn content_file_action(&self, path: &Path, id: usize) {
-        let result = self
-            .validate_content_path(path)
-            .and_then(|resolved| match id {
-                ID_OPEN | ID_CONTENT_ORIGINAL => api::open_path(self.hwnd, &resolved),
-                ID_REVEAL => api::reveal_path(&resolved),
-                _ => api::copy_to_clipboard(self.hwnd, &resolved.to_string_lossy()),
-            });
+        let result = self.open_content_path(path).and_then(|_file| match id {
+            ID_OPEN | ID_CONTENT_ORIGINAL => api::open_path(self.hwnd, path),
+            ID_REVEAL => api::reveal_path(path),
+            _ => api::copy_to_clipboard(self.hwnd, &path.to_string_lossy()),
+        });
         if let Err(err) = result {
             api::warn(self.hwnd, &err);
         }
