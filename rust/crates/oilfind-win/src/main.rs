@@ -8,30 +8,33 @@
 
 mod api;
 mod app;
+mod content;
+#[cfg(test)]
+mod content_tests;
 mod platform;
 mod quick_panel;
 
-// 单文件交付：MIT 许可与第三方 crate 声明必须随二进制一起分发，因此编入 exe。
-// `#[used]` 阻止链接器裁掉这两段只读数据（构建脚本不再输出独立许可文件）。
+// Embed licenses and notices with the single-file distribution.
 #[used]
 #[allow(dead_code)]
-static EMBEDDED_LICENSES: [&str; 2] = [
+static EMBEDDED_LICENSES: [&str; 3] = [
     include_str!("../../../../LICENSE"),
     include_str!("../../../THIRD_PARTY_NOTICES.txt"),
+    include_str!("../../../LICENSES/Content-search.txt"),
 ];
 
 fn license_requested() -> bool {
     std::env::args_os().any(|argument| argument.to_string_lossy() == "--license")
 }
 
-/// 许可文本必须真的被引用，否则 MSVC 链接器会把 `#[used]` 静态数据裁掉。
-/// `--license` 既满足 MIT 的可读入口，也保证两段文本留在 exe 里。
+/// Referencing the strings at runtime also keeps MSVC from discarding them.
 fn licenses() -> String {
     format!(
-        "Oil Find for Windows {}\n\n{}\n\n{}",
+        "Oil Find for Windows {}\n\n{}\n\n{}\n\n{}",
         env!("CARGO_PKG_VERSION"),
         EMBEDDED_LICENSES[0],
-        EMBEDDED_LICENSES[1]
+        EMBEDDED_LICENSES[1],
+        EMBEDDED_LICENSES[2]
     )
 }
 

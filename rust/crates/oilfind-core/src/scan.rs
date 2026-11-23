@@ -88,7 +88,7 @@ pub fn scan(
     roots: &[PathBuf],
     progress: impl Fn(Progress) + Sync,
 ) -> Result<Index, Error> {
-    let normalized = normalize_roots(roots)?;
+    let normalized = validate_scan_roots(roots)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
@@ -466,7 +466,8 @@ fn strip_verbatim_prefix(text: &str) -> Option<String> {
     text.strip_prefix(r"\\?\").map(str::to_string)
 }
 
-fn normalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+/// Validate and de-duplicate the scan roots without enumerating their contents.
+pub fn validate_scan_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
     if roots.is_empty() {
         return Err(Error::EmptyRoots);
     }

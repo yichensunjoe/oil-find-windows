@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, CDDS_PREPAINT, CDRF_SKIPDEFAULT, HDITEMW, HDI_TEXT, HDN_ITEMCLICK,
     ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCOLUMNW,
     LVHITTESTINFO, LVIF_TEXT, LVITEMW, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
-    NMCUSTOMDRAW, NMHDR, NMHEADERW, NMITEMACTIVATE, NM_CUSTOMDRAW, NM_DBLCLK,
+    NMCUSTOMDRAW, NMHDR, NMHEADERW, NMITEMACTIVATE, NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -58,6 +58,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::api::{self, SendHwnd};
 use crate::platform;
 use crate::quick_panel::{self, Panel};
+
+mod content_ui;
+use content_ui::ID_CONTENT;
 
 const RESULT_LIMIT: usize = 2000;
 const MAX_ROOTS: usize = 64;
@@ -166,6 +169,7 @@ mod style {
     pub const PBM_SETMARQUEE: u32 = 0x0400 + 10;
     // 静态控件：居中文本；默认按钮（“开始索引”）。
     pub const SS_CENTER: u32 = 0x0000_0001;
+    pub const SS_ENDELLIPSIS: u32 = 0x0000_4000;
     pub const EM_SETMARGINS: u32 = 0x00D3;
     // 静态控件颜色通知：wParam 是 HDC，lParam 是控件句柄。
 }
@@ -185,6 +189,7 @@ thread_local! {
     static WINDOW_HEADER: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_EMPTY: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_STATUS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+    static WINDOW_CONTENT_TEXT: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_PALETTE: Cell<Option<quick_panel::Palette>> = const { Cell::new(None) };
     static WINDOW_SYSTEM_COLORS: Cell<bool> = const { Cell::new(true) };
 }
@@ -210,7 +215,8 @@ fn mark_window_stopped(state: &Cell<WindowState>) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Notification {
-    HeaderClicked(i32),
+    HeaderColumn(i32),
+    ResultClicked { x: i32, y: i32 },
     ResultDoubleClicked(i32),
 }
 
@@ -410,6 +416,13 @@ enum Event {
         generation: u64,
         outcome: Result<(Vec<Entry>, usize), String>,
     },
+    ContentSearch {
+        generation: u64,
+        query: String,
+        hits: Vec<crate::content::Hit>,
+        total: usize,
+    },
+    ContentReady(Result<content_ui::WorkResult, String>),
 }
 
 #[derive(Clone, Copy)]
@@ -459,6 +472,58 @@ impl SearchRequest {
     }
 }
 
+enum SearchTask {
+    Metadata(SearchRequest),
+    Content {
+        generation: u64,
+        index: Arc<crate::content::ContentIndex>,
+        query: String,
+        sort: Vec<ResultSort>,
+    },
+}
+
+impl SearchTask {
+    fn run(self) -> Event {
+        match self {
+            Self::Metadata(request) => Event::Search {
+                generation: request.generation,
+                outcome: request.run().map_err(|err| err.to_string()),
+            },
+            Self::Content {
+                generation,
+                index,
+                query,
+                sort,
+            } => {
+                let (hits, total) = index.search(&query, RESULT_LIMIT, |a, b| {
+                    sort.iter()
+                        .map(|sort| {
+                            let order = match sort.column {
+                                0 => index.document(a).name().cmp(index.document(b).name()),
+                                1 => a.snippet.cmp(&b.snippet),
+                                2 => a.count.cmp(&b.count),
+                                _ => a.location.cmp(&b.location),
+                            };
+                            if sort.descending {
+                                order.reverse()
+                            } else {
+                                order
+                            }
+                        })
+                        .find(|order| !order.is_eq())
+                        .unwrap_or(cmp::Ordering::Equal)
+                });
+                Event::ContentSearch {
+                    generation,
+                    query,
+                    hits,
+                    total,
+                }
+            }
+        }
+    }
+}
+
 /// 容量为 1 的搜索请求信箱：新请求直接替换尚未开始执行的旧请求，
 /// 因此 UI 线程永远不会因为搜索忙而阻塞。
 struct SearchQueue {
@@ -467,7 +532,7 @@ struct SearchQueue {
 }
 
 struct SearchState {
-    request: Option<SearchRequest>,
+    request: Option<SearchTask>,
     closed: bool,
 }
 
@@ -508,6 +573,7 @@ struct App {
     storage_guard: Option<Arc<api::StorageGuard>>,
     index: Option<Arc<Index>>,
     rows: Vec<Entry>,
+    content: content_ui::State,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_gate: Arc<Mutex<()>>,
     scan_generation: u64,
@@ -657,6 +723,7 @@ fn run_window(instance: HWND) -> Result<(), String> {
         unsafe { SetFocus(first_focus) };
         app.start_search_worker();
         app.load_cache();
+        app.load_content_cache();
         app.hotkey = unsafe {
             RegisterHotKey(
                 hwnd,
@@ -745,8 +812,9 @@ unsafe extern "system" fn window_proc(
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
             if let Some(palette) = active_palette() {
                 let control = lparam as HWND;
-                let on_content =
-                    message != WM_CTLCOLORSTATIC || control == WINDOW_EMPTY.with(Cell::get);
+                let on_content = message != WM_CTLCOLORSTATIC
+                    || control == WINDOW_EMPTY.with(Cell::get)
+                    || control == WINDOW_CONTENT_TEXT.with(Cell::get);
                 let muted = control == WINDOW_STATUS.with(Cell::get);
                 palette.control_colors(wparam as HDC, on_content, muted)
             } else {
@@ -765,7 +833,7 @@ unsafe extern "system" fn window_proc(
         WM_NOTIFY => {
             // Header button painting is synchronous. The list keeps its native
             // drawing and notifications are copied before their pointers expire.
-            if matches!(wparam, ID_SETTINGS | ID_HIDE) && !lparam_is_null(lparam) {
+            if matches!(wparam, ID_SETTINGS | ID_HIDE | ID_CONTENT) && !lparam_is_null(lparam) {
                 let header = unsafe { &*(lparam as *const NMHDR) };
                 if header.idFrom == wparam && header.code == NM_CUSTOMDRAW {
                     if let Some(palette) = active_palette() {
@@ -874,14 +942,21 @@ unsafe fn read_notification(lparam: LPARAM, header: HWND, results: HWND) -> Opti
     if !header.is_null() && notice.hwndFrom == header {
         if notice.code as i32 == HDN_ITEMCLICK as i32 {
             let clicked = unsafe { &*(lparam as *const NMHEADERW) };
-            return Some(Notification::HeaderClicked(clicked.iItem));
+            return Some(Notification::HeaderColumn(clicked.iItem));
         }
     } else if !results.is_null()
         && notice.hwndFrom == results
-        && notice.code as i32 == NM_DBLCLK as i32
+        && matches!(notice.code, NM_CLICK | NM_DBLCLK)
     {
         let clicked = unsafe { &*(lparam as *const NMITEMACTIVATE) };
-        return Some(Notification::ResultDoubleClicked(clicked.iItem));
+        return if notice.code == NM_CLICK {
+            Some(Notification::ResultClicked {
+                x: clicked.ptAction.x,
+                y: clicked.ptAction.y,
+            })
+        } else {
+            Some(Notification::ResultDoubleClicked(clicked.iItem))
+        };
     }
     None
 }
@@ -902,6 +977,7 @@ impl App {
             96
         };
         let (events_tx, events_rx) = mpsc::channel();
+        let content = content_ui::State::new(config_path.as_deref());
         let mut app = App {
             hwnd: std::ptr::null_mut(),
             instance,
@@ -935,6 +1011,7 @@ impl App {
             storage_guard,
             index: None,
             rows: Vec::new(),
+            content,
             scan_cancel: None,
             scan_gate: Arc::new(Mutex::new(())),
             scan_generation: 0,
@@ -985,8 +1062,7 @@ impl App {
         match message {
             Deferred::Size => {
                 if !self.results.is_null() && unsafe { IsIconic(self.hwnd) } == 0 {
-                    let desired =
-                        Panel::for_query(self.panel == Panel::Settings, &api::text(self.search));
+                    let desired = self.panel_for_query(&api::text(self.search));
                     if self.panel == desired {
                         self.layout();
                     } else {
@@ -1015,6 +1091,9 @@ impl App {
                 {
                     self.disarm_refresh();
                     self.begin_scan(true);
+                    if self.auto_sync {
+                        self.begin_content_scan(true);
+                    }
                 }
             }
             Deferred::Events => self.drain_events(),
@@ -1180,6 +1259,7 @@ impl App {
         WINDOW_EMPTY.with(|handle| handle.set(self.empty));
         unsafe { ShowWindow(self.empty, SW_HIDE) };
 
+        self.create_content_ui()?;
         self.refresh_roots();
         api::enable(self.stop, false);
         self.last_notice = if self.config.roots.is_empty() {
@@ -1261,8 +1341,15 @@ impl App {
                 unsafe { ShowWindow(handle, command) };
             }
         };
-        show(&[self.search], !settings);
-        show(&[self.results, self.types, self.labels[2]], results);
+        show(
+            &[self.search],
+            matches!(self.panel, Panel::Search | Panel::Results),
+        );
+        show(&[self.results], results);
+        show(
+            &[self.types, self.labels[2]],
+            results && !self.content.searching,
+        );
         show(
             &[
                 self.labels[1],
@@ -1291,15 +1378,26 @@ impl App {
         };
 
         let top = self.px(15);
-        let hide_width = self.px(76);
-        let settings_width = self.px(102);
-        let settings_x = right - hide_width - gap - settings_width;
-        place(self.labels[0], p, top + self.px(4), settings_x - p, row);
+        let narrow = w < self.px(400);
+        let gap_top = if narrow { self.px(6) } else { gap };
+        let hide_width = self.px(if narrow { 52 } else { 76 });
+        let settings_width = self.px(if narrow { 86 } else { 102 });
+        let settings_x = right - hide_width - gap_top - settings_width;
+        let mode = matches!(self.panel, Panel::Settings | Panel::Search | Panel::Results);
+        let mode_x = settings_x - gap_top - settings_width;
+        let title_width = (if mode { mode_x } else { settings_x }) - p;
+        show(&[self.labels[0]], title_width >= self.px(68));
+        place(self.labels[0], p, top + self.px(4), title_width, row);
+        place(self.content.controls.mode, mode_x, top, settings_width, row);
         place(self.settings, settings_x, top, settings_width, row);
         place(self.hide, right - hide_width, top, hide_width, row);
         place(self.status, p, h - self.px(33), content_width, self.px(27));
         place(self.progress, 0, h - self.px(4), w, self.px(4));
 
+        self.layout_content(show, place, (w, h));
+        if matches!(self.panel, Panel::ContentSettings | Panel::Preview) {
+            return;
+        }
         let body = self.px(60);
         let start_width = self.px(112);
         if settings {
@@ -1380,7 +1478,11 @@ impl App {
             self.px(226),
         );
 
-        let list_y = types_y + row + gap;
+        let list_y = if self.content.searching {
+            types_y
+        } else {
+            types_y + row + gap
+        };
         let list_height = h - self.px(45) - list_y;
         place(self.results, p, list_y, content_width, list_height);
         place(
@@ -1390,10 +1492,12 @@ impl App {
             content_width - 2,
             row,
         );
-        for (position, column_width) in quick_panel::result_columns(content_width, self.dpi)
-            .into_iter()
-            .enumerate()
-        {
+        let columns = if self.content.searching {
+            quick_panel::content_columns(content_width, self.dpi)
+        } else {
+            quick_panel::result_columns(content_width, self.dpi)
+        };
+        for (position, column_width) in columns.into_iter().enumerate() {
             api::send_message(
                 self.results,
                 style::LVM_SETCOLUMNWIDTH,
@@ -1404,14 +1508,19 @@ impl App {
     }
 
     fn position_panel(&mut self, panel: Panel, follow_pointer: bool) {
+        if self.panel == Panel::Preview && panel != Panel::Preview {
+            self.clear_preview();
+        }
         self.panel = panel;
-        let (settings_label, hide_label) = if panel == Panel::Settings {
-            ("返回搜索", "退出")
-        } else {
-            ("索引设置", "收起")
+        let (settings_label, hide_label) = match panel {
+            Panel::Settings => ("返回搜索", "退出"),
+            Panel::ContentSettings => ("返回设置", "退出"),
+            Panel::Preview => ("返回结果", "收起"),
+            _ => ("索引设置", "收起"),
         };
         api::put_text(self.settings, settings_label);
         api::put_text(self.hide, hide_label);
+        self.update_content_button();
         let bounds = panel.bounds(quick_panel::work_area(self.hwnd, follow_pointer), self.dpi);
         unsafe {
             SetWindowPos(
@@ -1427,20 +1536,37 @@ impl App {
         self.layout();
     }
 
+    fn panel_for_query(&self, query: &str) -> Panel {
+        match self.panel {
+            Panel::Settings | Panel::ContentSettings | Panel::Preview => self.panel,
+            _ => Panel::for_query(false, query),
+        }
+    }
+
     fn toggle_settings(&mut self) {
-        if self.panel == Panel::Settings {
-            let panel = Panel::for_query(false, &api::text(self.search));
-            self.position_panel(panel, false);
-            unsafe { SetFocus(self.search) };
-        } else {
-            self.position_panel(Panel::Settings, false);
-            unsafe { SetFocus(self.roots_list) };
+        let away_from_preview = self.panel == Panel::Preview;
+        match self.panel {
+            Panel::Settings | Panel::Preview => {
+                self.position_panel(Panel::for_query(false, &api::text(self.search)), false);
+                unsafe { SetFocus(self.search) };
+            }
+            Panel::ContentSettings => {
+                self.position_panel(Panel::Settings, false);
+                unsafe { SetFocus(self.content.controls.mode) };
+            }
+            _ => {
+                self.position_panel(Panel::Settings, false);
+                unsafe { SetFocus(self.roots_list) };
+            }
+        }
+        if away_from_preview {
+            self.search_now();
         }
         self.render_status();
     }
 
     fn toggle_search_panel(&mut self) {
-        if self.panel != Panel::Settings
+        if !matches!(self.panel, Panel::Settings | Panel::ContentSettings)
             && unsafe { IsIconic(self.hwnd) == 0 && GetForegroundWindow() == self.hwnd }
         {
             unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
@@ -1456,6 +1582,9 @@ impl App {
             SetFocus(self.search);
         }
         api::send_message(self.search, style::EM_SETSEL, 0, -1);
+        if self.content.searching {
+            self.search_now();
+        }
         self.render_status();
     }
 
@@ -1497,6 +1626,7 @@ impl App {
             self.progress,
             self.empty,
         ]);
+        controls.extend(self.content.controls.all());
         for handle in controls {
             api::set_font(handle, font);
         }
@@ -1533,7 +1663,10 @@ impl App {
         }
         let focus = unsafe { GetFocus() };
         if message.wParam == 0x1B {
-            if self.panel == Panel::Settings {
+            if matches!(
+                self.panel,
+                Panel::Settings | Panel::ContentSettings | Panel::Preview
+            ) {
                 self.toggle_settings();
             } else {
                 unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
@@ -1541,7 +1674,10 @@ impl App {
             return true;
         }
         let control = unsafe { GetKeyState(0x11) };
-        if self.panel != Panel::Settings && message.wParam == 'L' as usize && control < 0 {
+        if matches!(self.panel, Panel::Search | Panel::Results)
+            && message.wParam == 'L' as usize
+            && control < 0
+        {
             unsafe { SetFocus(self.search) };
             api::send_message(self.search, style::EM_SETSEL, 0, -1);
             return true;
@@ -1556,7 +1692,7 @@ impl App {
         if message.wParam == 0x28
             && focus == self.search
             && self.rows_generation == Some(self.search_generation)
-            && !self.rows.is_empty()
+            && self.result_len() > 0
         {
             self.select_first_result();
             unsafe { SetFocus(self.results) };
@@ -1568,7 +1704,7 @@ impl App {
                 return true;
             }
             if focus == self.search {
-                if self.rows_generation == Some(self.search_generation) && !self.rows.is_empty() {
+                if self.rows_generation == Some(self.search_generation) && self.result_len() > 0 {
                     self.select_first_result();
                     self.file_action(ID_OPEN);
                     return true;
@@ -1590,7 +1726,7 @@ impl App {
     }
 
     fn select_first_result(&self) {
-        if self.selected_entry().is_some() || self.rows.is_empty() {
+        if self.selected_position().is_some() || self.result_len() == 0 {
             return;
         }
         let item = LVITEMW {
@@ -1612,7 +1748,10 @@ impl App {
         }
         match id {
             ID_SETTINGS if notification == 0 => self.toggle_settings(),
-            ID_HIDE if notification == 0 && self.panel == Panel::Settings => {
+            ID_HIDE
+                if notification == 0
+                    && matches!(self.panel, Panel::Settings | Panel::ContentSettings) =>
+            {
                 self.apply(Deferred::Close)
             }
             ID_HIDE if notification == 0 => {
@@ -1662,18 +1801,36 @@ impl App {
                 }
             }
             ID_OPEN | ID_REVEAL | ID_COPY if notification == 0 => self.file_action(id),
-            _ => {}
+            _ => self.content_command(id, notification),
         }
     }
 
     fn notify(&mut self, notification: Notification) {
         match notification {
-            Notification::HeaderClicked(column) => self.sort_by_column(column as usize),
+            Notification::HeaderColumn(column) => self.sort_by_column(column as usize),
+            Notification::ResultClicked { x, y }
+                if self.content.searching && self.panel == Panel::Results =>
+            {
+                let mut hit = LVHITTESTINFO {
+                    pt: POINT { x, y },
+                    ..Default::default()
+                };
+                let item = api::send_message(
+                    self.results,
+                    windows_sys::Win32::UI::Controls::LVM_SUBITEMHITTEST,
+                    0,
+                    &mut hit as *mut LVHITTESTINFO as isize,
+                );
+                if item >= 0 {
+                    self.open_content_hit(item as usize);
+                }
+            }
             Notification::ResultDoubleClicked(item) => {
-                if item >= 0 && (item as usize) < self.rows.len() {
+                if !self.content.searching && item >= 0 && (item as usize) < self.rows.len() {
                     self.file_action(ID_OPEN);
                 }
             }
+            Notification::ResultClicked { .. } => {}
         }
     }
 
@@ -1690,7 +1847,7 @@ impl App {
         self.sort.retain(|sort| sort.column != column);
         self.sort.insert(0, ResultSort { column, descending });
         self.refresh_header();
-        if self.index.is_some() {
+        if self.index.is_some() || self.content.searching {
             self.queue_search();
         }
     }
@@ -1700,8 +1857,12 @@ impl App {
         if self.header.is_null() {
             return;
         }
-        const LABELS: [&str; 4] = ["文件名", "完整路径", "大小", "修改日期"];
-        for (position, label) in LABELS.iter().enumerate() {
+        let labels = if self.content.searching {
+            ["文件名", "正文片段", "命中", "位置"]
+        } else {
+            ["文件名", "完整路径", "大小", "修改日期"]
+        };
+        for (position, label) in labels.iter().enumerate() {
             let mut text = (*label).to_string();
             if let Some(sort) = self.sort.first().filter(|sort| sort.column == position) {
                 text.push(if sort.descending { '▼' } else { '▲' });
@@ -1994,6 +2155,7 @@ impl App {
     }
 
     fn pause_scan(&mut self) {
+        self.content.cancel(true);
         self.auto_sync = false;
         self.config.refresh_enabled = false;
         self.disarm_refresh();
@@ -2060,14 +2222,7 @@ impl App {
                 state.request.take()
             };
             let Some(request) = request else { continue };
-            let outcome = request.run().map_err(|err| err.to_string());
-            if sender
-                .send(Event::Search {
-                    generation: request.generation,
-                    outcome,
-                })
-                .is_err()
-            {
+            if sender.send(request.run()).is_err() {
                 return;
             }
             hwnd.post(WM_APP_EVENT);
@@ -2081,17 +2236,38 @@ impl App {
     }
 
     fn queue_search(&mut self) {
+        if self.panel == Panel::Preview {
+            return;
+        }
         self.search_generation += 1;
         let query = api::text(self.search).trim().to_string();
-        let panel = Panel::for_query(self.panel == Panel::Settings, &query);
+        let panel = self.panel_for_query(&query);
         if panel != self.panel && unsafe { IsIconic(self.hwnd) } == 0 {
             self.position_panel(panel, false);
         }
         if query.is_empty() {
             self.rows_generation = None;
-            self.set_rows(Vec::new());
+            self.content.set_search_notice("");
+            self.clear_rows();
             self.layout();
             self.render_status();
+            return;
+        }
+        if self.content.searching {
+            let Some(index) = self.content.index.clone() else {
+                self.clear_rows();
+                self.content.set_search_notice("");
+                self.render_status();
+                return;
+            };
+            self.content.set_search_notice("正在搜正文…");
+            self.render_status();
+            self.post_search(SearchTask::Content {
+                generation: self.search_generation,
+                index,
+                query,
+                sort: self.sort.clone(),
+            });
             return;
         }
         let Some(index) = self.index.clone() else {
@@ -2118,13 +2294,16 @@ impl App {
             .map(str::to_string);
         self.last_notice = "正在搜索已有索引…".to_string();
         self.render_status();
-        let request = SearchRequest {
+        self.post_search(SearchTask::Metadata(SearchRequest {
             generation: self.search_generation,
             index,
             query,
             kind,
             sort: self.sort.clone(),
-        };
+        }));
+    }
+
+    fn post_search(&self, request: SearchTask) {
         // 信箱容量为 1：直接替换尚未执行的请求，UI 线程不会阻塞。
         let mut state = lock(&self.search_queue.state);
         state.request = Some(request);
@@ -2294,54 +2473,53 @@ impl App {
                 }
                 self.render_status();
             }
+            Event::ContentSearch {
+                generation,
+                query,
+                hits,
+                total,
+            } => {
+                if self.content.searching && generation == self.search_generation {
+                    self.rows_generation = Some(generation);
+                    self.display_content_hits(query, hits, total);
+                }
+            }
+            Event::ContentReady(outcome) => self.finish_content_job(outcome),
         }
     }
 
     fn set_rows(&mut self, entries: Vec<Entry>) {
-        api::send_message(self.results, style::WM_SETREDRAW, 0, 0);
-        api::send_message(self.results, style::LVM_DELETEALLITEMS, 0, 0);
         self.rows = entries;
-        for (position, entry) in self.rows.iter().enumerate() {
-            let name = api::wide(entry.name());
-            let mut item = LVITEMW {
-                mask: LVIF_TEXT,
-                iItem: position as i32,
-                pszText: name.as_ptr() as *mut u16,
-                ..Default::default()
-            };
-            api::send_message(
-                self.results,
-                style::LVM_INSERTITEMW,
-                0,
-                &item as *const LVITEMW as isize,
-            );
-            let size = if entry.is_dir {
-                "文件夹".to_string()
-            } else {
-                platform::format_size(entry.size)
-            };
-            let values = [
-                entry.path().to_string_lossy().to_string(),
-                size,
-                platform::format_timestamp(entry.modified, false),
-            ];
-            for (offset, value) in values.iter().enumerate() {
-                let buffer = api::wide(value);
-                item.iSubItem = offset as i32 + 1;
-                item.pszText = buffer.as_ptr() as *mut u16;
-                api::send_message(
-                    self.results,
-                    style::LVM_SETITEMW,
-                    0,
-                    &item as *const LVITEMW as isize,
-                );
-            }
-        }
-        api::send_message(self.results, style::WM_SETREDRAW, 1, 0);
-        unsafe {
-            InvalidateRect(self.results, std::ptr::null(), 1);
-        }
+        populate_result_control(
+            self.results,
+            self.rows.iter().map(|entry| {
+                let size = if entry.is_dir {
+                    "文件夹".to_string()
+                } else {
+                    platform::format_size(entry.size)
+                };
+                [
+                    entry.name().to_string(),
+                    entry.path().to_string_lossy().to_string(),
+                    size,
+                    platform::format_timestamp(entry.modified, false),
+                ]
+            }),
+        );
         self.refresh_empty_state();
+    }
+
+    fn clear_rows(&mut self) {
+        self.content.hits.clear();
+        self.set_rows(Vec::new());
+    }
+
+    fn result_len(&self) -> usize {
+        if self.content.searching {
+            self.content.hits.len()
+        } else {
+            self.rows.len()
+        }
     }
 
     /// 扫描期间显示底部 indeterminate 进度条；其余时间隐藏。
@@ -2365,7 +2543,9 @@ impl App {
             unsafe { ShowWindow(self.empty, SW_HIDE) };
             return;
         }
-        let text = if self.index.is_none() {
+        let text = if self.content.searching {
+            self.content.empty_message()
+        } else if self.index.is_none() {
             "还没有可用索引。请添加本机目录，然后点击“开始索引”。"
         } else if self.rows.is_empty() {
             if api::text(self.search).trim().is_empty() {
@@ -2464,7 +2644,14 @@ impl App {
         }
         // 标签缓冲区必须活到 AppendMenuW 返回，故先统一准备好。
         let items: Vec<(usize, Vec<u16>)> = [
-            (ID_OPEN, "打开"),
+            (
+                ID_OPEN,
+                if self.content.searching {
+                    "查看原文"
+                } else {
+                    "打开"
+                },
+            ),
             (ID_REVEAL, "资源管理器定位"),
             (ID_COPY, "复制路径"),
         ]
@@ -2492,27 +2679,35 @@ impl App {
         }
     }
 
-    fn selected_entry(&self) -> Option<Entry> {
+    fn selected_position(&self) -> Option<usize> {
         let selected = api::send_message(
             self.results,
             style::LVM_GETNEXTITEM,
             usize::MAX,
             style::LVNI_SELECTED as isize,
         );
-        if selected < 0 || selected as usize >= self.rows.len() {
-            return None;
-        }
-        Some(self.rows[selected as usize].clone())
+        (selected >= 0 && (selected as usize) < self.result_len()).then_some(selected as usize)
     }
 
     fn file_action(&mut self, action: usize) {
         if self.rows_generation != Some(self.search_generation) {
             return;
         }
-        let Some(entry) = self.selected_entry() else {
+        let Some(position) = self.selected_position() else {
             return;
         };
-        let path = entry.path();
+        if self.content.searching {
+            if action == ID_OPEN {
+                self.open_content_hit(position);
+            } else if let Some(index) = &self.content.index {
+                self.content_file_action(
+                    &index.document(&self.content.hits[position]).path,
+                    action,
+                );
+            }
+            return;
+        }
+        let path = self.rows[position].path();
         if let Err(err) = platform::local_path(&path) {
             api::warn(self.hwnd, &err);
             return;
@@ -2578,6 +2773,18 @@ impl App {
     }
 
     fn render_status(&mut self) {
+        let shortcut = if self.hotkey {
+            "Ctrl+Alt+Space"
+        } else {
+            "全局快捷键不可用"
+        };
+        if matches!(self.panel, Panel::ContentSettings | Panel::Preview)
+            || (self.content.searching && self.panel != Panel::Settings)
+        {
+            api::put_text(self.status, &self.content.notice(self.panel, shortcut));
+            self.refresh_title();
+            return;
+        }
         let mut mode = "手动刷新".to_string();
         if self.auto_sync {
             let label = REFRESH_PRESETS[self.config.refresh_preset()].1;
@@ -2596,11 +2803,6 @@ impl App {
         };
         let notice =
             format!("{} {}", self.last_notice, self.storage_notice).replace(['\r', '\n'], " ");
-        let shortcut = if self.hotkey {
-            "Ctrl+Alt+Space"
-        } else {
-            "全局快捷键不可用"
-        };
         let text = if self.panel == Panel::Search
             && self.index.is_some()
             && !self.scanning
@@ -2772,6 +2974,7 @@ impl App {
         if let Some(cancel) = self.scan_cancel.take() {
             cancel.store(true, Ordering::SeqCst);
         }
+        self.content.cancel(false);
         let mut state = lock(&self.search_queue.state);
         state.closed = true;
         state.request = None;
@@ -2786,6 +2989,31 @@ impl Drop for App {
         api::delete_font(self.font);
         self.font = std::ptr::null_mut();
     }
+}
+
+fn populate_result_control(results: HWND, rows: impl Iterator<Item = [String; 4]>) {
+    api::send_message(results, style::WM_SETREDRAW, 0, 0);
+    api::send_message(results, style::LVM_DELETEALLITEMS, 0, 0);
+    for (position, values) in rows.enumerate() {
+        for (column, text) in values.iter().enumerate() {
+            let value = api::wide(text);
+            let item = LVITEMW {
+                mask: LVIF_TEXT,
+                iItem: position as i32,
+                iSubItem: column as i32,
+                pszText: value.as_ptr() as *mut u16,
+                ..Default::default()
+            };
+            let message = if column == 0 {
+                style::LVM_INSERTITEMW
+            } else {
+                style::LVM_SETITEMW
+            };
+            api::send_message(results, message, 0, &item as *const LVITEMW as isize);
+        }
+    }
+    api::send_message(results, style::WM_SETREDRAW, 1, 0);
+    unsafe { InvalidateRect(results, std::ptr::null(), 1) };
 }
 
 fn send_event(sender: &Sender<Event>, hwnd: SendHwnd, event: Event) {
@@ -3022,7 +3250,7 @@ mod tests {
             };
             unsafe { read_notification(&notice as *const NMHEADERW as isize, header, results) }
         };
-        assert_eq!(captured, Some(Notification::HeaderClicked(2)));
+        assert_eq!(captured, Some(Notification::HeaderColumn(2)));
         let captured = {
             let notice = NMITEMACTIVATE {
                 hdr: NMHDR {
@@ -3037,6 +3265,33 @@ mod tests {
         };
         assert_eq!(captured, Some(Notification::ResultDoubleClicked(7)));
         assert_eq!(unsafe { read_notification(0, header, results) }, None);
+    }
+
+    #[test]
+    fn content_click_copies_coordinates_even_when_the_first_column_was_not_hit() {
+        let mut result_token = 0_u8;
+        let results = (&mut result_token as *mut u8).cast();
+        let notice = NMITEMACTIVATE {
+            hdr: NMHDR {
+                hwndFrom: results,
+                code: NM_CLICK,
+                ..Default::default()
+            },
+            iItem: -1,
+            ptAction: POINT { x: 255, y: 48 },
+            ..Default::default()
+        };
+        let notification = unsafe {
+            read_notification(
+                &notice as *const NMITEMACTIVATE as LPARAM,
+                std::ptr::null_mut(),
+                results,
+            )
+        };
+        assert_eq!(
+            notification,
+            Some(Notification::ResultClicked { x: 255, y: 48 })
+        );
     }
 
     #[test]

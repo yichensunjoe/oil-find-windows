@@ -173,6 +173,8 @@ pub(super) enum Panel {
     Search,
     Results,
     Settings,
+    ContentSettings,
+    Preview,
 }
 
 impl Panel {
@@ -190,8 +192,8 @@ impl Panel {
         let scale = |value| value * dpi / 96;
         let (desired_width, desired_height) = match self {
             Self::Search => (860, 151),
-            Self::Results => (860, 562),
-            Self::Settings => (860, 422),
+            Self::Results | Self::Preview => (860, 562),
+            Self::Settings | Self::ContentSettings => (860, 422),
         };
         let work_width = (work.right - work.left).max(1);
         let work_height = (work.bottom - work.top).max(1);
@@ -281,6 +283,14 @@ pub(super) fn result_columns(width: i32, dpi: i32) -> [i32; 4] {
     let size = px(93).min(available * 13 / 100).max(1);
     let date = px(183).min(available * 25 / 100).max(1);
     [name, available - name - size - date, size, date]
+}
+
+pub(super) fn content_columns(width: i32, dpi: i32) -> [i32; 4] {
+    let available = (width - 20 * dpi / 96 - 2).max(4);
+    let name = (available * 28 / 100).max(1);
+    let count = (available * 10 / 100).max(1);
+    let location = (available * 15 / 100).max(1);
+    [name, available - name - count - location, count, location]
 }
 
 #[cfg(test)]

@@ -26,4 +26,4 @@ mod time;
 pub use cache::MAX_CACHE_BYTES;
 pub use entry::{compare_entries, Entry, Index, Progress};
 pub use error::Error;
-pub use scan::{scan, MAX_ENTRIES, MAX_ROOTS};
+pub use scan::{scan, validate_scan_roots, MAX_ENTRIES, MAX_ROOTS};
