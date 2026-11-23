@@ -65,6 +65,9 @@ protocol ExternalDriveIndex: AnyObject {
 extension IndexManager: ExternalDriveIndex { }
 
 final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading {
+    private static let indexingDisabledKey = "externalDriveIndexingDisabled"
+    private static let disabledDriveIDsKey = "disabledExternalDriveUUIDs"
+
     struct Row: Identifiable {
         enum Status { case connected, indexing, offline, disabled, exclusionReview }
         var record: ExternalDriveRecord
@@ -125,9 +128,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         persistence = ExternalDrivePersistence(directory: directory)
         self.monitor = monitor; self.discover = discover; self.settingsDefaults = settingsDefaults
         self.makeIndex = makeIndex ?? { IndexManager(config: $0, dbURL: $1, volumeUUID: $2, settingsDefaults: settingsDefaults) }
-        if let initialPreferences {
-            preferences = initialPreferences; enabled = initialPreferences.enabled; ready = true
-        }
+        if let initialPreferences { restorePreferences(initialPreferences) }
         monitor.onChange = { [weak self] in DispatchQueue.main.async { self?.discoverVolumes() } }
         monitor.beforeEject = { [weak self] device in self?.prepareToEject(device: device) }
         monitor.beforeUnmount = { [weak self] uuid in self?.prepareToUnmount(uuid: uuid) }
@@ -151,6 +152,20 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         }
     }
     var usable: Bool { enabled && ready && !stopped }
+    private var disabledDriveIDs: Set<String> {
+        Set(settingsDefaults.stringArray(forKey: Self.disabledDriveIDsKey) ?? [])
+    }
+    private func restorePreferences(_ loaded: ExternalDrivePreferences) {
+        // A failed catalog write can leave an old opt-in on disk. The isolated
+        // application preferences retain revocations independently of the catalog.
+        preferences = loaded
+        preferences.enabled = loaded.enabled && !settingsDefaults.bool(forKey: Self.indexingDisabledKey)
+        let disabledIDs = disabledDriveIDs
+        for i in preferences.drives.indices where disabledIDs.contains(preferences.drives[i].id) {
+            preferences.drives[i].enabled = false
+        }
+        enabled = preferences.enabled; ready = true
+    }
     func start() {
         guard !started else { return }; started = true
         #if DEBUG
@@ -162,7 +177,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
             let loaded = persistence.load()
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.stopped else { return }
-                self.preferences = loaded; self.enabled = loaded.enabled; self.ready = true
+                self.restorePreferences(loaded)
                 self.configurationChanged()
             }
         }
@@ -202,12 +217,30 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
         let preferences = self.preferences, persistence = self.persistence
         ioQueue.async { persistence.save(preferences) }
     }
+    private func persistIndexingPreference(_ value: Any, forKey key: String) {
+        #if DEBUG
+        if snapshot { return }
+        #endif
+        settingsDefaults.set(value, forKey: key)
+    }
+    private func setDriveOptOut(_ uuid: String, disabled: Bool) {
+        var disabledIDs = disabledDriveIDs
+        guard disabledIDs.contains(uuid) != disabled else { return }
+        if disabled {
+            disabledIDs.insert(uuid)
+        } else {
+            disabledIDs.remove(uuid)
+        }
+        persistIndexingPreference(disabledIDs.sorted(), forKey: Self.disabledDriveIDsKey)
+    }
     func setEnabled(_ value: Bool) {
         guard ready, value != enabled else { return }
+        persistIndexingPreference(!value, forKey: Self.indexingDisabledKey)
         enabled = value; preferences.enabled = value; persist(); configurationChanged()
     }
     func setDriveEnabled(_ uuid: String, _ value: Bool) {
         guard usable, let i = preferences.drives.firstIndex(where: { $0.id == uuid }), preferences.drives[i].enabled != value else { return }
+        setDriveOptOut(uuid, disabled: !value)
         preferences.drives[i].enabled = value
         if !value { discardIndex(uuid) }
         persist(); reconcile()
@@ -215,6 +248,8 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
     func remove(_ uuid: String) {
         guard usable, preferences.drives.contains(where: { $0.id == uuid }) else { return }
         discardIndex(uuid); preferences.drives.removeAll { $0.id == uuid }
+        // An explicit removal resets the drive's setting for its next connection.
+        setDriveOptOut(uuid, disabled: false)
         // Keep the mounted volume suppressed until its next mount notification.
         removedUntilDisconnect.insert(uuid)
         volumes.removeValue(forKey: uuid)
@@ -270,6 +305,7 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
             ejectingDevices.formIntersection(Set(eligible.map(\.device)))
             unmountingVolumes.formIntersection(Set(eligible.map { $0.uuid.uppercased() }))
         }
+        let disabledIDs = disabledDriveIDs
         for (uuid, volume) in volumes {
             if let i = preferences.drives.firstIndex(where: { $0.id == uuid }) {
                 let oldPath = preferences.drives[i].path
@@ -282,7 +318,8 @@ final class ExternalDriveCatalog: ObservableObject, ExternalDriveCatalogReading 
                 preferences.drives[i].name = volume.name; preferences.drives[i].path = volume.path
                 if previous[uuid] == nil || previous[uuid]?.path != volume.path { preferences.drives[i].lastConnected = now }
             } else {
-                preferences.drives.append(.init(id: uuid, name: volume.name, path: volume.path, lastConnected: now))
+                preferences.drives.append(.init(id: uuid, name: volume.name, path: volume.path, lastConnected: now,
+                                               enabled: !disabledIDs.contains(uuid)))
             }
         }
         persist(); reconcile()

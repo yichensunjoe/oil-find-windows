@@ -2,7 +2,15 @@
 
 > 项目状态事实源；接力读取当前状态，轮次置顶保留历史。
 
-## 当前状态（2026-11-05，分支 `fix/review-remediation-20261102`）
+## 当前状态（2026-11-23）
+
+- 2026-11-23：完成了两项 P1 修复；下一步做 Windows 10/11 真机及 macOS 实际外置卷验收。
+- Rust 根目录打开或枚举失败时终止重扫，保留旧索引。不可读子目录仍跳过。回归覆盖缓存字节保留和已校验根目录在扫描中消失。
+- Swift 外置卷总开关与单卷关闭状态写入隔离偏好。启动和重新发现卷时优先应用关闭记录。明确移除卷会重置该卷的设置，下次连接时会重新索引。
+- 本机验证：Rust 127 项、Swift 定向 56 项通过。Swift release、fmt、Clippy、Windows 目标类型检查、脚本语法检查通过。独立进程验证了目录清单不可写时的关闭和手动重新开启。
+- Python 脚本 25 项通过，2 项 Windows PowerShell 用例跳过。卸载脚本的签名桩用例首次偶发失败，单独重跑 11 项通过。Windows 结果限额后的排序和产物替换顺序仍待处理。
+
+## 历史状态（2026-11-05，分支 `fix/review-remediation-20261102`）
 
 - Windows 交付改为单文件：`x86_64-pc-windows-msvc` 加 `+crt-static`（`rust/.cargo/config.toml`），`build.ps1`/`build.sh` 只输出 `outputs/windows-amd64/OilFind.exe`，不再复制 CLI、LICENSE 与说明文件。
 - `verify-pe.py` 新增导入表检查：出现 `vcruntime*`/`msvcp*`/`msvcr*`/`concrt*`/`api-ms-win-crt-*`/`ucrtbase.dll` 导入即失败，防止单文件承诺退回“缺 VC++ 运行库打不开”。

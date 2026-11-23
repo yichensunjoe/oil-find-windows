@@ -68,9 +68,9 @@ const SYSTEM_ROOT_DIRS: &[&str] = &[
 
 /// Walks `roots` and returns a metadata-only index.
 ///
-/// The scan is all-or-nothing: cancelling or hitting [`MAX_ENTRIES`] returns an
-/// error instead of a partial index, so callers can never publish a truncated
-/// cache.
+/// Cancelling, hitting [`MAX_ENTRIES`], or failing to enumerate a root returns
+/// an error instead of replacing the previous index. Unreadable descendants
+/// are counted and skipped.
 ///
 /// Work is split per directory, not per subtree. The top level of every root is
 /// read serially; every subdirectory found there is indexed immediately and put
@@ -106,7 +106,7 @@ pub fn scan(
     for root in &normalized {
         let mut pending: Vec<PathBuf> = Vec::new();
         // The root itself is not an entry, but everything below it is.
-        read_directory(&shared, root, &mut entries, &mut pending, &mut dirs)?;
+        read_directory(&shared, root, true, &mut entries, &mut pending, &mut dirs)?;
         drain(&shared, pending, &mut entries)?;
         check_stop(&shared)?;
     }
@@ -131,6 +131,19 @@ pub fn scan(
     })
 }
 
+fn open_directory(directory: &Path) -> Result<fs::ReadDir, Error> {
+    // Recheck directories before descending in case they were replaced after
+    // validation or discovery.
+    let metadata = fs::symlink_metadata(directory).map_err(Error::RootUnreadable)?;
+    if platform::is_link_or_reparse(&metadata) {
+        return Err(Error::LinkRoot);
+    }
+    if !metadata.is_dir() {
+        return Err(Error::NotDirectory);
+    }
+    fs::read_dir(directory).map_err(Error::RootUnreadable)
+}
+
 /// Reads one directory: indexes every child and queues the subdirectories that
 /// still need to be walked.
 ///
@@ -139,24 +152,15 @@ pub fn scan(
 fn read_directory<F: Fn(Progress) + Sync>(
     shared: &Shared<'_, F>,
     directory: &Path,
+    is_root: bool,
     entries: &mut Vec<Entry>,
     pending: &mut Vec<PathBuf>,
     dirs: &mut DirCache,
 ) -> Result<(), Error> {
-    // A directory may have been replaced after it was queued. Check it again
-    // before descending instead of letting read_dir follow a newly created link.
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() && !platform::is_link_or_reparse(&metadata) => {}
-        _ => {
-            shared.skip(directory);
-            return Ok(());
-        }
-    }
-    let reader = match fs::read_dir(directory) {
+    let reader = match open_directory(directory) {
         Ok(reader) => reader,
+        Err(err) if is_root => return Err(err),
         Err(_) => {
-            // Unreadable directories are counted and skipped; one bad branch
-            // must not abort the scan.
             shared.skip(directory);
             return Ok(());
         }
@@ -165,6 +169,7 @@ fn read_directory<F: Fn(Progress) + Sync>(
         check_stop(shared)?;
         let item = match item {
             Ok(item) => item,
+            Err(err) if is_root => return Err(Error::RootUnreadable(err)),
             Err(_) => {
                 shared.skip(directory);
                 continue;
@@ -253,7 +258,14 @@ fn drain<F: Fn(Progress) + Sync>(
                 // One directory table per worker: a directory is walked by a
                 // single worker, so siblings still share their parent.
                 let mut dirs = DirCache::default();
-                let result = read_directory(shared, &directory, &mut entries, &mut next, &mut dirs);
+                let result = read_directory(
+                    shared,
+                    &directory,
+                    false,
+                    &mut entries,
+                    &mut next,
+                    &mut dirs,
+                );
                 // Publish before dropping `active`, so the queue is never seen
                 // as empty while this worker still owns work.
                 if !next.is_empty() {

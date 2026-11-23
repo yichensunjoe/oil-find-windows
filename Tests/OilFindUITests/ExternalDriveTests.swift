@@ -13,6 +13,18 @@ final class ExternalDriveTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url
     }
+    private func isolatedSettings(_ suite: String = "OilFindExternalTests-" + UUID().uuidString) throws -> UserDefaults {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+    private func denyCatalogWrites(in directory: URL) throws {
+        let files = FileManager.default
+        try files.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        addTeardownBlock { try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        let probe = directory.appendingPathComponent("write-probe")
+        try XCTSkipIf((try? Data().write(to: probe, options: .atomic)) != nil, "The test process can still write to this directory")
+    }
     private func store(path: String) -> IndexStore {
         var buffer = ScanBuffer()
         buffer.ids = [0, 1]; buffer.parents = [0, 0]; buffer.sizes = [0, 1024]; buffer.mtimes = [0, 1_790_000_000]
@@ -128,6 +140,68 @@ final class ExternalDriveTests: XCTestCase {
         try waitUntil("previously enabled catalog") { catalog.ready && catalog.enabled && index.starts == 1 }
         XCTAssertEqual(monitor.starts, 1)
         XCTAssertTrue(persistence.load().enabled)
+    }
+
+    func testMasterDisableSurvivesCatalogWriteFailure() throws {
+        let suite = "OilFindExternalMasterDisable-" + UUID().uuidString
+        let defaults = try isolatedSettings(suite), directory = temporaryDirectory()
+        let persistence = ExternalDrivePersistence(directory: directory)
+        persistence.save(.init(enabled: true))
+        try denyCatalogWrites(in: directory)
+        let index = Index()
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { [self.volume] },
+                                          settingsDefaults: defaults, makeIndex: { _, _, _ in index })
+        defer { catalog.stop() }
+        catalog.start()
+        try waitUntil("original opt-in starts indexing") { index.starts == 1 }
+        catalog.setEnabled(false)
+        XCTAssertFalse(catalog.enabled)
+        XCTAssertEqual(index.stops, 1)
+        catalog.stop()
+        XCTAssertTrue(persistence.load().enabled, "The old catalog must still authorize indexing")
+
+        let monitor = Monitor()
+        let reopened = ExternalDriveCatalog(directory: directory, monitor: monitor,
+                                           discover: { [self.volume] },
+                                           settingsDefaults: try XCTUnwrap(UserDefaults(suiteName: suite)),
+                                           makeIndex: { _, _, _ in Index() })
+        defer { reopened.stop() }
+        reopened.start()
+        try waitUntil("restart loads settings") { reopened.ready }
+        XCTAssertFalse(reopened.enabled)
+        XCTAssertEqual(monitor.starts, 0, "A stale catalog must not start monitoring or scanning")
+    }
+
+    func testDriveDisableSurvivesCatalogWriteFailure() throws {
+        for knownDrive in [true, false] {
+            let suite = "OilFindExternalDriveDisable-" + UUID().uuidString
+            let defaults = try isolatedSettings(suite), directory = temporaryDirectory()
+            let persistence = ExternalDrivePersistence(directory: directory)
+            let drive = ExternalDriveRecord(id: uuid, name: volume.name, path: volume.path, lastConnected: Date())
+            persistence.save(.init(enabled: true, drives: knownDrive ? [drive] : []))
+            try denyCatalogWrites(in: directory)
+            let index = Index()
+            let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { [self.volume] },
+                                              settingsDefaults: defaults, makeIndex: { _, _, _ in index })
+            defer { catalog.stop() }
+            catalog.start()
+            try waitUntil("drive starts indexing") { index.starts == 1 }
+            catalog.setDriveEnabled(uuid, false)
+            XCTAssertEqual(index.stops, 1)
+            catalog.stop()
+            XCTAssertEqual(persistence.load().drives.map(\.enabled), knownDrive ? [true] : [])
+
+            let nextIndex = Index()
+            let reopened = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { [self.volume] },
+                                               settingsDefaults: try XCTUnwrap(UserDefaults(suiteName: suite)),
+                                               makeIndex: { _, _, _ in nextIndex })
+            defer { reopened.stop() }
+            reopened.start()
+            try waitUntil("drive is rediscovered after restart") { reopened.rows.first?.id == self.uuid }
+            XCTAssertTrue(reopened.enabled)
+            XCTAssertEqual(reopened.rows.first?.status, .disabled)
+            XCTAssertEqual(nextIndex.starts, 0, "Rediscovery must honor the user's previous opt-out")
+        }
     }
 
     func testUserExclusionsAndScopeFollowExternalDriveSettings() throws {
@@ -413,7 +487,8 @@ final class ExternalDriveTests: XCTestCase {
     func testPreEjectStopsWholeDeviceBeforeReturningAndWithdrawsSources() throws {
         var indexes: [Index] = []
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in
+                                          initialPreferences: .init(enabled: true), settingsDefaults: try isolatedSettings(),
+                                          makeIndex: { _, _, _ in
             let index = Index(); indexes.append(index); return index
         })
         defer { catalog.stop() }
@@ -432,7 +507,8 @@ final class ExternalDriveTests: XCTestCase {
         var second = volume; second.uuid = secondUUID; second.name = "Second"; second.path = "/Volumes/Second"
         var mounted = [volume, second], indexes: [Index] = [], indexesByID: [String: Index] = [:]
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(enabled: true), discover: { mounted }, makeIndex: { _, _, id in
+                                          initialPreferences: .init(enabled: true), discover: { mounted },
+                                          settingsDefaults: try isolatedSettings(), makeIndex: { _, _, id in
             let index = Index(); indexes.append(index); indexesByID[id] = index; return index
         })
         defer { catalog.stop() }
@@ -459,7 +535,8 @@ final class ExternalDriveTests: XCTestCase {
         var indexes: [Index] = []
         let mounted = [volume]
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(enabled: true), discover: { mounted }, makeIndex: { _, _, _ in
+                                          initialPreferences: .init(enabled: true), discover: { mounted },
+                                          settingsDefaults: try isolatedSettings(), makeIndex: { _, _, _ in
             let index = Index(); indexes.append(index); return index
         })
         defer { catalog.stop() }
@@ -485,7 +562,8 @@ final class ExternalDriveTests: XCTestCase {
     func testRemoveDeletesCatalogAndOnlyRecreatesAfterNextConnection() throws {
         let directory = temporaryDirectory(); var indexes: [Index] = []
         let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(),
-                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
+                                          initialPreferences: .init(enabled: true), settingsDefaults: try isolatedSettings(),
+                                          makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
         let first = try XCTUnwrap(indexes.first)
@@ -506,10 +584,34 @@ final class ExternalDriveTests: XCTestCase {
         L10n.snapshotChinese = nil
     }
 
+    func testRemovingADisabledDriveLetsItIndexOnReconnect() throws {
+        var indexes: [Index] = []
+        let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
+                                          initialPreferences: .init(enabled: true), settingsDefaults: try isolatedSettings(),
+                                          makeIndex: { _, _, _ in
+            let index = Index(); indexes.append(index); return index
+        })
+        defer { catalog.stop() }
+        catalog.updateMounted([volume])
+        catalog.setDriveEnabled(uuid, false)
+        XCTAssertEqual(catalog.rows.first?.status, .disabled)
+
+        catalog.remove(uuid)
+        catalog.updateMounted([volume])
+        XCTAssertTrue(catalog.rows.isEmpty)
+        XCTAssertEqual(indexes.count, 1)
+
+        catalog.updateMounted([])
+        catalog.updateMounted([volume])
+        XCTAssertEqual(indexes.count, 2)
+        XCTAssertEqual(try XCTUnwrap(indexes.last).starts, 1)
+    }
+
     func testProgressDoesNotInvalidateSearchUntilSourceStoreOrOnlineStateChanges() throws {
         var indexes: [Index] = [], changes = 0
         let catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(),
-                                          initialPreferences: .init(enabled: true), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
+                                          initialPreferences: .init(enabled: true), settingsDefaults: try isolatedSettings(),
+                                          makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.onSourcesChange = { changes += 1 }
         catalog.updateMounted([volume]); XCTAssertEqual(changes, 0)
@@ -528,6 +630,7 @@ final class ExternalDriveTests: XCTestCase {
         let directory = temporaryDirectory(), monitor = Monitor()
         var indexes: [Index] = []
         let catalog = ExternalDriveCatalog(directory: directory, monitor: monitor, initialPreferences: .init(enabled: true), discover: { [self.volume] },
+                                          settingsDefaults: try isolatedSettings(),
                                           makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
@@ -553,6 +656,7 @@ final class ExternalDriveTests: XCTestCase {
         let directory = temporaryDirectory()
         var indexes: [Index] = [], urls: [URL] = []
         let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), initialPreferences: .init(enabled: true),
+                                          settingsDefaults: try isolatedSettings(),
                                           makeIndex: { _, url, _ in urls.append(url); let index = Index(); indexes.append(index); return index })
         defer { catalog.stop() }
         catalog.updateMounted([volume])
@@ -598,7 +702,8 @@ final class ExternalDriveTests: XCTestCase {
 
     func testPublicSnapshotArgumentsHaveThreeRowsAndNoPersistentIO() throws {
         let directory = temporaryDirectory()
-        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { XCTFail("Snapshot discovery"); return [] })
+        let catalog = ExternalDriveCatalog(directory: directory, monitor: Monitor(), discover: { XCTFail("Snapshot discovery"); return [] },
+                                          settingsDefaults: try isolatedSettings())
         var arguments = ["--snapshot", "/tmp/settings.png", "--external-drives-sample", "--allow-external-disk-images"]
         try catalog.prepareArguments(&arguments)
         XCTAssertEqual(arguments, ["--snapshot", "/tmp/settings.png"])
@@ -610,7 +715,7 @@ final class ExternalDriveTests: XCTestCase {
 
     func testDisconnectedNotificationWaitsForApprovalCatalogSave() throws {
         let index = Index(), catalog = ExternalDriveCatalog(directory: temporaryDirectory(), monitor: Monitor(), initialPreferences: .init(enabled: true),
-                                                            makeIndex: { _, _, _ in index })
+                                                            settingsDefaults: try isolatedSettings(), makeIndex: { _, _, _ in index })
         defer { catalog.stop() }
         catalog.updateMounted([volume]); index.complete(store(path: volume.path))
         var saved = false, disconnected = false
@@ -649,7 +754,7 @@ final class ExternalDriveTests: XCTestCase {
                 return [staleVolume]
             }
             return [current]
-        }, makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
+        }, settingsDefaults: try isolatedSettings(), makeIndex: { _, _, _ in let index = Index(); indexes.append(index); return index })
         defer { releaseDiscovery.signal(); catalog.stop() }
         catalog.onSourcesChange = { changes += 1 }
         catalog.updateMounted([current])

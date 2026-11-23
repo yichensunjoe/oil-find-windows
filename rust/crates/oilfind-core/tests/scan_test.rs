@@ -389,6 +389,25 @@ fn scan_skips_unreadable_directories_and_keeps_going() {
 }
 
 #[test]
+fn scan_rejects_a_root_that_disappears_after_validation() {
+    let dir = TempDir::new("scan-lost-root");
+    let first = dir.mkdir("first");
+    let file = dir.write("first/visible.txt", "fixture");
+    let second = dir.mkdir("second");
+    let cancel = AtomicBool::new(false);
+    let result = scan(&cancel, &[first, second.clone()], |progress| {
+        if progress.current == file {
+            fs::remove_dir(&second).expect("remove the second empty root after validation");
+        }
+    });
+
+    assert!(
+        matches!(&result, Err(Error::RootUnreadable(err)) if err.kind() == std::io::ErrorKind::NotFound),
+        "disappearing root should fail the whole scan: {result:?}"
+    );
+}
+
+#[test]
 fn scan_accepts_a_directory_created_just_now() {
     let dir = TempDir::new("scan-empty");
     let index = run_scan(&[dir.path().to_path_buf()]).expect("scan");
