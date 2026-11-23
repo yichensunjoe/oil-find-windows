@@ -2,9 +2,7 @@
 # 在 macOS/Linux 上交叉编译 Windows 产物。
 #
 # 真正的发布包由 Windows 宿主（或 CI 的 windows-latest）上的 build.ps1 生成：
-# 这里除了 MSVC 链接器，还依赖 Windows 资源编译器把 app.manifest 嵌进 exe
-# （build.rs 只在 Windows 宿主上执行 embed-resource），因此允许失败，但必须
-# 明确告诉调用方缺什么。
+# 交叉编译依赖 MSVC 链接器和 Windows 资源编译器。仅发布通过校验的产物。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,15 +43,10 @@ if ! cargo build --release --target "$TARGET" --target-dir "$TARGET_DIR" -p oilf
     echo "" >&2
     echo "交叉编译失败：需要 Windows 工具链。" >&2
     echo "  - 链接 x86_64-pc-windows-msvc 需要 MSVC 链接器（如 cargo-xwin / xwin 提供的 lld-link）；" >&2
-    echo "  - 嵌入 app.manifest 需要 Windows 资源编译器，仅在 Windows 宿主上由 build.rs 执行。" >&2
+    echo "  - 嵌入 app.manifest 需要 Windows 资源编译器。" >&2
     echo "请在 Windows 上运行 rust/scripts/build.ps1 生成正式产物。" >&2
     exit 1
 fi
-
-# 单文件交付：清掉上一轮遗留的 CLI、文档等文件，只保留 OilFind.exe。
-rm -rf "$OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"
-cp "$RELEASE_DIR/oilfind-win.exe" "$OUTPUT_DIR/OilFind.exe"
 
 PYTHON="${PYTHON_BIN:-python3}"
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
@@ -61,10 +54,8 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! "$PYTHON" "$SCRIPT_DIR/verify-pe.py" --arch amd64 "$OUTPUT_DIR/OilFind.exe"; then
-    echo "" >&2
-    echo "PE 校验失败：交叉编译产物通常缺少嵌入清单，因为 build.rs 只在 Windows 宿主上执行" >&2
-    echo "embed-resource。请在 Windows 上用 build.ps1 打包，或改用 GitHub Actions。" >&2
+if ! "$PYTHON" "$SCRIPT_DIR/package-windows.py" "$RELEASE_DIR/oilfind-win.exe" "$OUTPUT_DIR"; then
+    echo "打包失败。若产物缺少嵌入清单，请检查资源编译器或在 Windows 上运行 build.ps1。" >&2
     exit 1
 fi
 

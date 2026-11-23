@@ -123,7 +123,7 @@ class BuildScriptTests(unittest.TestCase):
         self.rust = self.project / "rust"
         self.scripts = self.rust / "scripts"
         self.scripts.mkdir(parents=True)
-        for name in ("build.sh", "build.ps1", "package-mac.sh", "verify-pe.py"):
+        for name in ("build.sh", "build.ps1", "package-mac.sh", "package-windows.py", "verify-pe.py"):
             shutil.copy2(SCRIPTS / name, self.scripts / name)
         shutil.copy2(RUST_TOOLCHAIN, self.rust / "rust-toolchain.toml")
         (self.rust / "Cargo.toml").write_text(
@@ -195,7 +195,7 @@ class BuildScriptTests(unittest.TestCase):
         self.assertTrue(versions)
         self.assertTrue(all(line.startswith("rustc 1.92.0 ") for line in versions), versions)
 
-    def run_powershell(self, env, expect_success):
+    def run_powershell(self, env, expect_success, error_contains=None):
         env["OILFIND_FIXTURE_SCRIPT"] = str(self.scripts / "build.ps1")
         env["OILFIND_FIXTURE_PYTHON"] = sys.executable
         env["OILFIND_TEST_POST_ENV"] = str(self.base / "environment-after.json")
@@ -205,6 +205,8 @@ class BuildScriptTests(unittest.TestCase):
             cwd=self.caller, env=env, capture_output=True, text=True, timeout=180,
         )
         self.assertEqual(result.returncode, 0 if expect_success else 1, result.stdout + result.stderr)
+        if error_contains:
+            self.assertIn(error_contains, result.stderr)
         after = json.loads(Path(env["OILFIND_TEST_POST_ENV"]).read_text(encoding="utf-8-sig"))
         self.assertEqual(after["success"], expect_success)
         self.assertEqual(after["beforeTemp"], env.get("TEMP"))
@@ -231,6 +233,55 @@ class BuildScriptTests(unittest.TestCase):
             used.add(directory)
         self.assertEqual(len(used), 1, used)
         return used.pop()
+
+    def seed_windows_output(self):
+        output = self.project / "outputs" / "windows-amd64"
+        previous_manifest = VALID_MANIFEST.replace(b"<assembly ", b'<assembly fixture="previous" ', 1)
+        contents = {
+            "OilFind.exe": synthetic_pe(manifest=previous_manifest),
+            "oilfind-cli.exe": b"legacy CLI",
+            "USAGE.txt": b"legacy instructions",
+            "LICENSES/Apache-2.0.txt": b"legacy Apache license",
+            "LICENSES/MIT.txt": b"legacy MIT license",
+        }
+        for name, payload in contents.items():
+            path = output / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        return output, contents
+
+    def assert_output_contents(self, output, contents):
+        for name, payload in contents.items():
+            self.assertEqual((output / name).read_bytes(), payload, name)
+        self.assertEqual({path.name for path in output.iterdir()}, {Path(name).parts[0] for name in contents})
+
+    def test_successful_packaging_preserves_unrelated_files(self):
+        output, _ = self.seed_windows_output()
+        source = self.base / "new OilFind.exe"
+        payload = synthetic_pe()
+        source.write_bytes(payload)
+        if os.name == "posix":
+            source.chmod(0o755)
+        (output / "USAGE.txt").unlink()
+        survivors = {
+            "keep.txt": b"personal notes",
+            "LICENSES/keep.txt": b"custom attribution",
+            "USAGE.txt/keep.txt": b"extra documentation",
+        }
+        for name, data in survivors.items():
+            path = output / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+        result = subprocess.run(
+            [sys.executable, str(self.scripts / "package-windows.py"), str(source), str(output)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_output_contents(output, {"OilFind.exe": payload, **survivors})
+        self.assertEqual(sorted(path.name for path in (output / "LICENSES").iterdir()), ["keep.txt"])
+        if os.name == "posix":
+            self.assertEqual((output / "OilFind.exe").stat().st_mode & 0o777, 0o755)
 
     def target_cases(self):
         return (
@@ -293,12 +344,31 @@ class BuildScriptTests(unittest.TestCase):
                 env = self.environment(configured)
                 env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"] = str(linker)
                 env["OILFIND_FIXTURE_PE"] = str(pe)
+                output, _ = self.seed_windows_output()
                 self.run_script(["bash", str(self.scripts / "build.sh")], env)
                 release = target / WINDOWS_TARGET / "release"
-                output = self.project / "outputs" / "windows-amd64"
                 self.assertEqual(sorted(path.name for path in output.iterdir()), ["OilFind.exe"])
                 self.assertEqual((output / "OilFind.exe").read_bytes(), (release / "oilfind-win.exe").read_bytes())
                 self.assertNotEqual((output / "OilFind.exe").read_bytes(), (stale / "oilfind-win.exe").read_bytes())
+
+    @unittest.skipUnless(os.name == "posix", "shell packaging requires POSIX")
+    def test_windows_cross_build_preserves_previous_package_on_pe_failure(self):
+        target = self.base / "invalid PE target"
+        release = target / WINDOWS_TARGET / "release"
+        release.mkdir(parents=True)
+        (release / "oilfind-win.exe").write_bytes(synthetic_pe(subsystem=3))
+        executable(self.bin / "cargo", "#!/bin/sh\nexit 0\n")
+        executable(self.bin / "rustup", f"#!/bin/sh\nprintf '%s\\n' {WINDOWS_TARGET}\n")
+        env = self.environment(str(target))
+        output, contents = self.seed_windows_output()
+
+        result = subprocess.run(
+            ["bash", str(self.scripts / "build.sh")], cwd=self.caller, env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Not Windows GUI subsystem", result.stderr)
+        self.assert_output_contents(output, contents)
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "Windows PowerShell is unavailable")
     def test_windows_powershell_uses_configured_target_with_real_cargo(self):
@@ -330,15 +400,29 @@ class BuildScriptTests(unittest.TestCase):
                     TEMP=str(original_temp), TMP=str(original_tmp),
                     OILFIND_TEST_TEMP_LOG=str(log), OILFIND_FIXTURE_PROJECT=str(self.project),
                 )
+                output, _ = self.seed_windows_output()
                 used.add(self.run_powershell(env, expect_success=True))
                 gui = [p for p in target.rglob("oilfind-win.exe") if p.parent.name == "release"]
                 self.assertEqual(len(gui), 1, gui)
-                output = self.project / "outputs" / "windows-amd64"
                 self.assertEqual(sorted(path.name for path in output.iterdir()), ["OilFind.exe"])
                 self.assertEqual((output / "OilFind.exe").read_bytes(), gui[0].read_bytes())
         self.assertEqual(len(used), 2, used)
         self.assertEqual(sentinel.read_text(), "do not delete")
         self.assertEqual(set(self.project.glob(".oilfind-build-temp-*")), {existing})
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "Windows PowerShell is unavailable")
+    def test_windows_powershell_preserves_previous_package_on_pe_failure(self):
+        # The fixture crate produces a real console PE, which the GUI verifier rejects.
+        output, contents = self.seed_windows_output()
+        log = self.base / "pe-failure-temp-logs"
+        log.mkdir()
+        env = self.environment(str(self.base / "invalid PE target"))
+        env.update(
+            OILFIND_TEST_TEMP_LOG=str(log), OILFIND_FIXTURE_PROJECT=str(self.project),
+        )
+
+        self.run_powershell(env, expect_success=False, error_contains="Not Windows GUI subsystem")
+        self.assert_output_contents(output, contents)
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "Windows PowerShell is unavailable")
     def test_windows_powershell_restores_temp_after_cargo_failure(self):

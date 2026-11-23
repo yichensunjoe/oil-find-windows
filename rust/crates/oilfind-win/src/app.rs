@@ -6,6 +6,7 @@
 //! - 进度通过 `PostMessage(WM_APP + 2)` 通知，UI 线程读取最新的进度快照。
 
 use std::cell::{Cell, RefCell};
+use std::cmp;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -296,11 +297,51 @@ enum Event {
     },
 }
 
+#[derive(Clone, Copy)]
+struct ResultSort {
+    column: usize,
+    descending: bool,
+}
+
+impl ResultSort {
+    fn compare(self, a: &Entry, b: &Entry) -> cmp::Ordering {
+        let order = match self.column {
+            0 => a.lower_name().cmp(b.lower_name()),
+            1 => compare_entries(a, b),
+            2 => a.size.cmp(&b.size),
+            _ => a.modified.cmp(&b.modified),
+        };
+        if self.descending {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+}
+
 struct SearchRequest {
     generation: u64,
     index: Arc<Index>,
     query: String,
     kind: Option<String>,
+    sort: Vec<ResultSort>,
+}
+
+impl SearchRequest {
+    fn run(&self) -> Result<(Vec<Entry>, usize), oilfind_core::Error> {
+        let kind = self.kind.as_deref();
+        if self.sort.is_empty() {
+            return self.index.search(&self.query, kind, RESULT_LIMIT);
+        }
+        self.index
+            .search_by(&self.query, kind, RESULT_LIMIT, |a, b| {
+                self.sort
+                    .iter()
+                    .map(|sort| sort.compare(a, b))
+                    .find(|order| !order.is_eq())
+                    .unwrap_or(cmp::Ordering::Equal)
+            })
+    }
 }
 
 /// 容量为 1 的搜索请求信箱：新请求直接替换尚未开始执行的旧请求，
@@ -339,9 +380,8 @@ struct App {
     empty: HWND,
     /// 结果列表的表头控件，用于排序点击与排序箭头。
     header: HWND,
-    /// 当前排序列；None 表示按搜索相关度顺序，不显示箭头。
-    sort_column: Option<usize>,
-    sort_descending: bool,
+    /// Active header sort first, followed by earlier columns for ties.
+    sort: Vec<ResultSort>,
     config: Config,
     config_path: Option<PathBuf>,
     cache_path: Option<PathBuf>,
@@ -714,8 +754,7 @@ impl App {
             progress: std::ptr::null_mut(),
             empty: std::ptr::null_mut(),
             header: std::ptr::null_mut(),
-            sort_column: None,
-            sort_descending: false,
+            sort: Vec::new(),
             config: Config::default(),
             config_path,
             cache_path,
@@ -1284,16 +1323,17 @@ impl App {
         if column >= 4 {
             return;
         }
-        if self.sort_column == Some(column) {
-            self.sort_descending = !self.sort_descending;
-        } else {
-            self.sort_column = Some(column);
-            self.sort_descending = false;
-        }
-        // set_rows 会按当前排序列重排，随后刷新表头箭头。
-        let rows = std::mem::take(&mut self.rows);
-        self.set_rows(rows);
+        let descending = self
+            .sort
+            .first()
+            .is_some_and(|sort| sort.column == column && !sort.descending);
+        // A stable header sort keeps earlier column orders for equal values.
+        self.sort.retain(|sort| sort.column != column);
+        self.sort.insert(0, ResultSort { column, descending });
         self.refresh_header();
+        if self.index.is_some() {
+            self.queue_search();
+        }
     }
 
     /// 重画表头文字：排序列带 ▲/▼，其余列显示纯名称。
@@ -1304,8 +1344,8 @@ impl App {
         const LABELS: [&str; 4] = ["文件名", "完整路径", "大小", "修改日期"];
         for (position, label) in LABELS.iter().enumerate() {
             let mut text = (*label).to_string();
-            if self.sort_column == Some(position) {
-                text.push(if self.sort_descending { '▼' } else { '▲' });
+            if let Some(sort) = self.sort.first().filter(|sort| sort.column == position) {
+                text.push(if sort.descending { '▼' } else { '▲' });
             }
             let buffer = api::wide(&text);
             let item = HDITEMW {
@@ -1550,10 +1590,7 @@ impl App {
                 state.request.take()
             };
             let Some(request) = request else { continue };
-            let outcome = request
-                .index
-                .search(&request.query, request.kind.as_deref(), RESULT_LIMIT)
-                .map_err(|err| err.to_string());
+            let outcome = request.run().map_err(|err| err.to_string());
             if sender
                 .send(Event::Search {
                     generation: request.generation,
@@ -1568,6 +1605,12 @@ impl App {
     }
 
     fn search_now(&mut self) {
+        // A fresh result set uses relevance for ties in the active column.
+        self.sort.truncate(1);
+        self.queue_search();
+    }
+
+    fn queue_search(&mut self) {
         self.search_generation += 1;
         let Some(index) = self.index.clone() else {
             self.set_rows(Vec::new());
@@ -1599,6 +1642,7 @@ impl App {
             index,
             query,
             kind,
+            sort: self.sort.clone(),
         };
         // 信箱容量为 1：直接替换尚未执行的请求，UI 线程不会阻塞。
         let mut state = lock(&self.search_queue.state);
@@ -1748,11 +1792,7 @@ impl App {
         }
     }
 
-    fn set_rows(&mut self, mut entries: Vec<Entry>) {
-        // 有排序列时结果按列呈现；否则保持搜索相关度顺序。
-        if let Some(column) = self.sort_column {
-            sort_rows(&mut entries, column, self.sort_descending);
-        }
+    fn set_rows(&mut self, entries: Vec<Entry>) {
         api::send_message(self.results, style::WM_SETREDRAW, 0, 0);
         api::send_message(self.results, style::LVM_DELETEALLITEMS, 0, 0);
         self.rows = entries;
@@ -2195,25 +2235,6 @@ fn send_event(sender: &Sender<Event>, hwnd: SendHwnd, event: Event) {
     }
 }
 
-/// 按列排序结果行。列：0 文件名、1 完整路径、2 大小、3 修改日期；
-/// descending 时反转比较结果。排序稳定，同列值保持原顺序。
-fn sort_rows(rows: &mut [Entry], column: usize, descending: bool) {
-    rows.sort_by(|a, b| {
-        let order = match column {
-            0 => a.lower_name().cmp(b.lower_name()),
-            // 与索引顺序一致：先比目录再比文件名，不分配完整路径。
-            1 => compare_entries(a, b),
-            2 => a.size.cmp(&b.size),
-            _ => a.modified.cmp(&b.modified),
-        };
-        if descending {
-            order.reverse()
-        } else {
-            order
-        }
-    });
-}
-
 /// 千分位分组：标题与状态栏的大数字更易读。
 fn group_digits(value: usize) -> String {
     let digits = value.to_string();
@@ -2437,36 +2458,109 @@ mod tests {
         rows.iter().map(|entry| entry.name()).collect()
     }
 
+    fn sorted_fixture(column: usize, descending: bool) -> Vec<Entry> {
+        SearchRequest {
+            generation: 0,
+            index: Arc::new(Index {
+                entries: fixture(),
+                roots: Vec::new(),
+                built_at: 0,
+            }),
+            query: String::new(),
+            kind: None,
+            sort: vec![ResultSort { column, descending }],
+        }
+        .run()
+        .expect("column search")
+        .0
+    }
+
     #[test]
     fn sort_by_name_ignores_case_in_both_directions() {
-        let mut rows = fixture();
-        sort_rows(&mut rows, 0, false);
+        let rows = sorted_fixture(0, false);
         assert_eq!(names(&rows), vec!["A.txt", "b.txt", "c.txt"]);
-        sort_rows(&mut rows, 0, true);
+        let rows = sorted_fixture(0, true);
         assert_eq!(names(&rows), vec!["c.txt", "b.txt", "A.txt"]);
     }
 
     #[test]
     fn sort_by_path_orders_directories_before_names() {
-        let mut rows = fixture();
-        sort_rows(&mut rows, 1, false);
+        let rows = sorted_fixture(1, false);
         assert_eq!(names(&rows), vec!["A.txt", "b.txt", "c.txt"]);
-        sort_rows(&mut rows, 1, true);
+        let rows = sorted_fixture(1, true);
         assert_eq!(names(&rows), vec!["c.txt", "b.txt", "A.txt"]);
     }
 
     #[test]
     fn sort_by_size_and_date_uses_numbers_not_text() {
-        let mut rows = fixture();
-        sort_rows(&mut rows, 2, false);
+        let rows = sorted_fixture(2, false);
         let sizes: Vec<u64> = rows.iter().map(|entry| entry.size).collect();
         assert_eq!(sizes, vec![10, 20, 30]);
-        sort_rows(&mut rows, 2, true);
+        let rows = sorted_fixture(2, true);
         let sizes: Vec<u64> = rows.iter().map(|entry| entry.size).collect();
         assert_eq!(sizes, vec![30, 20, 10]);
-        sort_rows(&mut rows, 3, false);
+        let rows = sorted_fixture(3, false);
         let stamps: Vec<i64> = rows.iter().map(|entry| entry.modified).collect();
         assert_eq!(stamps, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn column_search_uses_all_matches_before_limiting_results() {
+        const MATCHES: usize = RESULT_LIMIT + 17;
+        let root = PathBuf::from("fixture");
+        let mut entries: Vec<Entry> = (0..MATCHES)
+            .map(|position| {
+                let name = format!("report-{:05}.txt", MATCHES - position - 1);
+                let path = root.join(format!("{position:05}")).join(&name);
+                Entry::new(path, name, position as u64, position as i64, false)
+            })
+            .collect();
+        entries.push(Entry::new(
+            root.join("report.jpg"),
+            "report.jpg".into(),
+            u64::MAX,
+            i64::MAX,
+            false,
+        ));
+        entries.push(Entry::new(
+            root.join("unrelated.txt"),
+            "unrelated.txt".into(),
+            u64::MAX,
+            i64::MAX,
+            false,
+        ));
+        let index = Arc::new(Index {
+            entries,
+            roots: vec![root],
+            built_at: 0,
+        });
+
+        for (column, name_order_is_reversed) in [(0, true), (1, false), (2, false), (3, false)] {
+            for descending in [false, true] {
+                let request = SearchRequest {
+                    generation: 0,
+                    index: Arc::clone(&index),
+                    query: "report".into(),
+                    kind: Some("doc".into()),
+                    sort: vec![ResultSort { column, descending }],
+                };
+                let (rows, total) = request.run().expect("column search");
+                assert_eq!(total, MATCHES);
+                assert_eq!(rows.len(), RESULT_LIMIT);
+                for (offset, entry) in rows.iter().enumerate() {
+                    let position = if descending != name_order_is_reversed {
+                        MATCHES - offset - 1
+                    } else {
+                        offset
+                    };
+                    assert_eq!(
+                        entry.name(),
+                        format!("report-{:05}.txt", MATCHES - position - 1),
+                        "column {column}, descending {descending}, row {offset}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2475,5 +2569,33 @@ mod tests {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(1_000), "1,000");
         assert_eq!(group_digits(1_532_419), "1,532,419");
+    }
+
+    #[test]
+    fn changing_columns_preserves_the_previous_order_for_equal_values() {
+        let mut entries = fixture();
+        entries[2].size = 10;
+        let request = SearchRequest {
+            generation: 0,
+            index: Arc::new(Index {
+                entries,
+                roots: Vec::new(),
+                built_at: 0,
+            }),
+            query: String::new(),
+            kind: None,
+            sort: vec![
+                ResultSort {
+                    column: 2,
+                    descending: false,
+                },
+                ResultSort {
+                    column: 0,
+                    descending: true,
+                },
+            ],
+        };
+        let (rows, _) = request.run().expect("column search");
+        assert_eq!(names(&rows), vec!["c.txt", "b.txt", "A.txt"]);
     }
 }

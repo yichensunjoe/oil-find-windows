@@ -59,7 +59,7 @@ bash scripts/build.sh
 bash scripts/package-mac.sh   # 产出 build/Oil Find Rust.app 与 outputs/OilFind-Rust-macOS-preview.zip
 ```
 
-Windows 产物是单文件 `outputs/windows-amd64/OilFind.exe`：静态链接 C 运行库（不依赖 VC++ 运行库或同目录 DLL），MIT 许可与第三方声明编入 exe，双击即可运行；构建脚本会清掉该目录里的旧 CLI/文档文件。
+Windows 产物是单文件 `outputs/windows-amd64/OilFind.exe`。它静态链接 C 运行库，不依赖 VC++ 运行库或同目录 DLL。MIT 许可与第三方声明编入 exe，双击即可运行。构建脚本在 PE 校验通过后替换 EXE，并清理旧版打包生成的 CLI 和文档。
 
 ### macOS Swift 基线
 

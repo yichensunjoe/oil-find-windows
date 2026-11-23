@@ -68,8 +68,6 @@ function Restore-ProcessVariable {
     }
 }
 
-New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-
 $PreviousTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 $PreviousTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
 $BuildTempDir = Join-Path $ProjectDir (".oilfind-build-temp-" + [Guid]::NewGuid().ToString("N"))
@@ -92,13 +90,9 @@ try {
         throw "Build output is missing: $GuiBinary"
     }
 
-    # 单文件交付：输出目录只放 OilFind.exe，先清掉上一轮遗留的 CLI、文档等文件。
-    Get-ChildItem -LiteralPath $OutputDir -Force | Remove-Item -Recurse -Force
-    Copy-Item -LiteralPath $GuiBinary -Destination (Join-Path $OutputDir "OilFind.exe") -Force
-
-    & $PythonExe (Join-Path $ScriptDir "verify-pe.py") --arch amd64 (Join-Path $OutputDir "OilFind.exe")
+    & $PythonExe (Join-Path $ScriptDir "package-windows.py") $GuiBinary $OutputDir
     if ($LASTEXITCODE -ne 0) {
-        throw "PE verification failed: the GUI binary is not a single-file amd64 GUI executable with an embedded asInvoker/PerMonitorV2 manifest."
+        throw "Windows packaging failed with exit code $LASTEXITCODE."
     }
 
     Write-Host "Local Windows build completed: $OutputDir\OilFind.exe"

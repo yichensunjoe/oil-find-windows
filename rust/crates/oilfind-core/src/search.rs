@@ -9,6 +9,7 @@ use crate::entry::{extension_of, Entry, Index};
 use crate::error::Error;
 use crate::time;
 use regex::Regex;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 /// Maximum accepted query length, in bytes.
@@ -41,8 +42,8 @@ impl Compiled {
 }
 
 /// A retained candidate together with its relevance score.
-struct Ranked {
-    entry: Entry,
+struct Ranked<'a> {
+    entry: Cow<'a, Entry>,
     score: i64,
 }
 
@@ -57,6 +58,20 @@ impl Index {
         query: &str,
         kind: Option<&str>,
         limit: usize,
+    ) -> Result<(Vec<Entry>, usize), Error> {
+        self.search_by(query, kind, limit, |_, _| Ordering::Equal)
+    }
+
+    /// Orders all matches with the supplied comparison before applying the limit.
+    ///
+    /// A comparison of `Less` puts the first entry earlier in the results.
+    /// Equal entries use the normal relevance and path ordering.
+    pub fn search_by(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        limit: usize,
+        order: impl Fn(&Entry, &Entry) -> Ordering,
     ) -> Result<(Vec<Entry>, usize), Error> {
         let now = time::now_secs();
         let category = match kind {
@@ -79,71 +94,51 @@ impl Index {
             limit => limit.min(MAX_LIMIT),
         };
 
-        let mut heap: Vec<Ranked> = Vec::with_capacity(limit.min(self.entries.len()));
+        let compare = |a: &Ranked<'_>, b: &Ranked<'_>| {
+            order(&a.entry, &b.entry)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.entry.lower_path().cmp(&b.entry.lower_path()))
+        };
+        let mut heap = Vec::with_capacity(limit.min(self.entries.len()));
         let mut total = 0usize;
         for stored in &self.entries {
             // Entries built by an external caller may not have their derived
             // fields populated yet.
-            let prepared;
             let entry = if stored.lower_name().is_empty() {
-                prepared = {
-                    let mut copy = stored.clone();
-                    copy.prepare();
-                    copy
-                };
-                &prepared
+                let mut copy = stored.clone();
+                copy.prepare();
+                Cow::Owned(copy)
             } else {
-                stored
+                Cow::Borrowed(stored)
             };
             if let Some(category) = category.as_ref() {
-                if !category(entry) {
+                if !category(&entry) {
                     continue;
                 }
             }
-            if !compiled.matches(entry) {
+            if !compiled.matches(&entry) {
                 continue;
             }
             total += 1;
             let score = compiled
                 .rank_terms
                 .iter()
-                .map(|term| score_of(entry, term))
+                .map(|term| score_of(&entry, term))
                 .sum();
+            let candidate = Ranked { entry, score };
             if heap.len() < limit {
-                heap_push(
-                    &mut heap,
-                    Ranked {
-                        entry: entry.clone(),
-                        score,
-                    },
-                );
-            } else {
-                // Compare before cloning: most matches are dropped here.
-                let root = &heap[0];
-                let keeps = score > root.score
-                    || (score == root.score && entry.lower_path() < root.entry.lower_path());
-                if keeps {
-                    heap_replace_root(
-                        &mut heap,
-                        Ranked {
-                            entry: entry.clone(),
-                            score,
-                        },
-                    );
-                }
+                heap_push(&mut heap, candidate, &compare);
+            } else if compare(&candidate, &heap[0]).is_lt() {
+                heap_replace_root(&mut heap, candidate, &compare);
             }
         }
 
-        heap.sort_by(|a, b| {
-            if better(a, b) {
-                Ordering::Less
-            } else if better(b, a) {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        });
-        Ok((heap.into_iter().map(|item| item.entry).collect(), total))
+        heap.sort_by(compare);
+        let rows = heap
+            .into_iter()
+            .map(|item| item.entry.into_owned())
+            .collect();
+        Ok((rows, total))
     }
 }
 
@@ -173,23 +168,17 @@ fn score_of(entry: &Entry, term: &str) -> i64 {
     10
 }
 
-/// True when `a` should be shown before `b`. Ties break on the lowercased path
-/// so results are deterministic across runs.
-fn better(a: &Ranked, b: &Ranked) -> bool {
-    if a.score != b.score {
-        a.score > b.score
-    } else {
-        a.entry.lower_path() < b.entry.lower_path()
-    }
-}
-
 /// Inserts into a heap whose root is the worst retained candidate.
-fn heap_push(heap: &mut Vec<Ranked>, item: Ranked) {
+fn heap_push<'a>(
+    heap: &mut Vec<Ranked<'a>>,
+    item: Ranked<'a>,
+    compare: &impl Fn(&Ranked<'a>, &Ranked<'a>) -> Ordering,
+) {
     heap.push(item);
     let mut child = heap.len() - 1;
     while child > 0 {
         let parent = (child - 1) / 2;
-        if !better(&heap[parent], &heap[child]) {
+        if !compare(&heap[parent], &heap[child]).is_lt() {
             break;
         }
         heap.swap(parent, child);
@@ -198,7 +187,11 @@ fn heap_push(heap: &mut Vec<Ranked>, item: Ranked) {
 }
 
 /// Replaces the worst retained candidate and sifts the new one down.
-fn heap_replace_root(heap: &mut [Ranked], item: Ranked) {
+fn heap_replace_root<'a>(
+    heap: &mut [Ranked<'a>],
+    item: Ranked<'a>,
+    compare: &impl Fn(&Ranked<'a>, &Ranked<'a>) -> Ordering,
+) {
     heap[0] = item;
     let mut parent = 0;
     loop {
@@ -206,10 +199,10 @@ fn heap_replace_root(heap: &mut [Ranked], item: Ranked) {
         if child >= heap.len() {
             break;
         }
-        if child + 1 < heap.len() && better(&heap[child], &heap[child + 1]) {
+        if child + 1 < heap.len() && compare(&heap[child], &heap[child + 1]).is_lt() {
             child += 1;
         }
-        if !better(&heap[parent], &heap[child]) {
+        if !compare(&heap[parent], &heap[child]).is_lt() {
             break;
         }
         heap.swap(parent, child);
