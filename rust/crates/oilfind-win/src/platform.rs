@@ -4,18 +4,72 @@
 //! 只处理本机磁盘上的真实目录，不打开索引范围之外的目标（UNC、映射盘、
 //! 设备路径、重解析点）。
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{Local, TimeZone};
 #[cfg(any(windows, test))]
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+use windows_sys::Win32::Storage::FileSystem::{
+    GetDriveTypeW, GetLogicalDrives, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+};
 
 use crate::api::wide;
 
 const DRIVE_UNKNOWN: u32 = 0;
 const DRIVE_NO_ROOT_DIR: u32 = 1;
+const DRIVE_FIXED: u32 = 3;
 const DRIVE_REMOTE: u32 = 4;
+
+pub fn local_fixed_roots() -> Vec<String> {
+    fixed_roots_from(unsafe { GetLogicalDrives() }, |root| {
+        let wide_root = wide(root);
+        unsafe { GetDriveTypeW(wide_root.as_ptr()) }
+    })
+}
+
+fn fixed_roots_from(mask: u32, drive_type: impl Fn(&str) -> u32) -> Vec<String> {
+    let mut roots = Vec::new();
+    for (bit, letter) in (b'A'..=b'Z').enumerate() {
+        if mask & (1 << bit) != 0 {
+            let root = format!("{}:\\", char::from(letter));
+            if drive_type(&root) == DRIVE_FIXED {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+pub fn volume_ids(roots: &[PathBuf]) -> Result<BTreeMap<String, String>, String> {
+    let mut ids = BTreeMap::new();
+    for root in roots {
+        validate_drive(root)?;
+        let path = root.to_string_lossy();
+        let drive = format!("{}\\", path[..2].to_ascii_uppercase());
+        if ids.contains_key(&drive) {
+            continue;
+        }
+        let drive_wide = wide(&drive);
+        let mut name = [0u16; 64];
+        let found = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                drive_wide.as_ptr(),
+                name.as_mut_ptr(),
+                name.len() as u32,
+            )
+        };
+        let length = name
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(name.len());
+        if found == 0 || length == 0 {
+            return Err(format!("无法验证磁盘 {drive} 的卷标识"));
+        }
+        ids.insert(drive, String::from_utf16_lossy(&name[..length]));
+    }
+    Ok(ids)
+}
 
 /// 用户配置目录：`%LOCALAPPDATA%\OilFind`。
 ///
@@ -311,6 +365,19 @@ pub fn format_timestamp(seconds: i64, with_seconds: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_disk_suggestions_include_only_mounted_fixed_drives() {
+        let detected = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6);
+        let roots = fixed_roots_from(detected, |path| match path {
+            "C:\\" | "G:\\" => DRIVE_FIXED,
+            "D:\\" => 2,
+            "E:\\" => DRIVE_REMOTE,
+            _ => panic!("queried a drive absent from the mask"),
+        });
+        assert_eq!(roots, ["C:\\", "G:\\"]);
+        assert!(fixed_roots_from(0, |_| panic!("no drives to query")).is_empty());
+    }
 
     struct TestDir(PathBuf);
 

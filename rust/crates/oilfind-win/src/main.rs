@@ -9,6 +9,7 @@
 mod api;
 mod app;
 mod platform;
+mod quick_panel;
 
 // 单文件交付：MIT 许可与第三方 crate 声明必须随二进制一起分发，因此编入 exe。
 // `#[used]` 阻止链接器裁掉这两段只读数据（构建脚本不再输出独立许可文件）。

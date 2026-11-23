@@ -34,7 +34,8 @@ Rust 版是主线（Go 版保留在 `v0.1-go` 标签对照/回退），配置了
 
 ## 安全与边界
 
-- Windows 与 Rust macOS 预览默认不扫描任何目录，必须手动选择并点击“开始索引”。预览版的旧配置无法确认授权时会保留原文件，但要求重新选择范围。
+- Windows 首次预选本机固定盘，由用户确认范围并点击“开始索引”。按 `Ctrl+Alt+Space` 唤出快捷搜索，范围和刷新间隔在“索引设置”里调整。
+- Rust macOS 预览版由用户选择范围并点击“开始索引”。旧配置无法确认授权时会保留原文件，并要求重新选择范围。
 - 跳过依赖与版本库目录（`node_modules`、`.git` 等）和私人运行器目录（`.claude`、`.codex`、`.workbuddy` 等），任意层级生效。
 - `C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`$RECYCLE.BIN` 等系统目录只在磁盘根一级跳过；`D:\code\myproject\windows` 这类普通项目目录仍可搜索。
 - 拒绝 UNC、设备路径与网络映射盘；跳过符号链接与目录联接。
@@ -114,7 +115,7 @@ Windows 客户端基于 [oil-oil/oil-find](https://github.com/oil-oil/oil-find) 
 
 ## 已知限制
 
-- 索引同步为用户启动后每 30 秒全量快照，不是 NTFS USN 实时索引。
+- Windows 索引按设定间隔重建全量快照，默认每小时一次。可选每 15 分钟至每天，也可使用仅手动模式。
 - 索引常驻内存，上限 200 万条；大目录首次索引较慢。
 - 结果最多显示 2000 条。
 - 可执行文件未签名，Windows SmartScreen 或安全软件可能提示未知发布者。

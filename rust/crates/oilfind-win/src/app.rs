@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 // ClientToScreen / ScreenToClient 在 Gdi 模块（user32 转发），与绘制用同一组。
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetSysColorBrush, InvalidateRect, ScreenToClient, SetBkColor, SetTextColor,
-    UpdateWindow, COLOR_WINDOW, HDC, HFONT,
+    ClientToScreen, FillRect, GetStockObject, GetSysColorBrush, InvalidateRect, ScreenToClient,
+    SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, COLOR_WINDOW, HDC, HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -35,25 +35,39 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, VK_SPACE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetMessageW, GetSystemMetrics, IsDialogMessageW, KillTimer,
-    LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos,
-    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, IDC_ARROW, MF_STRING, MINMAXINFO,
-    MSG, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_LEFTALIGN,
-    TPM_RETURNCMD, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW,
+    DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, IsDialogMessageW, IsIconic,
+    KillTimer, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
+    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    IDC_ARROW, MF_STRING, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_HOTKEY, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CLIPCHILDREN,
+    WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
 };
 
 use crate::api::{self, SendHwnd};
 use crate::platform;
+use crate::quick_panel::{self, Panel};
 
 const RESULT_LIMIT: usize = 2000;
 const MAX_ROOTS: usize = 64;
 const SEARCH_DEBOUNCE_MS: u32 = 250;
-const SYNC_INTERVAL_MS: u32 = 30_000;
+const REFRESH_PRESETS: [(u32, &str); 7] = [
+    (0, "仅手动"),
+    (15, "每 15 分钟"),
+    (30, "每 30 分钟"),
+    (60, "每小时"),
+    (120, "每 2 小时"),
+    (360, "每 6 小时"),
+    (1440, "每天"),
+];
+const DEFAULT_REFRESH_PRESET: usize = 3;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 fn progress_control_class() -> &'static str {
@@ -84,6 +98,11 @@ const WM_APP_PROGRESS: u32 = WM_APP + 2;
 
 const TIMER_SEARCH: usize = 1;
 const TIMER_SYNC: usize = 2;
+const SEARCH_HOTKEY: i32 = 1;
+const ID_SETTINGS: usize = 150;
+const ID_HIDE: usize = 151;
+const ID_FIXED_ROOTS: usize = 152;
+const ID_REFRESH_INTERVAL: usize = 153;
 
 /// 控件样式与控件消息（数值来自 Win32 SDK，集中在此便于核对）。
 mod style {
@@ -103,7 +122,6 @@ mod style {
     pub const RESULTS_STYLE: u32 =
         WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
     pub const LVS_EX_FULLROWSELECT: u32 = 0x0000_0020;
-    pub const LVS_EX_GRIDLINES: u32 = 0x0000_0001;
     pub const LVS_EX_DOUBLEBUFFER: u32 = 0x0001_0000;
     pub const LVCF_FMT: u32 = 0x0001;
     pub const LVCF_WIDTH: u32 = 0x0002;
@@ -119,6 +137,7 @@ mod style {
     pub const LVNI_SELECTED: usize = 0x0002;
     pub const CB_ADDSTRING: u32 = 0x0143;
     pub const CB_SETCURSEL: u32 = 0x014E;
+    pub const CB_GETDROPPEDSTATE: u32 = 0x0157;
     pub const CB_GETCURSEL: u32 = 0x0147;
     pub const LB_ADDSTRING: u32 = 0x0180;
     pub const LB_RESETCONTENT: u32 = 0x0184;
@@ -140,7 +159,7 @@ mod style {
     pub const PBM_SETMARQUEE: u32 = 0x0400 + 10;
     // 静态控件：居中文本；默认按钮（“开始索引”）。
     pub const SS_CENTER: u32 = 0x0000_0001;
-    pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+    pub const EM_SETMARGINS: u32 = 0x00D3;
     // 静态控件颜色通知：wParam 是 HDC，lParam 是控件句柄。
     pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 }
@@ -159,6 +178,7 @@ thread_local! {
     static WINDOW_RESULTS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_HEADER: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_EMPTY: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+    static WINDOW_GLASS: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +209,7 @@ enum Deferred {
     Timer(usize),
     Events,
     Progress,
+    ToggleSearch,
     Close,
     Destroyed,
 }
@@ -297,10 +318,68 @@ struct Config {
     roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cache_roots: Vec<String>,
+    #[serde(default)]
+    refresh_minutes: Option<u32>,
+    #[serde(default)]
+    refresh_enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    approved_volumes: BTreeMap<String, String>,
+    #[serde(default)]
+    cache_slot: Option<CacheSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum CacheSlot {
+    A,
+    B,
+}
+
+impl CacheSlot {
+    fn alternate(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+
+    fn path(self, legacy: &Path) -> PathBuf {
+        legacy.with_file_name(match self {
+            Self::A => "index-a.bin",
+            Self::B => "index-b.bin",
+        })
+    }
+}
+
+impl Config {
+    fn refresh_preset(&self) -> usize {
+        self.refresh_minutes
+            .and_then(|minutes| {
+                REFRESH_PRESETS
+                    .iter()
+                    .position(|(value, _)| *value == minutes)
+            })
+            .unwrap_or(DEFAULT_REFRESH_PRESET)
+    }
+
+    fn refresh_delay(&self) -> Option<Duration> {
+        let minutes = REFRESH_PRESETS[self.refresh_preset()].0;
+        (minutes > 0).then(|| Duration::from_secs(u64::from(minutes) * 60))
+    }
+
+    fn can_resume_refresh(&self) -> bool {
+        self.refresh_enabled
+            && self.refresh_delay().is_some()
+            && !self.roots.is_empty()
+            && !self.approved_volumes.is_empty()
+            && self.cache_slot.is_some()
+            && platform::same_root_set(&self.roots, &self.cache_roots)
+    }
 }
 
 struct ScanSuccess {
     index: Index,
+    volume_ids: Option<BTreeMap<String, String>>,
+    cache_slot: Option<CacheSlot>,
     save_error: Option<String>,
     updated: SystemTime,
 }
@@ -383,8 +462,16 @@ struct App {
     hwnd: HWND,
     instance: HWND,
     font: HFONT,
+    search_font: HFONT,
     dpi: i32,
+    panel: Panel,
+    hotkey: bool,
     search: HWND,
+    settings: HWND,
+    hide: HWND,
+    fixed_roots: HWND,
+    refresh_interval: HWND,
+    rows_generation: Option<u64>,
     roots_list: HWND,
     types: HWND,
     results: HWND,
@@ -417,6 +504,7 @@ struct App {
     search_generation: u64,
     scanning: bool,
     auto_sync: bool,
+    next_refresh: Option<Instant>,
     closing: bool,
     storage_notice: String,
     last_notice: String,
@@ -475,6 +563,7 @@ pub fn run() -> Result<(), String> {
     WINDOW_RESULTS.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_HEADER.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_EMPTY.with(|handle| handle.set(std::ptr::null_mut()));
+    WINDOW_GLASS.with(|glass| glass.set(false));
     drop(app);
     unsafe { CoUninitialize() };
     outcome
@@ -513,30 +602,18 @@ fn run_window(instance: HWND) -> Result<(), String> {
     }
 
     let title = api::wide("Oil Find for Windows");
-    let dpi = with_app(|app| app.dpi).unwrap_or(96);
-    let mut width = 1120 * dpi / 96;
-    let mut height = 760 * dpi / 96;
-    let (screen_width, screen_height) =
-        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let available = screen_width - 32 * dpi / 96;
-    if available > 0 && width > available {
-        width = available;
-    }
-    let available = screen_height - 48 * dpi / 96;
-    if available > 0 && height > available {
-        height = available;
-    }
-    const CW_USEDEFAULT: i32 = -0x8000_0000;
+    let (dpi, panel) = with_app(|app| (app.dpi, app.panel)).unwrap_or((96, Panel::Search));
+    let bounds = panel.bounds(quick_panel::work_area(std::ptr::null_mut(), true), dpi);
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_CONTROLPARENT,
+            WS_EX_CONTROLPARENT | WS_EX_APPWINDOW,
             class_name.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            width,
-            height,
+            WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
@@ -549,17 +626,31 @@ fn run_window(instance: HWND) -> Result<(), String> {
         return Err(init_error.unwrap_or_else(|| format!("创建应用窗口失败：{error}")));
     }
 
+    WINDOW_GLASS.with(|glass| glass.set(quick_panel::apply_material(hwnd)));
+    with_app(|app| app.position_panel(panel, true));
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
     // 窗口显示后再设置焦点：WM_CREATE 里设置的焦点会被随后的框架显示丢弃。
     with_app(|app| {
-        if !app.search.is_null() {
-            unsafe { SetFocus(app.search) };
-        }
+        let first_focus = if panel == Panel::Settings {
+            app.roots_list
+        } else {
+            app.search
+        };
+        unsafe { SetFocus(first_focus) };
         app.start_search_worker();
         app.load_cache();
+        app.hotkey = unsafe {
+            RegisterHotKey(
+                hwnd,
+                SEARCH_HOTKEY,
+                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                u32::from(VK_SPACE),
+            )
+        } != 0;
+        app.render_status();
     });
 
     if WINDOW_STATE.with(Cell::get) == WindowState::Stopped {
@@ -578,19 +669,13 @@ fn run_window(instance: HWND) -> Result<(), String> {
         if result == 0 {
             break;
         }
-        if message.message == WM_KEYDOWN && message.wParam == 0x1B {
-            // SetWindowText synchronously sends EN_CHANGE. Do it outside the App
-            // borrow so the notification runs before cancel_search kills its timer.
-            if let Some(search) = with_app(|app| app.search) {
-                api::put_text(search, "");
-                with_app(|app| app.cancel_search());
-                continue;
-            }
-        }
-        if with_app(|app| app.keyboard(&message)).unwrap_or(false) {
+        let native_key = message.message == WM_KEYDOWN
+            && matches!(message.wParam, 0x0D | 0x1B | 0x28)
+            && with_app(|app| app.native_key_handling(message.wParam)).unwrap_or(false);
+        if !native_key && with_app(|app| app.keyboard(&message)).unwrap_or(false) {
             continue;
         }
-        if unsafe { IsDialogMessageW(hwnd, &message) } == 0 {
+        if native_key || unsafe { IsDialogMessageW(hwnd, &message) } == 0 {
             unsafe {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -632,14 +717,22 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_ERASEBKGND if WINDOW_GLASS.with(Cell::get) => {
+            let mut area = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut area) } != 0 {
+                unsafe { FillRect(wparam as HDC, &area, GetStockObject(BLACK_BRUSH) as _) };
+            }
+            1
+        }
         style::WM_CTLCOLORSTATIC => {
             let empty = WINDOW_EMPTY.with(Cell::get);
             if !empty.is_null() && lparam == empty as isize {
-                let device = wparam as HDC;
+                unsafe { GetSysColorBrush(COLOR_WINDOW) as LRESULT }
+            } else if WINDOW_GLASS.with(Cell::get) {
                 unsafe {
-                    SetTextColor(device, 0x0080_8080);
-                    SetBkColor(device, 0x00FF_FFFF);
-                    GetSysColorBrush(COLOR_WINDOW) as LRESULT
+                    SetBkMode(wparam as HDC, TRANSPARENT as i32);
+                    SetTextColor(wparam as HDC, 0x0039_3026);
+                    GetStockObject(BLACK_BRUSH) as LRESULT
                 }
             } else {
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -688,6 +781,10 @@ unsafe extern "system" fn window_proc(
             dispatch_deferred(Deferred::Timer(wparam));
             0
         }
+        WM_HOTKEY if wparam == SEARCH_HOTKEY as usize => {
+            dispatch_deferred(Deferred::ToggleSearch);
+            0
+        }
         WM_APP_EVENT => {
             dispatch_deferred(Deferred::Events);
             0
@@ -716,7 +813,7 @@ unsafe extern "system" fn window_proc(
 }
 
 fn min_track_size(dpi: i32) -> (i32, i32) {
-    (860 * dpi / 96, 620 * dpi / 96)
+    (280 * dpi / 96, 100 * dpi / 96)
 }
 
 unsafe fn read_suggested_rect(lparam: LPARAM) -> Option<RECT> {
@@ -770,8 +867,16 @@ impl App {
             hwnd: std::ptr::null_mut(),
             instance,
             font: std::ptr::null_mut(),
+            search_font: std::ptr::null_mut(),
             dpi,
+            panel: Panel::Search,
+            hotkey: false,
             search: std::ptr::null_mut(),
+            settings: std::ptr::null_mut(),
+            hide: std::ptr::null_mut(),
+            fixed_roots: std::ptr::null_mut(),
+            refresh_interval: std::ptr::null_mut(),
+            rows_generation: None,
             roots_list: std::ptr::null_mut(),
             types: std::ptr::null_mut(),
             results: std::ptr::null_mut(),
@@ -800,6 +905,7 @@ impl App {
             search_generation: 0,
             scanning: false,
             auto_sync: false,
+            next_refresh: None,
             closing: false,
             storage_notice: String::new(),
             last_notice: String::new(),
@@ -819,6 +925,9 @@ impl App {
             }),
         };
         app.load_configuration();
+        if app.config.cache_roots.is_empty() {
+            app.panel = Panel::Settings;
+        }
         Ok(app)
     }
 
@@ -839,8 +948,14 @@ impl App {
         }
         match message {
             Deferred::Size => {
-                if !self.results.is_null() {
-                    self.layout();
+                if !self.results.is_null() && unsafe { IsIconic(self.hwnd) } == 0 {
+                    let desired =
+                        Panel::for_query(self.panel == Panel::Settings, &api::text(self.search));
+                    if self.panel == desired {
+                        self.layout();
+                    } else {
+                        self.position_panel(desired, false);
+                    }
                 }
             }
             Deferred::DpiChanged { dpi, suggested } => {
@@ -858,12 +973,17 @@ impl App {
                 if timer == TIMER_SEARCH {
                     unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
                     self.search_now();
-                } else if timer == TIMER_SYNC && self.auto_sync && !self.scanning {
-                    self.begin_scan();
+                } else if timer == TIMER_SYNC
+                    && self.auto_sync
+                    && self.next_refresh.is_some_and(|due| Instant::now() >= due)
+                {
+                    self.disarm_refresh();
+                    self.begin_scan(true);
                 }
             }
             Deferred::Events => self.drain_events(),
             Deferred::Progress => self.show_progress(),
+            Deferred::ToggleSearch => self.toggle_search_panel(),
             Deferred::Close => {
                 self.shutdown();
                 unsafe { DestroyWindow(self.hwnd) };
@@ -878,7 +998,8 @@ impl App {
             self.dpi = window_dpi as i32;
         }
         WINDOW_DPI.with(|dpi| dpi.set(self.dpi));
-        self.font = api::create_font(self.dpi)?;
+        self.font = api::create_font(self.dpi, 17)?;
+        self.search_font = api::create_font(self.dpi, 24)?;
 
         let make = |class: &str, label: &str, style: u32, ex_style: u32, id: usize| {
             api::create_control(
@@ -892,46 +1013,62 @@ impl App {
                 self.font,
             )
         };
-        for label in [
-            "搜索本机文件",
-            "索引范围（仅本机目录；删除范围不会删除文件）",
-            "文件类型",
-            "索引只记录文件名与路径等元数据，不上传文件内容。",
-        ] {
+        for label in ["Oil Find", "索引范围", "文件类型", "刷新间隔"] {
             let handle = make("STATIC", label, style::SS_LEFT, 0, 0)?;
             self.labels.push(handle);
         }
         self.search = make(
             "EDIT",
             "",
-            style::WS_TABSTOP | style::ES_AUTOHSCROLL,
-            style::WS_EX_CLIENTEDGE,
+            style::WS_TABSTOP | style::WS_BORDER | style::ES_AUTOHSCROLL,
+            0,
             ID_SEARCH,
         )?;
+        api::set_font(self.search, self.search_font);
+        self.set_search_margins();
         api::send_message(self.search, style::EM_SETLIMITTEXT, 4096, 0);
-        let cue = api::wide("中文 / 拼音 / 空格 AND / !排除 / OR 或 | / ext:pdf / size:>1mb");
+        let cue = api::wide("搜索文件名、路径或拼音");
         api::send_message(
             self.search,
             style::EM_SETCUEBANNER,
             0,
             cue.as_ptr() as isize,
         );
+        self.settings = make("BUTTON", "索引设置", style::WS_TABSTOP, 0, ID_SETTINGS)?;
+        self.hide = make("BUTTON", "最小化", style::WS_TABSTOP, 0, ID_HIDE)?;
+        self.fixed_roots = make("BUTTON", "本机固定盘", style::WS_TABSTOP, 0, ID_FIXED_ROOTS)?;
+        self.refresh_interval = make(
+            "COMBOBOX",
+            "",
+            style::WS_TABSTOP | style::WS_VSCROLL | style::CBS_DROPDOWNLIST,
+            0,
+            ID_REFRESH_INTERVAL,
+        )?;
+        for (_, label) in REFRESH_PRESETS {
+            let label = api::wide(label);
+            api::send_message(
+                self.refresh_interval,
+                style::CB_ADDSTRING,
+                0,
+                label.as_ptr() as isize,
+            );
+        }
+        api::send_message(
+            self.refresh_interval,
+            style::CB_SETCURSEL,
+            self.config.refresh_preset(),
+            0,
+        );
         for (label, id) in [
             ("添加目录…", ID_ADD_ROOT),
             ("删除范围", ID_REMOVE_ROOT),
             ("开始索引", ID_START),
-            ("停止 / 暂停同步", ID_STOP),
+            ("暂停刷新", ID_STOP),
             ("打开所选", ID_OPEN),
             ("资源管理器定位", ID_REVEAL),
             ("复制路径", ID_COPY),
         ] {
-            // “开始索引”是默认按钮：回车可达，边框加粗以突出主操作。
-            let emphasis = if id == ID_START {
-                style::BS_DEFPUSHBUTTON
-            } else {
-                0
-            };
-            let handle = make("BUTTON", label, style::WS_TABSTOP | emphasis, 0, id)?;
+            let handle = make("BUTTON", label, style::WS_TABSTOP, 0, id)?;
             match id {
                 ID_ADD_ROOT => self.add = handle,
                 ID_REMOVE_ROOT => self.remove = handle,
@@ -983,8 +1120,7 @@ impl App {
             self.results,
             style::LVM_SETEXTENDEDLISTVIEWSTYLE,
             0,
-            (style::LVS_EX_FULLROWSELECT | style::LVS_EX_GRIDLINES | style::LVS_EX_DOUBLEBUFFER)
-                as isize,
+            (style::LVS_EX_FULLROWSELECT | style::LVS_EX_DOUBLEBUFFER) as isize,
         );
         // 表头句柄：排序点击通知由列表视图转发给父窗口。
         self.header = api::send_message(self.results, style::LVM_GETHEADER, 0, 0) as HWND;
@@ -1026,9 +1162,13 @@ impl App {
         self.refresh_roots();
         self.selection_buttons();
         api::enable(self.stop, false);
-        self.last_notice = "尚未启动索引。请先添加本机目录，再明确点击“开始索引”。".to_string();
+        self.last_notice = if self.config.roots.is_empty() {
+            "在索引设置里选择范围，再开始索引。".to_string()
+        } else {
+            "确认索引范围后点击开始。索引成功后按所选间隔刷新。".to_string()
+        };
         if !self.startup_notice.is_empty() {
-            self.last_notice = self.startup_notice.clone();
+            self.storage_notice = self.startup_notice.clone();
         }
         self.render_status();
         self.refresh_header();
@@ -1041,147 +1181,185 @@ impl App {
         value * self.dpi / 96
     }
 
+    fn set_search_margins(&self) {
+        let margin = self.px(12) as isize;
+        api::send_message(
+            self.search,
+            style::EM_SETMARGINS,
+            3,
+            margin | (margin << 16),
+        );
+    }
+
     fn layout(&mut self) {
         let mut area = RECT::default();
         if unsafe { GetClientRect(self.hwnd, &mut area) } == 0 {
             return;
         }
-        let width = area.right;
-        let height = area.bottom;
-        let padding = self.px(18);
-        let gap = self.px(10);
-        let row = self.px(32);
-
-        let label_height = self.px(25);
-        let label_gap = self.px(29);
-        let mut y = padding + label_gap;
-        let move_control = |handle: HWND, x: i32, y: i32, w: i32, h: i32| {
-            if handle.is_null() {
-                return;
-            }
-            unsafe {
-                MoveWindow(handle, x, y, w.max(1), h.max(1), 1);
+        let settings = self.panel == Panel::Settings;
+        let results = self.panel == Panel::Results;
+        let show = |controls: &[HWND], visible: bool| {
+            let command = if visible {
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNA
+            } else {
+                SW_HIDE
+            };
+            for &handle in controls {
+                unsafe { ShowWindow(handle, command) };
             }
         };
-        move_control(
-            self.labels[0],
-            padding,
-            padding,
-            width - 2 * padding,
-            label_height,
+        show(&[self.search], !settings);
+        show(
+            &[
+                self.results,
+                self.types,
+                self.labels[2],
+                self.open,
+                self.reveal,
+                self.copy,
+            ],
+            results,
         );
-        move_control(self.search, padding, y, width - 2 * padding, row);
-        y += row + gap;
-        move_control(
-            self.labels[1],
-            padding,
-            y,
-            width - 2 * padding,
-            label_height,
+        show(
+            &[
+                self.labels[1],
+                self.roots_list,
+                self.add,
+                self.remove,
+                self.fixed_roots,
+                self.labels[3],
+                self.refresh_interval,
+                self.stop,
+            ],
+            settings,
         );
-        y += label_gap;
+        show(&[self.start], settings);
+        self.refresh_empty_state();
 
-        let buttons_width = self.px(145);
-        move_control(
-            self.roots_list,
-            padding,
-            y,
-            width - 3 * padding - buttons_width,
-            self.px(100),
-        );
-        move_control(
-            self.add,
-            width - padding - buttons_width,
-            y,
-            buttons_width,
-            row,
-        );
-        move_control(
-            self.remove,
-            width - padding - buttons_width,
-            y + row + gap,
-            buttons_width,
-            row,
-        );
-        y += self.px(100) + gap;
+        let p = self.px(22);
+        let w = area.right;
+        let h = area.bottom;
+        let right = w - p;
+        let content_width = w - 2 * p;
+        let row = self.px(32);
+        let gap = self.px(10);
+        let place = |handle: HWND, x, y, width: i32, height: i32| {
+            unsafe { MoveWindow(handle, x, y, width.max(1), height.max(1), 1) };
+        };
 
-        move_control(self.start, padding, y, self.px(125), row);
-        move_control(self.stop, padding + self.px(135), y, self.px(165), row);
-        move_control(
+        let top = self.px(13);
+        let hide_width = self.px(76);
+        let settings_width = self.px(102);
+        let settings_x = right - hide_width - gap - settings_width;
+        place(self.labels[0], p, top + self.px(4), settings_x - p, row);
+        place(self.settings, settings_x, top, settings_width, row);
+        place(self.hide, right - hide_width, top, hide_width, row);
+        place(self.status, p, h - self.px(29), content_width, self.px(24));
+        place(self.progress, 0, h - self.px(4), w, self.px(4));
+
+        let body = self.px(57);
+        let start_width = self.px(112);
+        if settings {
+            let button_width = self.px(132);
+            let list_y = body + self.px(30);
+            let settings_footer = h - self.px(81);
+            let list_height = (settings_footer - list_y - gap * 2).max(self.px(112));
+            place(self.labels[1], p, body, content_width, row);
+            place(
+                self.roots_list,
+                p,
+                list_y,
+                content_width - button_width - gap,
+                list_height,
+            );
+            for (i, handle) in [self.fixed_roots, self.add, self.remove]
+                .into_iter()
+                .enumerate()
+            {
+                place(
+                    handle,
+                    right - button_width,
+                    list_y + i as i32 * (row + gap),
+                    button_width,
+                    row,
+                );
+            }
+            place(
+                self.labels[3],
+                p,
+                settings_footer + self.px(5),
+                self.px(76),
+                row,
+            );
+            place(
+                self.refresh_interval,
+                p + self.px(82),
+                settings_footer,
+                self.px(142),
+                self.px(230),
+            );
+            place(
+                self.stop,
+                right - start_width * 2 - gap,
+                settings_footer,
+                start_width,
+                row,
+            );
+            place(
+                self.start,
+                right - start_width,
+                settings_footer,
+                start_width,
+                row,
+            );
+            return;
+        }
+
+        let edit_height = self.px(43);
+        place(self.search, p, body, content_width, edit_height);
+        if !results {
+            return;
+        }
+        let types_y = body + edit_height + gap;
+        let types_width = self.px(126);
+        place(
             self.labels[2],
-            width - padding - self.px(280),
-            y + self.px(4),
-            self.px(75),
+            right - types_width - self.px(76),
+            types_y + self.px(5),
+            self.px(72),
             row,
         );
-        move_control(
+        place(
             self.types,
-            width - padding - self.px(195),
-            y,
-            self.px(195),
-            self.px(240),
+            right - types_width,
+            types_y,
+            types_width,
+            self.px(226),
         );
-        y += row + gap;
 
-        let bottom = height - self.px(112);
-        let results_y = y;
-        let results_height = bottom - y;
-        move_control(self.results, padding, y, width - 2 * padding, bottom - y);
-        // 空状态提示：垂直落在结果区约 2/5 处，单行居中。
-        move_control(
+        let list_y = types_y + row + gap;
+        let buttons_y = h - self.px(70);
+        let list_height = buttons_y - list_y - gap;
+        place(self.results, p, list_y, content_width, list_height);
+        place(
             self.empty,
-            padding,
-            results_y + results_height * 2 / 5,
-            width - 2 * padding,
-            self.px(40),
-        );
-        move_control(self.open, padding, bottom + gap, self.px(115), row);
-        move_control(
-            self.reveal,
-            padding + self.px(125),
-            bottom + gap,
-            self.px(165),
+            p + 1,
+            list_y + list_height / 2,
+            content_width - 2,
             row,
         );
-        move_control(
-            self.copy,
-            padding + self.px(300),
-            bottom + gap,
-            self.px(115),
-            row,
-        );
-        move_control(
-            self.status,
-            padding,
-            height - self.px(63),
-            width - 2 * padding,
-            self.px(29),
-        );
-        move_control(
-            self.labels[3],
-            padding,
-            height - self.px(30),
-            width - 2 * padding,
-            self.px(24),
-        );
-        // 底部细进度条：贴客户区下边缘，扫描时显示。
-        move_control(self.progress, 0, height - self.px(6), width, self.px(6));
-
-        // 列宽：文件名 / 完整路径（弹性，吃掉剩余宽度）/ 大小 / 修改日期。
-        // 日期列按 "YYYY-MM-DD HH:MM"（16 字符，界面字体下约 125px）留足余量；
-        // 文件名与路径的超长内容由列表视图在单元格边界裁切，属预期行为。
-        for (position, mut column_width) in [
-            self.px(220),
-            width - 2 * padding - self.px(515),
-            self.px(100),
+        place(self.open, p, buttons_y, self.px(104), row);
+        place(self.reveal, p + self.px(115), buttons_y, self.px(156), row);
+        place(self.copy, p + self.px(282), buttons_y, self.px(104), row);
+        for (position, column_width) in [
+            self.px(199),
+            (content_width - self.px(458)).max(self.px(80)),
+            self.px(84),
             self.px(175),
         ]
         .into_iter()
         .enumerate()
         {
-            if column_width < self.px(100) {
-                column_width = self.px(100);
-            }
             api::send_message(
                 self.results,
                 style::LVM_SETCOLUMNWIDTH,
@@ -1191,6 +1369,62 @@ impl App {
         }
     }
 
+    fn position_panel(&mut self, panel: Panel, follow_pointer: bool) {
+        self.panel = panel;
+        let (settings_label, hide_label) = if panel == Panel::Settings {
+            ("返回搜索", "退出")
+        } else {
+            ("索引设置", "最小化")
+        };
+        api::put_text(self.settings, settings_label);
+        api::put_text(self.hide, hide_label);
+        let bounds = panel.bounds(quick_panel::work_area(self.hwnd, follow_pointer), self.dpi);
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                std::ptr::null_mut(),
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        self.layout();
+    }
+
+    fn toggle_settings(&mut self) {
+        if self.panel == Panel::Settings {
+            let panel = Panel::for_query(false, &api::text(self.search));
+            self.position_panel(panel, false);
+            unsafe { SetFocus(self.search) };
+        } else {
+            self.position_panel(Panel::Settings, false);
+            unsafe { SetFocus(self.roots_list) };
+        }
+        self.render_status();
+    }
+
+    fn toggle_search_panel(&mut self) {
+        if self.panel != Panel::Settings
+            && unsafe { IsIconic(self.hwnd) == 0 && GetForegroundWindow() == self.hwnd }
+        {
+            unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+            return;
+        }
+        if unsafe { IsIconic(self.hwnd) } != 0 {
+            unsafe { ShowWindow(self.hwnd, SW_RESTORE) };
+        }
+        let panel = Panel::for_query(false, &api::text(self.search));
+        self.position_panel(panel, true);
+        unsafe {
+            SetForegroundWindow(self.hwnd);
+            SetFocus(self.search);
+        }
+        api::send_message(self.search, style::EM_SETSEL, 0, -1);
+        self.render_status();
+    }
+
     fn change_dpi(&mut self, dpi: i32, suggested: RECT) -> Result<(), String> {
         if !(96..=768).contains(&dpi)
             || suggested.right <= suggested.left
@@ -1198,14 +1432,26 @@ impl App {
         {
             return Err("显示缩放参数无效".to_string());
         }
-        let font = api::create_font(dpi)?;
+        let font = api::create_font(dpi, 17)?;
+        let search_font = match api::create_font(dpi, 24) {
+            Ok(font) => font,
+            Err(error) => {
+                api::delete_font(font);
+                return Err(error);
+            }
+        };
         let previous = self.font;
+        let previous_search = self.search_font;
         self.font = font;
+        self.search_font = search_font;
         self.dpi = dpi;
         WINDOW_DPI.with(|snapshot| snapshot.set(dpi));
         let mut controls = self.labels.clone();
         controls.extend([
-            self.search,
+            self.settings,
+            self.hide,
+            self.fixed_roots,
+            self.refresh_interval,
             self.roots_list,
             self.types,
             self.results,
@@ -1223,24 +1469,30 @@ impl App {
         for handle in controls {
             api::set_font(handle, font);
         }
+        api::set_font(self.search, search_font);
+        self.set_search_margins();
         // 表头不继承列表视图字体，显式设置。
         if !self.header.is_null() {
             api::set_font(self.header, font);
         }
-        // 按系统建议矩形重建窗口；随后的 WM_SIZE 仍会重新布局。
+        // Fit the panel on the destination monitor at its new DPI.
+        let bounds = self
+            .panel
+            .bounds(quick_panel::work_area_near(&suggested), dpi);
         unsafe {
             SetWindowPos(
                 self.hwnd,
                 std::ptr::null_mut(),
-                suggested.left,
-                suggested.top,
-                suggested.right - suggested.left,
-                suggested.bottom - suggested.top,
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
         self.layout();
         api::delete_font(previous);
+        api::delete_font(previous_search);
         Ok(())
     }
 
@@ -1248,45 +1500,79 @@ impl App {
         if message.message != WM_KEYDOWN {
             return false;
         }
+        let focus = unsafe { GetFocus() };
+        if message.wParam == 0x1B {
+            if self.panel == Panel::Settings {
+                self.toggle_settings();
+            } else {
+                unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+            }
+            return true;
+        }
         let control = unsafe { GetKeyState(0x11) };
-        if message.wParam == 'L' as usize && control < 0 {
+        if self.panel != Panel::Settings && message.wParam == 'L' as usize && control < 0 {
             unsafe { SetFocus(self.search) };
             api::send_message(self.search, style::EM_SETSEL, 0, -1);
             return true;
         }
         if message.wParam == 'C' as usize && control < 0 {
             // Ctrl+C：焦点在结果列表时复制所选路径。
-            let focus = unsafe { GetFocus() };
             if focus == self.results {
                 self.file_action(ID_COPY);
                 return true;
             }
         }
+        if message.wParam == 0x28
+            && focus == self.search
+            && self.rows_generation == Some(self.search_generation)
+            && !self.rows.is_empty()
+        {
+            self.select_first_result();
+            unsafe { SetFocus(self.results) };
+            return true;
+        }
         if message.wParam == 0x0D {
-            let focus = unsafe { GetFocus() };
             if focus == self.results {
                 self.file_action(ID_OPEN);
                 return true;
             }
             if focus == self.search {
+                if self.rows_generation == Some(self.search_generation) && !self.rows.is_empty() {
+                    self.select_first_result();
+                    self.file_action(ID_OPEN);
+                    return true;
+                }
                 unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
                 self.search_now();
-                unsafe { SetFocus(self.results) };
                 return true;
             }
         }
         false
     }
 
-    fn cancel_search(&mut self) {
-        if self.closing {
+    fn native_key_handling(&self, key: usize) -> bool {
+        let focus = unsafe { GetFocus() };
+        (focus == self.search && quick_panel::composing(self.search))
+            || (key == 0x1B
+                && (focus == self.types || focus == self.refresh_interval)
+                && api::send_message(focus, style::CB_GETDROPPEDSTATE, 0, 0) != 0)
+    }
+
+    fn select_first_result(&self) {
+        if self.selected_entry().is_some() || self.rows.is_empty() {
             return;
         }
-        unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
-        self.search_generation += 1;
-        self.set_rows(Vec::new());
-        self.last_notice = "已取消搜索；索引与文件未改动。".to_string();
-        self.render_status();
+        let item = LVITEMW {
+            state: style::LVIS_SELECTED,
+            stateMask: style::LVIS_SELECTED,
+            ..Default::default()
+        };
+        api::send_message(
+            self.results,
+            style::LVM_SETITEMSTATE,
+            0,
+            &item as *const LVITEMW as isize,
+        );
     }
 
     fn command(&mut self, id: usize, notification: u32) {
@@ -1294,6 +1580,15 @@ impl App {
             return;
         }
         match id {
+            ID_SETTINGS if notification == 0 => self.toggle_settings(),
+            ID_HIDE if notification == 0 && self.panel == Panel::Settings => {
+                self.apply(Deferred::Close)
+            }
+            ID_HIDE if notification == 0 => {
+                unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+            }
+            ID_FIXED_ROOTS if notification == 0 => self.use_fixed_roots(),
+            ID_REFRESH_INTERVAL if notification == 1 => self.change_refresh_setting(),
             ID_SEARCH => {
                 // EN_CHANGE
                 if notification == 0x0300 && !self.search.is_null() {
@@ -1310,7 +1605,7 @@ impl App {
             }
             ID_ADD_ROOT if notification == 0 => self.add_root(),
             ID_REMOVE_ROOT if notification == 0 => self.remove_root(),
-            ID_START if notification == 0 => {
+            ID_START if notification == 0 && self.panel == Panel::Settings => {
                 if self.config.roots.is_empty() {
                     api::warn(
                         self.hwnd,
@@ -1318,13 +1613,14 @@ impl App {
                     );
                     return;
                 }
-                self.auto_sync = true;
-                unsafe { SetTimer(self.hwnd, TIMER_SYNC, SYNC_INTERVAL_MS, None) };
-                self.begin_scan();
+                self.disarm_refresh();
+                self.auto_sync = self.config.refresh_delay().is_some();
+                self.begin_scan(false);
             }
             ID_STOP if notification == 0 => {
                 self.pause_scan();
-                self.last_notice = "已停止扫描并暂停 30 秒同步；已有索引仍可搜索。".to_string();
+                self.last_notice = "已暂停刷新，仍可搜索已有索引。".to_string();
+                self.persist_refresh_setting();
                 self.render_status();
             }
             ID_ROOTS => {
@@ -1465,14 +1761,48 @@ impl App {
         self.search_generation += 1;
         self.index = None;
         self.config.cache_roots.clear();
+        self.config.approved_volumes.clear();
         self.last_update = None;
         self.set_rows(Vec::new());
+    }
+
+    fn use_fixed_roots(&mut self) {
+        let roots = platform::local_fixed_roots();
+        if roots.is_empty() {
+            self.last_notice = "没有找到可用的本机固定盘。".to_string();
+            self.render_status();
+        } else if !platform::same_root_set(&self.config.roots, &roots) {
+            self.invalidate_scope();
+            self.config.roots = roots;
+            self.scope_changed("已选中本机固定盘。确认范围后点击开始索引。");
+        }
+    }
+
+    fn change_refresh_setting(&mut self) {
+        let selected = api::send_message(self.refresh_interval, style::CB_GETCURSEL, 0, 0);
+        let Some(&(minutes, label)) = REFRESH_PRESETS.get(selected as usize) else {
+            return;
+        };
+        self.config.refresh_minutes = Some(minutes);
+        if minutes == 0 {
+            self.auto_sync = false;
+            self.config.refresh_enabled = false;
+        }
+        self.last_notice = if self.auto_sync || minutes == 0 {
+            format!("刷新间隔已设为{label}。")
+        } else {
+            format!("刷新间隔已设为{label}。点击开始索引后生效。")
+        };
+        self.schedule_next_refresh();
+        api::enable(self.stop, self.auto_sync || self.scanning);
+        self.persist_refresh_setting();
+        self.render_status();
     }
 
     fn scope_changed(&mut self, notice: &str) {
         self.last_notice = notice.to_string();
         if let Err(err) = self.save_configuration() {
-            self.last_notice = format!("{} 配置未保存：{err}", self.last_notice);
+            self.storage_notice = format!("范围未保存。重启会读取上次保存的范围和刷新设置：{err}");
         }
         self.refresh_roots();
         self.render_status();
@@ -1493,13 +1823,14 @@ impl App {
         api::enable(self.remove, false);
     }
 
-    fn begin_scan(&mut self) {
+    fn begin_scan(&mut self, automatic: bool) {
         if self.scanning || self.config.roots.is_empty() {
             return;
         }
         self.scan_generation += 1;
         let generation = self.scan_generation;
         let roots: Vec<PathBuf> = self.config.roots.iter().map(PathBuf::from).collect();
+        let approved = automatic.then(|| self.config.approved_volumes.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(Arc::clone(&cancel));
         self.scanning = true;
@@ -1511,7 +1842,18 @@ impl App {
 
         let sender = self.events_tx.clone();
         let hwnd = SendHwnd(self.hwnd);
-        let cache_path = self.cache_path.clone();
+        // Write to the unreferenced slot. The atomic config write publishes the
+        // new snapshot and its volume approval together.
+        let cache_slot = self.cache_path.as_ref().map(|_| {
+            self.config
+                .cache_slot
+                .map_or(CacheSlot::A, CacheSlot::alternate)
+        });
+        let cache_path = self
+            .cache_path
+            .as_ref()
+            .zip(cache_slot)
+            .map(|(path, slot)| slot.path(path));
         let gate = Arc::clone(&self.scan_gate);
         let progress_slot = Arc::clone(&self.progress_slot);
         let storage_guard = self.storage_guard.clone();
@@ -1524,8 +1866,22 @@ impl App {
             if cancel.load(Ordering::SeqCst) {
                 return;
             }
-            for root in &roots {
-                if let Err(err) = platform::local_directory(root) {
+            let preflight = (|| {
+                for root in &roots {
+                    platform::local_directory(root)?;
+                }
+                let volumes = platform::volume_ids(&roots).ok();
+                if approved
+                    .as_ref()
+                    .is_some_and(|ids| volumes.as_ref() != Some(ids))
+                {
+                    return Err("索引范围所在的磁盘已变化，请重新确认后开始索引。".to_string());
+                }
+                Ok(volumes)
+            })();
+            let volume_ids = match preflight {
+                Ok(ids) => ids,
+                Err(err) => {
                     send_event(
                         &sender,
                         hwnd,
@@ -1536,7 +1892,7 @@ impl App {
                     );
                     return;
                 }
-            }
+            };
             let last_progress = Mutex::new(Instant::now() - PROGRESS_INTERVAL);
             let scan_result = scan(&cancel, &roots, |progress| {
                 {
@@ -1566,6 +1922,20 @@ impl App {
                     return;
                 }
             };
+            if volume_ids
+                .as_ref()
+                .is_some_and(|ids| platform::volume_ids(&roots).ok().as_ref() != Some(ids))
+            {
+                send_event(
+                    &sender,
+                    hwnd,
+                    Event::Scan {
+                        generation,
+                        outcome: Err("扫描期间磁盘发生变化，已保留旧索引。".to_string()),
+                    },
+                );
+                return;
+            }
             let mut save_error = None;
             if let Some(path) = cache_path {
                 if let Err(err) = index.save_cancellable(&cancel, &path) {
@@ -1583,6 +1953,8 @@ impl App {
                     generation,
                     outcome: Ok(ScanSuccess {
                         index,
+                        volume_ids,
+                        cache_slot,
                         save_error,
                         updated: SystemTime::now(),
                     }),
@@ -1593,7 +1965,8 @@ impl App {
 
     fn pause_scan(&mut self) {
         self.auto_sync = false;
-        unsafe { KillTimer(self.hwnd, TIMER_SYNC) };
+        self.config.refresh_enabled = false;
+        self.disarm_refresh();
         self.scan_generation += 1;
         if let Some(cancel) = self.scan_cancel.take() {
             cancel.store(true, Ordering::SeqCst);
@@ -1602,6 +1975,40 @@ impl App {
         self.set_scan_progress(false);
         api::enable(self.start, !self.config.roots.is_empty());
         api::enable(self.stop, false);
+    }
+
+    fn disarm_refresh(&mut self) {
+        unsafe { KillTimer(self.hwnd, TIMER_SYNC) };
+        self.next_refresh = None;
+    }
+
+    fn schedule_next_refresh(&mut self) {
+        self.disarm_refresh();
+        let Some(delay) = self
+            .config
+            .refresh_delay()
+            .filter(|_| self.auto_sync && !self.scanning)
+        else {
+            return;
+        };
+        let deadline = Instant::now() + delay;
+        if unsafe { SetTimer(self.hwnd, TIMER_SYNC, delay.as_millis() as u32, None) } == 0 {
+            self.auto_sync = false;
+            self.config.refresh_enabled = false;
+            api::enable(self.stop, false);
+            self.last_notice = "无法设置定时刷新，请手动开始索引。".to_string();
+            self.persist_refresh_setting();
+            return;
+        }
+        self.next_refresh = Some(deadline);
+    }
+
+    fn persist_refresh_setting(&mut self) {
+        if self.config_path.is_some() {
+            if let Err(err) = self.save_configuration() {
+                self.storage_notice = format!("刷新设置未保存。重启会读取上次保存的设置：{err}");
+            }
+        }
     }
 
     fn start_search_worker(&mut self) {
@@ -1645,13 +2052,25 @@ impl App {
 
     fn queue_search(&mut self) {
         self.search_generation += 1;
+        self.selection_buttons();
+        let query = api::text(self.search).trim().to_string();
+        let panel = Panel::for_query(self.panel == Panel::Settings, &query);
+        if panel != self.panel && unsafe { IsIconic(self.hwnd) } == 0 {
+            self.position_panel(panel, false);
+        }
+        if query.is_empty() {
+            self.rows_generation = None;
+            self.set_rows(Vec::new());
+            self.layout();
+            self.render_status();
+            return;
+        }
         let Some(index) = self.index.clone() else {
             self.set_rows(Vec::new());
-            self.last_notice = "还没有可用索引。添加目录后点击“开始索引”。".to_string();
+            self.last_notice = "在索引设置里确认范围，再开始索引。".to_string();
             self.render_status();
             return;
         };
-        let query = api::text(self.search).trim().to_string();
         let selected = api::send_message(self.types, style::CB_GETCURSEL, 0, 0);
         let kinds = [
             None,
@@ -1733,11 +2152,13 @@ impl App {
                     Err(err) => {
                         // 失败就停掉 30 秒定时器：反复重试失败任务只会白烧 CPU。
                         self.auto_sync = false;
-                        unsafe { KillTimer(self.hwnd, TIMER_SYNC) };
+                        self.config.refresh_enabled = false;
+                        self.disarm_refresh();
                         api::enable(self.stop, false);
                         self.last_notice = format!(
                             "索引失败，已有缓存仍可使用；自动同步已暂停，请处理后再手动开始：{err}"
                         );
+                        self.persist_refresh_setting();
                         self.render_status();
                         return;
                     }
@@ -1747,6 +2168,11 @@ impl App {
                     if let Some(err) = success.save_error {
                         self.last_notice = "本次索引未提交，保留原索引与搜索结果。".to_string();
                         self.storage_notice = format!("缓存未保存：{err}");
+                        if self.config.approved_volumes.is_empty() {
+                            self.auto_sync = false;
+                            api::enable(self.stop, false);
+                        }
+                        self.schedule_next_refresh();
                         self.render_status();
                         return;
                     }
@@ -1756,19 +2182,33 @@ impl App {
                 self.last_update = Some(success.updated);
                 self.storage_notice.clear();
                 self.last_notice = format!("索引完成：{count} 项。");
+                self.config.approved_volumes = success.volume_ids.unwrap_or_default();
+                if self.auto_sync && self.config.approved_volumes.is_empty() {
+                    self.auto_sync = false;
+                    api::enable(self.stop, false);
+                    self.last_notice
+                        .push_str("卷标识无法验证，定时刷新已暂停。");
+                }
                 if self.cache_path.is_none() {
                     // 启动时已明确降级为仅内存模式：快照可用，但没有有效缓存范围。
                     self.storage_notice =
                         "仅内存索引，退出后丢失；配置与缓存未持久化。".to_string();
                     self.config.cache_roots.clear();
+                    self.config.refresh_enabled = false;
                 } else {
                     // 只有真正持久化成功，cache_roots 才代表下次启动可加载的范围。
                     self.config.cache_roots = self.config.roots.clone();
+                    self.config.refresh_enabled = self.auto_sync;
+                    let previous_slot = self.config.cache_slot;
+                    self.config.cache_slot = success.cache_slot;
                     if let Err(err) = self.save_configuration() {
+                        self.config.cache_slot = previous_slot;
                         self.config.cache_roots.clear();
+                        self.config.refresh_enabled = false;
                         self.storage_notice = format!("配置未保存：{err}");
                     }
                 }
+                self.schedule_next_refresh();
                 self.render_status();
                 self.search_now();
             }
@@ -1785,9 +2225,10 @@ impl App {
                         let count = index.len();
                         self.index = Some(Arc::new(index));
                         self.last_update = Some(updated);
-                        self.last_notice = format!(
-                            "已加载本机缓存（{count} 项），未启动扫描。点击“开始索引”才启用同步。"
-                        );
+                        self.auto_sync = self.config.can_resume_refresh();
+                        self.last_notice = format!("已加载本机索引（{count} 项）。");
+                        self.schedule_next_refresh();
+                        api::enable(self.stop, self.auto_sync);
                         self.render_status();
                         self.search_now();
                     }
@@ -1807,6 +2248,7 @@ impl App {
                 }
                 match outcome {
                     Ok((entries, total)) => {
+                        self.rows_generation = Some(generation);
                         self.set_rows(entries);
                         self.last_notice =
                             format!("共命中 {total} 项，显示 {} 项", self.rows.len());
@@ -1816,6 +2258,7 @@ impl App {
                         }
                     }
                     Err(err) => {
+                        self.rows_generation = None;
                         self.set_rows(Vec::new());
                         self.last_notice = format!("搜索条件有误：{err}");
                     }
@@ -1888,6 +2331,10 @@ impl App {
     /// 没有任何结果行时，在结果区显示引导文案；有行则隐藏。
     fn refresh_empty_state(&self) {
         if self.empty.is_null() {
+            return;
+        }
+        if self.panel != Panel::Results {
+            unsafe { ShowWindow(self.empty, SW_HIDE) };
             return;
         }
         let text = if self.index.is_none() {
@@ -2032,13 +2479,17 @@ impl App {
     }
 
     fn selection_buttons(&mut self) {
-        let selected = self.selected_entry().is_some();
+        let selected =
+            self.rows_generation == Some(self.search_generation) && self.selected_entry().is_some();
         api::enable(self.open, selected);
         api::enable(self.reveal, selected);
         api::enable(self.copy, selected);
     }
 
     fn file_action(&mut self, action: usize) {
+        if self.rows_generation != Some(self.search_generation) {
+            return;
+        }
         let Some(entry) = self.selected_entry() else {
             return;
         };
@@ -2049,6 +2500,16 @@ impl App {
         }
         if !self.in_scope(&path) {
             api::warn(self.hwnd, "该项目已不在当前索引范围内，请重新索引。");
+            return;
+        }
+        if !self.config.approved_volumes.is_empty()
+            && !platform::volume_ids(std::slice::from_ref(&path)).is_ok_and(|observed| {
+                observed
+                    .iter()
+                    .all(|(drive, id)| self.config.approved_volumes.get(drive) == Some(id))
+            })
+        {
+            api::warn(self.hwnd, "此结果所在的磁盘已变化。请核对范围后重新索引。");
             return;
         }
         if std::fs::symlink_metadata(&path).is_err() {
@@ -2098,9 +2559,10 @@ impl App {
     }
 
     fn render_status(&mut self) {
-        let mut mode = "同步未启动".to_string();
+        let mut mode = "手动刷新".to_string();
         if self.auto_sync {
-            mode = "30 秒同步已启用".to_string();
+            let label = REFRESH_PRESETS[self.config.refresh_preset()].1;
+            mode = format!("{label}刷新");
         }
         if self.scanning {
             mode = format!("扫描中 · {mode}");
@@ -2115,11 +2577,26 @@ impl App {
         };
         let notice =
             format!("{} {}", self.last_notice, self.storage_notice).replace(['\r', '\n'], " ");
-        let text = format!(
-            "{} · 索引 {} 项{updated} · {notice}",
-            mode,
-            group_digits(count)
-        );
+        let shortcut = if self.hotkey {
+            "Ctrl+Alt+Space"
+        } else {
+            "全局快捷键不可用"
+        };
+        let text = if self.panel == Panel::Search
+            && self.index.is_some()
+            && !self.scanning
+            && self.storage_notice.is_empty()
+        {
+            format!("已索引 {} 项 · {mode} · {shortcut}", group_digits(count))
+        } else if self.panel == Panel::Search {
+            format!("{} · {shortcut}", notice.trim())
+        } else {
+            format!(
+                "{} · 索引 {} 项{updated} · {notice}",
+                mode,
+                group_digits(count)
+            )
+        };
         let buffer = api::wide(&text);
         unsafe {
             SetWindowTextW(self.status, buffer.as_ptr());
@@ -2129,6 +2606,7 @@ impl App {
 
     fn load_configuration(&mut self) {
         let Some(config_path) = self.config_path.clone() else {
+            self.config.roots = platform::local_fixed_roots();
             return;
         };
         if platform::is_link_or_reparse(&config_path) {
@@ -2137,7 +2615,10 @@ impl App {
         }
         let data = match std::fs::read(&config_path) {
             Ok(data) => data,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.config.roots = platform::local_fixed_roots();
+                return;
+            }
             Err(err) => {
                 self.startup_notice = format!("读取目录配置失败；请重新添加本机目录：{err}");
                 return;
@@ -2181,7 +2662,11 @@ impl App {
             && platform::same_root_set(&config.cache_roots, &roots)
         {
             self.config.cache_roots = roots.clone();
+            self.config.refresh_enabled = config.refresh_enabled;
+            self.config.approved_volumes = config.approved_volumes;
         }
+        self.config.refresh_minutes = config.refresh_minutes;
+        self.config.cache_slot = config.cache_slot;
         self.config.roots = roots;
     }
 
@@ -2201,16 +2686,26 @@ impl App {
         if !platform::same_root_set(&self.config.roots, &self.config.cache_roots) {
             return;
         }
+        let cache_path = self
+            .config
+            .cache_slot
+            .map_or_else(|| cache_path.clone(), |slot| slot.path(&cache_path));
         let generation = self.scan_generation;
         // 大缓存加载可能要几秒：同样用底部进度条提示。
         self.set_scan_progress(true);
         let sender = self.events_tx.clone();
         let hwnd = SendHwnd(self.hwnd);
         let roots: Vec<PathBuf> = self.config.roots.iter().map(PathBuf::from).collect();
+        let approved = self.config.approved_volumes.clone();
         let storage_guard = self.storage_guard.clone();
         std::thread::spawn(move || {
             let _storage_guard = storage_guard;
             let outcome = (|| -> Result<(Index, SystemTime), String> {
+                if !approved.is_empty()
+                    && platform::volume_ids(&roots).ok().as_ref() != Some(&approved)
+                {
+                    return Err("索引范围所在的磁盘已变化。请核对范围后重新索引。".to_string());
+                }
                 let metadata = std::fs::symlink_metadata(&cache_path)
                     .map_err(|err| format!("缓存不可用：{err}"))?;
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2239,6 +2734,10 @@ impl App {
             return;
         }
         self.closing = true;
+        if self.hotkey {
+            unsafe { UnregisterHotKey(self.hwnd, SEARCH_HOTKEY) };
+            self.hotkey = false;
+        }
         self.set_scan_progress(false);
         unsafe {
             KillTimer(self.hwnd, TIMER_SEARCH);
@@ -2257,6 +2756,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        api::delete_font(self.search_font);
         api::delete_font(self.font);
         self.font = std::ptr::null_mut();
     }
@@ -2328,8 +2828,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recommended_scope_and_legacy_cache_do_not_enable_periodic_refresh() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "roots": ["C:\\", "D:\\"],
+            "cache_roots": ["D:\\", "C:\\"]
+        }))
+        .expect("read a legacy scope");
+        assert_eq!(config.refresh_delay(), Some(Duration::from_secs(3600)));
+        assert!(!config.can_resume_refresh());
+
+        config.refresh_enabled = true;
+        config.cache_roots.clear();
+        assert!(
+            !config.can_resume_refresh(),
+            "preselected roots need a completed index"
+        );
+        config.cache_roots = config.roots.clone();
+        assert!(
+            !config.can_resume_refresh(),
+            "paths alone do not authorize a timer"
+        );
+        config.approved_volumes = BTreeMap::from([
+            ("C:\\".to_string(), "volume-c".to_string()),
+            ("D:\\".to_string(), "volume-d".to_string()),
+        ]);
+        config.cache_slot = Some(CacheSlot::A);
+        assert!(config.can_resume_refresh());
+        config.refresh_minutes = Some(15);
+        assert_eq!(config.refresh_delay(), Some(Duration::from_secs(900)));
+        config.refresh_minutes = Some(0);
+        assert!(!config.can_resume_refresh());
+        config.refresh_minutes = Some(30);
+        config.roots.pop();
+        assert!(
+            !config.can_resume_refresh(),
+            "changing the scope requires another start"
+        );
+    }
+
+    #[test]
     fn startup_progress_control_uses_the_registered_win32_class() {
         assert_eq!(progress_control_class(), "msctls_progress32");
+    }
+
+    #[test]
+    fn rebuilding_uses_an_unreferenced_cache_file() {
+        let legacy = Path::new("storage").join("index.json");
+        let first = CacheSlot::A;
+        let next = first.alternate();
+        assert_ne!(first.path(&legacy), legacy);
+        assert_ne!(first.path(&legacy), next.path(&legacy));
+        assert_eq!(next.alternate(), first);
     }
 
     #[test]
@@ -2405,9 +2954,9 @@ mod tests {
 
     #[test]
     fn synchronous_minimum_size_uses_the_current_dpi_snapshot() {
-        assert_eq!(min_track_size(96), (860, 620));
-        assert_eq!(min_track_size(144), (1290, 930));
-        assert_eq!(min_track_size(192), (1720, 1240));
+        assert_eq!(min_track_size(96), (280, 100));
+        assert_eq!(min_track_size(144), (420, 150));
+        assert_eq!(min_track_size(192), (560, 200));
     }
 
     #[test]

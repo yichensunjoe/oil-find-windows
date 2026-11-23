@@ -405,9 +405,9 @@ pub fn set_font(hwnd: HWND, font: HFONT) {
 }
 
 /// 创建界面字体（Microsoft YaHei UI），高度按 DPI 缩放。
-pub fn create_font(dpi: i32) -> Result<HFONT, String> {
+pub fn create_font(dpi: i32, logical_height: i32) -> Result<HFONT, String> {
     let face = wide("Microsoft YaHei UI");
-    let height = -(17 * dpi / 96);
+    let height = -(logical_height * dpi / 96);
     let font = unsafe { CreateFontW(height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr()) };
     if font.is_null() {
         return Err("创建界面字体失败".to_string());
