@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 在 macOS/Linux 上交叉编译 Windows 产物。
+# Cross-build the Windows executable on macOS or Linux.
 #
-# 真正的发布包由 Windows 宿主（或 CI 的 windows-latest）上的 build.ps1 生成：
-# 交叉编译依赖 MSVC 链接器和 Windows 资源编译器。仅发布通过校验的产物。
+# Native Windows builds use build.ps1. Cross-builds need an MSVC linker
+# and a Windows resource compiler. Only a verified executable is published locally.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
