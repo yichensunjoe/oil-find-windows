@@ -154,10 +154,13 @@ fn cached_body_requires_the_same_approved_scope() {
     let unrelated = Fixture::new();
     folder.write("内部.txt", "海水淡化");
     let data = serde_json::to_vec(&folder.scan()).unwrap();
-    let restored = ContentIndex::from_cache(&data, std::slice::from_ref(&folder.0)).unwrap();
+    folder.write("content-cache.json", data);
+    let stored =
+        crate::content::read_local_file(&folder.0.join("content-cache.json"), 1024 * 1024).unwrap();
+    let restored = ContentIndex::from_cache(&stored, std::slice::from_ref(&folder.0)).unwrap();
     assert_eq!(restored.len(), 1);
     for roots in [&[][..], std::slice::from_ref(&unrelated.0)] {
-        assert!(ContentIndex::from_cache(&data, roots).is_err());
+        assert!(ContentIndex::from_cache(&stored, roots).is_err());
     }
 }
 

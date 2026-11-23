@@ -451,7 +451,11 @@ fn word_units(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 pub fn read_local_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    read_limited(&open_local_file(path, None)?, limit)
+    #[cfg(windows)]
+    let volumes = crate::platform::volume_ids(&[path.to_path_buf()]).map_err(io::Error::other)?;
+    #[cfg(not(windows))]
+    let volumes = BTreeMap::new();
+    read_limited(&open_indexed_file(path, &volumes)?, limit)
 }
 
 fn read_source(
@@ -471,29 +475,7 @@ pub fn open_indexed_file(
     path: &Path,
     approved_volumes: &BTreeMap<String, String>,
 ) -> io::Result<File> {
-    #[cfg(windows)]
-    let volume_path = {
-        let text = path
-            .to_str()
-            .ok_or_else(|| io::Error::other("文件路径无效"))?;
-        let drive = text
-            .get(..2)
-            .ok_or_else(|| io::Error::other("文件盘符无效"))?;
-        let drive = format!("{}\\", drive.to_ascii_uppercase());
-        let volume = approved_volumes
-            .get(&drive)
-            .ok_or_else(|| io::Error::other("文件所在磁盘未经确认"))?;
-        let rest = text
-            .get(3..)
-            .ok_or_else(|| io::Error::other("文件路径无效"))?;
-        Some(format!("{volume}{rest}"))
-    };
-    #[cfg(not(windows))]
-    let volume_path: Option<String> = {
-        let _ = approved_volumes;
-        None
-    };
-    open_local_file(path, volume_path.as_deref())
+    open_local_file(path, approved_volumes)
 }
 
 fn read_limited(file: &File, limit: usize) -> io::Result<Vec<u8>> {
@@ -515,8 +497,8 @@ fn read_limited(file: &File, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
-    use std::os::windows::fs::MetadataExt;
+fn open_local_file(path: &Path, volumes: &BTreeMap<String, String>) -> io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
@@ -529,9 +511,10 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         GetFinalPathNameByHandleW, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        VOLUME_NAME_GUID,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, VOLUME_NAME_GUID,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -539,12 +522,44 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
         | FILE_ATTRIBUTE_OFFLINE
         | FILE_ATTRIBUTE_RECALL_ON_OPEN
         | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-    let expected = volume_path
-        .or_else(|| path.to_str())
+    let input = path
+        .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "文件路径无效"))?;
-    let expected = expected.strip_prefix(r"\\?\").unwrap_or(expected);
-    let expected = expected.replace('/', "\\");
-    let mut nt_path: Vec<u16> = format!(r"\??\{expected}").encode_utf16().collect();
+    let input = input.replace('/', "\\");
+    let (drive, relative) = input
+        .split_once('\\')
+        .filter(|(drive, relative)| {
+            drive.len() == 2
+                && drive.as_bytes()[1] == b':'
+                && !relative.is_empty()
+                && !relative.contains([':', '\0'])
+                && relative
+                    .split('\\')
+                    .all(|part| !matches!(part, "" | "." | ".."))
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "文件路径无效"))?;
+    let drive = format!("{}\\", drive.to_ascii_uppercase());
+    let volume = volumes
+        .get(&drive)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "文件所在磁盘未经确认"))?;
+
+    // The GUID names a local volume confirmed by GetVolumeNameForVolumeMountPointW.
+    // Open that root first, so no-follow parsing begins below NT's DOS alias.
+    let root = fs::OpenOptions::new()
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+        )
+        .open(volume)?;
+    let metadata = root.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & UNSAFE_ATTRIBUTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "无法验证本机磁盘",
+        ));
+    }
+    let mut nt_path: Vec<u16> = relative.encode_utf16().collect();
     let length = u16::try_from(nt_path.len() * 2)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "文件路径过长"))?;
     let name = UNICODE_STRING {
@@ -554,14 +569,15 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: root.as_raw_handle(),
         ObjectName: &name,
         Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
         ..Default::default()
     };
     let mut handle = std::ptr::null_mut();
     let mut information = IO_STATUS_BLOCK::default();
-    // The object name and I/O status storage stay alive during this synchronous
-    // request. OBJ_DONT_REPARSE applies to ancestors as well as the leaf.
+    // The root handle and buffers stay alive for the synchronous request.
+    // Reject reparse points in the path relative to that root handle.
     let status = unsafe {
         NtOpenFile(
             &mut handle,
@@ -602,18 +618,12 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
     // Validate the opened handle before reading any bytes. This prevents a
     // junction swapped in after the metadata scan from redirecting a body read.
     let mut buffer = [0; 512];
-    let flags = FILE_NAME_NORMALIZED
-        | if volume_path.is_some() {
-            VOLUME_NAME_GUID
-        } else {
-            0
-        };
     let read_path = |buffer: &mut [u16]| unsafe {
         GetFinalPathNameByHandleW(
             file.as_raw_handle(),
             buffer.as_mut_ptr(),
             buffer.len() as u32,
-            flags,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_GUID,
         ) as usize
     };
     let length = read_path(&mut buffer);
@@ -629,12 +639,14 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
     } else {
         return Err(io::Error::other("无法验证已打开的文件"));
     };
-    let resolved = resolved.strip_prefix(r"\\?\").unwrap_or(&resolved);
-    let expected_components = expected.split_once('\\');
-    let actual_components = resolved.split_once('\\');
-    if !matches!((expected_components, actual_components),
-        (Some((volume, path)), Some((actual_volume, actual_path)))
-            if volume.eq_ignore_ascii_case(actual_volume) && path == actual_path)
+    let expected_volume = volume.trim_end_matches('\\');
+    if !resolved
+        .get(..expected_volume.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected_volume))
+        || resolved
+            .get(expected_volume.len()..)
+            .and_then(|path| path.strip_prefix('\\'))
+            != Some(relative)
     {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "文件位置已变化"));
     }
@@ -642,7 +654,7 @@ fn open_local_file(path: &Path, volume_path: Option<&str>) -> io::Result<File> {
 }
 
 #[cfg(not(windows))]
-fn open_local_file(path: &Path, _: Option<&str>) -> io::Result<File> {
+fn open_local_file(path: &Path, _: &BTreeMap<String, String>) -> io::Result<File> {
     if !fs::symlink_metadata(path)?.is_file() || fs::canonicalize(path)? != path {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "文件位置已变化"));
     }
