@@ -20,16 +20,18 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 // ClientToScreen / ScreenToClient 在 Gdi 模块（user32 转发），与绘制用同一组。
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, FillRect, GetStockObject, GetSysColorBrush, InvalidateRect, ScreenToClient,
-    SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, COLOR_WINDOW, HDC, HFONT, TRANSPARENT,
+    ClientToScreen, GetSysColor, GetSysColorBrush, InvalidateRect, RedrawWindow, ScreenToClient,
+    UpdateWindow, COLOR_WINDOW, COLOR_WINDOWTEXT, HDC, HFONT, RDW_ALLCHILDREN, RDW_ERASE,
+    RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 // 表头排序、命中测试与进度条类所需的常量与结构。
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, HDITEMW, HDI_TEXT, HDN_ITEMCLICK, ICC_LISTVIEW_CLASSES,
-    ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT,
-    LVITEMW, LVN_ITEMCHANGED, NMHDR, NMHEADERW, NMITEMACTIVATE, NM_DBLCLK,
+    InitCommonControlsEx, CDDS_PREPAINT, CDRF_SKIPDEFAULT, HDITEMW, HDI_TEXT, HDN_ITEMCLICK,
+    ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCOLUMNW,
+    LVHITTESTINFO, LVIF_TEXT, LVITEMW, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    NMCUSTOMDRAW, NMHDR, NMHEADERW, NMITEMACTIVATE, NM_CUSTOMDRAW, NM_DBLCLK,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -41,14 +43,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetForegroundWindow, GetMessageW, IsDialogMessageW, IsIconic,
-    KillTimer, LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    IDC_ARROW, MF_STRING, MINMAXINFO, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_MINIMIZE,
-    SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_HOTKEY, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    DispatchMessageW, EnumChildWindows, GetClientRect, GetForegroundWindow, GetMessageW,
+    IsDialogMessageW, IsIconic, KillTimer, LoadCursorW, MoveWindow, PostQuitMessage,
+    RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, IDC_ARROW, MF_STRING, MINMAXINFO, MSG, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_HOTKEY,
+    WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW,
+    WS_BORDER, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU,
 };
 
 use crate::api::{self, SendHwnd};
@@ -58,6 +62,9 @@ use crate::quick_panel::{self, Panel};
 const RESULT_LIMIT: usize = 2000;
 const MAX_ROOTS: usize = 64;
 const SEARCH_DEBOUNCE_MS: u32 = 250;
+const BODY_FONT_HEIGHT: i32 = 19;
+const SEARCH_FONT_HEIGHT: i32 = 27;
+const TEXT_WEIGHT: i32 = 500;
 const REFRESH_PRESETS: [(u32, &str); 7] = [
     (0, "仅手动"),
     (15, "每 15 分钟"),
@@ -161,7 +168,6 @@ mod style {
     pub const SS_CENTER: u32 = 0x0000_0001;
     pub const EM_SETMARGINS: u32 = 0x00D3;
     // 静态控件颜色通知：wParam 是 HDC，lParam 是控件句柄。
-    pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
 }
 
 // Win32 may call the window procedure synchronously from almost any control
@@ -178,7 +184,17 @@ thread_local! {
     static WINDOW_RESULTS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_HEADER: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
     static WINDOW_EMPTY: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
-    static WINDOW_GLASS: Cell<bool> = const { Cell::new(false) };
+    static WINDOW_STATUS: Cell<HWND> = const { Cell::new(std::ptr::null_mut()) };
+    static WINDOW_PALETTE: Cell<Option<quick_panel::Palette>> = const { Cell::new(None) };
+    static WINDOW_SYSTEM_COLORS: Cell<bool> = const { Cell::new(true) };
+}
+
+fn active_palette() -> Option<quick_panel::Palette> {
+    if WINDOW_SYSTEM_COLORS.with(Cell::get) {
+        None
+    } else {
+        WINDOW_PALETTE.with(Cell::get)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,12 +212,12 @@ fn mark_window_stopped(state: &Cell<WindowState>) -> bool {
 enum Notification {
     HeaderClicked(i32),
     ResultDoubleClicked(i32),
-    ResultSelectionChanged,
 }
 
 #[derive(Clone, Copy)]
 enum Deferred {
     Size,
+    ThemeChanged,
     DpiChanged { dpi: i32, suggested: RECT },
     Command { id: usize, notification: u32 },
     ContextMenu { control: HWND, position: LPARAM },
@@ -218,12 +234,9 @@ impl Deferred {
     fn coalesces_with(self, other: Self) -> bool {
         match (self, other) {
             (Self::Size, Self::Size)
+            | (Self::ThemeChanged, Self::ThemeChanged)
             | (Self::Events, Self::Events)
-            | (Self::Progress, Self::Progress)
-            | (
-                Self::Notify(Notification::ResultSelectionChanged),
-                Self::Notify(Notification::ResultSelectionChanged),
-            ) => true,
+            | (Self::Progress, Self::Progress) => true,
             (Self::Timer(left), Self::Timer(right)) => left == right,
             _ => false,
         }
@@ -480,9 +493,6 @@ struct App {
     remove: HWND,
     start: HWND,
     stop: HWND,
-    open: HWND,
-    reveal: HWND,
-    copy: HWND,
     labels: Vec<HWND>,
     /// 扫描进度条（marquee），仅扫描期间可见。
     progress: HWND,
@@ -555,6 +565,8 @@ pub fn run() -> Result<(), String> {
     };
     WINDOW_DPI.with(|dpi| dpi.set(app.dpi));
     WINDOW_STATE.with(|state| state.set(WindowState::Starting));
+    WINDOW_PALETTE.with(|palette| palette.set(quick_panel::Palette::new()));
+    WINDOW_SYSTEM_COLORS.with(|colors| colors.set(quick_panel::uses_system_colors()));
     APP.with(|slot| *slot.borrow_mut() = Some(app));
     let outcome = run_window(instance);
     WINDOW_STATE.with(|state| state.set(WindowState::Stopped));
@@ -563,7 +575,10 @@ pub fn run() -> Result<(), String> {
     WINDOW_RESULTS.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_HEADER.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_EMPTY.with(|handle| handle.set(std::ptr::null_mut()));
-    WINDOW_GLASS.with(|glass| glass.set(false));
+    WINDOW_STATUS.with(|handle| handle.set(std::ptr::null_mut()));
+    if let Some(palette) = WINDOW_PALETTE.with(Cell::take) {
+        palette.release();
+    }
     drop(app);
     unsafe { CoUninitialize() };
     outcome
@@ -626,7 +641,7 @@ fn run_window(instance: HWND) -> Result<(), String> {
         return Err(init_error.unwrap_or_else(|| format!("创建应用窗口失败：{error}")));
     }
 
-    WINDOW_GLASS.with(|glass| glass.set(quick_panel::apply_material(hwnd)));
+    quick_panel::apply_frame(hwnd, active_palette().is_some());
     with_app(|app| app.position_panel(panel, true));
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
@@ -717,32 +732,53 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
-        WM_ERASEBKGND if WINDOW_GLASS.with(Cell::get) => {
-            let mut area = RECT::default();
-            if unsafe { GetClientRect(hwnd, &mut area) } != 0 {
-                unsafe { FillRect(wparam as HDC, &area, GetStockObject(BLACK_BRUSH) as _) };
-            }
-            1
-        }
-        style::WM_CTLCOLORSTATIC => {
-            let empty = WINDOW_EMPTY.with(Cell::get);
-            if !empty.is_null() && lparam == empty as isize {
-                unsafe { GetSysColorBrush(COLOR_WINDOW) as LRESULT }
-            } else if WINDOW_GLASS.with(Cell::get) {
-                unsafe {
-                    SetBkMode(wparam as HDC, TRANSPARENT as i32);
-                    SetTextColor(wparam as HDC, 0x0039_3026);
-                    GetStockObject(BLACK_BRUSH) as LRESULT
+        WM_ERASEBKGND => {
+            if let Some(palette) = active_palette() {
+                let mut area = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut area) } != 0 {
+                    palette.erase_panel(wparam as HDC, &area);
+                    return 1;
                 }
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            if let Some(palette) = active_palette() {
+                let control = lparam as HWND;
+                let on_content =
+                    message != WM_CTLCOLORSTATIC || control == WINDOW_EMPTY.with(Cell::get);
+                let muted = control == WINDOW_STATUS.with(Cell::get);
+                palette.control_colors(wparam as HDC, on_content, muted)
             } else {
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
             }
         }
-        // This is not an owner-data or owner-draw list: item text is stored
-        // by the control. Return 0 synchronously, including CDRF_DODEFAULT for
-        // NM_CUSTOMDRAW, and never queue drawing/data-request pointers. Copy
-        // only our actionable notifications before their lparam expires.
+        WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            if message == WM_SYSCOLORCHANGE {
+                // Common controls cache colors and do not get this broadcast.
+                unsafe { EnumChildWindows(hwnd, Some(forward_system_colors), 0) };
+            }
+            dispatch_deferred(Deferred::ThemeChanged);
+            result
+        }
         WM_NOTIFY => {
+            // Header button painting is synchronous. The list keeps its native
+            // drawing and notifications are copied before their pointers expire.
+            if matches!(wparam, ID_SETTINGS | ID_HIDE) && !lparam_is_null(lparam) {
+                let header = unsafe { &*(lparam as *const NMHDR) };
+                if header.idFrom == wparam && header.code == NM_CUSTOMDRAW {
+                    if let Some(palette) = active_palette() {
+                        let item = unsafe { &*(lparam as *const NMCUSTOMDRAW) };
+                        if item.dwDrawStage == CDDS_PREPAINT
+                            && palette.draw_header_button(item, WINDOW_DPI.with(Cell::get))
+                        {
+                            return CDRF_SKIPDEFAULT as LRESULT;
+                        }
+                    }
+                    return 0;
+                }
+            }
             let header = WINDOW_HEADER.with(Cell::get);
             let results = WINDOW_RESULTS.with(Cell::get);
             if let Some(notification) = unsafe { read_notification(lparam, header, results) } {
@@ -812,6 +848,11 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+extern "system" fn forward_system_colors(child: HWND, _: LPARAM) -> i32 {
+    api::send_message(child, WM_SYSCOLORCHANGE, 0, 0);
+    1
+}
+
 fn min_track_size(dpi: i32) -> (i32, i32) {
     (280 * dpi / 96, 100 * dpi / 96)
 }
@@ -835,14 +876,12 @@ unsafe fn read_notification(lparam: LPARAM, header: HWND, results: HWND) -> Opti
             let clicked = unsafe { &*(lparam as *const NMHEADERW) };
             return Some(Notification::HeaderClicked(clicked.iItem));
         }
-    } else if !results.is_null() && notice.hwndFrom == results {
-        if notice.code as i32 == NM_DBLCLK as i32 {
-            let clicked = unsafe { &*(lparam as *const NMITEMACTIVATE) };
-            return Some(Notification::ResultDoubleClicked(clicked.iItem));
-        }
-        if notice.code as i32 == LVN_ITEMCHANGED as i32 {
-            return Some(Notification::ResultSelectionChanged);
-        }
+    } else if !results.is_null()
+        && notice.hwndFrom == results
+        && notice.code as i32 == NM_DBLCLK as i32
+    {
+        let clicked = unsafe { &*(lparam as *const NMITEMACTIVATE) };
+        return Some(Notification::ResultDoubleClicked(clicked.iItem));
     }
     None
 }
@@ -885,9 +924,6 @@ impl App {
             remove: std::ptr::null_mut(),
             start: std::ptr::null_mut(),
             stop: std::ptr::null_mut(),
-            open: std::ptr::null_mut(),
-            reveal: std::ptr::null_mut(),
-            copy: std::ptr::null_mut(),
             labels: Vec::new(),
             progress: std::ptr::null_mut(),
             empty: std::ptr::null_mut(),
@@ -983,6 +1019,7 @@ impl App {
             }
             Deferred::Events => self.drain_events(),
             Deferred::Progress => self.show_progress(),
+            Deferred::ThemeChanged => self.refresh_theme(),
             Deferred::ToggleSearch => self.toggle_search_panel(),
             Deferred::Close => {
                 self.shutdown();
@@ -998,8 +1035,8 @@ impl App {
             self.dpi = window_dpi as i32;
         }
         WINDOW_DPI.with(|dpi| dpi.set(self.dpi));
-        self.font = api::create_font(self.dpi, 17)?;
-        self.search_font = api::create_font(self.dpi, 24)?;
+        self.font = api::create_font(self.dpi, BODY_FONT_HEIGHT, TEXT_WEIGHT)?;
+        self.search_font = api::create_font(self.dpi, SEARCH_FONT_HEIGHT, TEXT_WEIGHT)?;
 
         let make = |class: &str, label: &str, style: u32, ex_style: u32, id: usize| {
             api::create_control(
@@ -1035,7 +1072,7 @@ impl App {
             cue.as_ptr() as isize,
         );
         self.settings = make("BUTTON", "索引设置", style::WS_TABSTOP, 0, ID_SETTINGS)?;
-        self.hide = make("BUTTON", "最小化", style::WS_TABSTOP, 0, ID_HIDE)?;
+        self.hide = make("BUTTON", "收起", style::WS_TABSTOP, 0, ID_HIDE)?;
         self.fixed_roots = make("BUTTON", "本机固定盘", style::WS_TABSTOP, 0, ID_FIXED_ROOTS)?;
         self.refresh_interval = make(
             "COMBOBOX",
@@ -1059,25 +1096,13 @@ impl App {
             self.config.refresh_preset(),
             0,
         );
-        for (label, id) in [
-            ("添加目录…", ID_ADD_ROOT),
-            ("删除范围", ID_REMOVE_ROOT),
-            ("开始索引", ID_START),
-            ("暂停刷新", ID_STOP),
-            ("打开所选", ID_OPEN),
-            ("资源管理器定位", ID_REVEAL),
-            ("复制路径", ID_COPY),
+        for (label, id, control) in [
+            ("添加目录…", ID_ADD_ROOT, &mut self.add),
+            ("删除范围", ID_REMOVE_ROOT, &mut self.remove),
+            ("开始索引", ID_START, &mut self.start),
+            ("暂停刷新", ID_STOP, &mut self.stop),
         ] {
-            let handle = make("BUTTON", label, style::WS_TABSTOP, 0, id)?;
-            match id {
-                ID_ADD_ROOT => self.add = handle,
-                ID_REMOVE_ROOT => self.remove = handle,
-                ID_START => self.start = handle,
-                ID_STOP => self.stop = handle,
-                ID_OPEN => self.open = handle,
-                ID_REVEAL => self.reveal = handle,
-                _ => self.copy = handle,
-            }
+            *control = make("BUTTON", label, style::WS_TABSTOP, 0, id)?;
         }
         self.roots_list = make(
             "LISTBOX",
@@ -1108,14 +1133,9 @@ impl App {
         }
         api::send_message(self.types, style::CB_SETCURSEL, 0, 0);
 
-        self.results = make(
-            "SysListView32",
-            "",
-            style::RESULTS_STYLE,
-            style::WS_EX_CLIENTEDGE,
-            ID_RESULTS,
-        )?;
+        self.results = make("SysListView32", "", style::RESULTS_STYLE, 0, ID_RESULTS)?;
         WINDOW_RESULTS.with(|handle| handle.set(self.results));
+        self.apply_list_colors();
         api::send_message(
             self.results,
             style::LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -1149,6 +1169,7 @@ impl App {
             }
         }
         self.status = make("STATIC", "", style::SS_LEFT, 0, 0)?;
+        WINDOW_STATUS.with(|handle| handle.set(self.status));
 
         // 扫描进度条：indeterminate marquee，平时隐藏，扫描时显示。
         self.progress = make(progress_control_class(), "", style::PBS_MARQUEE, 0, 0)?;
@@ -1160,7 +1181,6 @@ impl App {
         unsafe { ShowWindow(self.empty, SW_HIDE) };
 
         self.refresh_roots();
-        self.selection_buttons();
         api::enable(self.stop, false);
         self.last_notice = if self.config.roots.is_empty() {
             "在索引设置里选择范围，再开始索引。".to_string()
@@ -1181,8 +1201,41 @@ impl App {
         value * self.dpi / 96
     }
 
+    fn apply_list_colors(&self) {
+        if self.results.is_null() {
+            return;
+        }
+        let (background, text) = if active_palette().is_some() {
+            (quick_panel::CONTENT_BACKGROUND, quick_panel::CONTENT_TEXT)
+        } else {
+            unsafe { (GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)) }
+        };
+        api::send_message(self.results, LVM_SETBKCOLOR, 0, background as isize);
+        api::send_message(self.results, LVM_SETTEXTBKCOLOR, 0, background as isize);
+        api::send_message(self.results, LVM_SETTEXTCOLOR, 0, text as isize);
+    }
+
+    fn refresh_theme(&self) {
+        let system = quick_panel::uses_system_colors();
+        let previous = WINDOW_SYSTEM_COLORS.with(|colors| colors.replace(system));
+        if !self.hwnd.is_null() {
+            if previous != system {
+                quick_panel::apply_frame(self.hwnd, active_palette().is_some());
+            }
+            self.apply_list_colors();
+            unsafe {
+                RedrawWindow(
+                    self.hwnd,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+        }
+    }
+
     fn set_search_margins(&self) {
-        let margin = self.px(12) as isize;
+        let margin = self.px(15) as isize;
         api::send_message(
             self.search,
             style::EM_SETMARGINS,
@@ -1209,17 +1262,7 @@ impl App {
             }
         };
         show(&[self.search], !settings);
-        show(
-            &[
-                self.results,
-                self.types,
-                self.labels[2],
-                self.open,
-                self.reveal,
-                self.copy,
-            ],
-            results,
-        );
+        show(&[self.results, self.types, self.labels[2]], results);
         show(
             &[
                 self.labels[1],
@@ -1236,28 +1279,28 @@ impl App {
         show(&[self.start], settings);
         self.refresh_empty_state();
 
-        let p = self.px(22);
+        let p = self.px(24);
         let w = area.right;
         let h = area.bottom;
         let right = w - p;
         let content_width = w - 2 * p;
-        let row = self.px(32);
+        let row = self.px(34);
         let gap = self.px(10);
         let place = |handle: HWND, x, y, width: i32, height: i32| {
             unsafe { MoveWindow(handle, x, y, width.max(1), height.max(1), 1) };
         };
 
-        let top = self.px(13);
+        let top = self.px(15);
         let hide_width = self.px(76);
         let settings_width = self.px(102);
         let settings_x = right - hide_width - gap - settings_width;
         place(self.labels[0], p, top + self.px(4), settings_x - p, row);
         place(self.settings, settings_x, top, settings_width, row);
         place(self.hide, right - hide_width, top, hide_width, row);
-        place(self.status, p, h - self.px(29), content_width, self.px(24));
+        place(self.status, p, h - self.px(33), content_width, self.px(27));
         place(self.progress, 0, h - self.px(4), w, self.px(4));
 
-        let body = self.px(57);
+        let body = self.px(60);
         let start_width = self.px(112);
         if settings {
             let button_width = self.px(132);
@@ -1315,7 +1358,7 @@ impl App {
             return;
         }
 
-        let edit_height = self.px(43);
+        let edit_height = self.px(48);
         place(self.search, p, body, content_width, edit_height);
         if !results {
             return;
@@ -1338,8 +1381,7 @@ impl App {
         );
 
         let list_y = types_y + row + gap;
-        let buttons_y = h - self.px(70);
-        let list_height = buttons_y - list_y - gap;
+        let list_height = h - self.px(45) - list_y;
         place(self.results, p, list_y, content_width, list_height);
         place(
             self.empty,
@@ -1348,17 +1390,9 @@ impl App {
             content_width - 2,
             row,
         );
-        place(self.open, p, buttons_y, self.px(104), row);
-        place(self.reveal, p + self.px(115), buttons_y, self.px(156), row);
-        place(self.copy, p + self.px(282), buttons_y, self.px(104), row);
-        for (position, column_width) in [
-            self.px(199),
-            (content_width - self.px(458)).max(self.px(80)),
-            self.px(84),
-            self.px(175),
-        ]
-        .into_iter()
-        .enumerate()
+        for (position, column_width) in quick_panel::result_columns(content_width, self.dpi)
+            .into_iter()
+            .enumerate()
         {
             api::send_message(
                 self.results,
@@ -1374,7 +1408,7 @@ impl App {
         let (settings_label, hide_label) = if panel == Panel::Settings {
             ("返回搜索", "退出")
         } else {
-            ("索引设置", "最小化")
+            ("索引设置", "收起")
         };
         api::put_text(self.settings, settings_label);
         api::put_text(self.hide, hide_label);
@@ -1432,8 +1466,8 @@ impl App {
         {
             return Err("显示缩放参数无效".to_string());
         }
-        let font = api::create_font(dpi, 17)?;
-        let search_font = match api::create_font(dpi, 24) {
+        let font = api::create_font(dpi, BODY_FONT_HEIGHT, TEXT_WEIGHT)?;
+        let search_font = match api::create_font(dpi, SEARCH_FONT_HEIGHT, TEXT_WEIGHT) {
             Ok(font) => font,
             Err(error) => {
                 api::delete_font(font);
@@ -1460,9 +1494,6 @@ impl App {
             self.remove,
             self.start,
             self.stop,
-            self.open,
-            self.reveal,
-            self.copy,
             self.progress,
             self.empty,
         ]);
@@ -1643,7 +1674,6 @@ impl App {
                     self.file_action(ID_OPEN);
                 }
             }
-            Notification::ResultSelectionChanged => self.selection_buttons(),
         }
     }
 
@@ -2052,7 +2082,6 @@ impl App {
 
     fn queue_search(&mut self) {
         self.search_generation += 1;
-        self.selection_buttons();
         let query = api::text(self.search).trim().to_string();
         let panel = Panel::for_query(self.panel == Panel::Settings, &query);
         if panel != self.panel && unsafe { IsIconic(self.hwnd) } == 0 {
@@ -2312,7 +2341,6 @@ impl App {
         unsafe {
             InvalidateRect(self.results, std::ptr::null(), 1);
         }
-        self.selection_buttons();
         self.refresh_empty_state();
     }
 
@@ -2417,7 +2445,6 @@ impl App {
                 item as usize,
                 &selection as *const LVITEMW as isize,
             );
-            self.selection_buttons();
         } else {
             let mut rect = RECT::default();
             if unsafe { GetClientRect(self.results, &mut rect) } == 0 {
@@ -2476,14 +2503,6 @@ impl App {
             return None;
         }
         Some(self.rows[selected as usize].clone())
-    }
-
-    fn selection_buttons(&mut self) {
-        let selected =
-            self.rows_generation == Some(self.search_generation) && self.selected_entry().is_some();
-        api::enable(self.open, selected);
-        api::enable(self.reveal, selected);
-        api::enable(self.copy, selected);
     }
 
     fn file_action(&mut self, action: usize) {
@@ -2590,6 +2609,13 @@ impl App {
             format!("已索引 {} 项 · {mode} · {shortcut}", group_digits(count))
         } else if self.panel == Panel::Search {
             format!("{} · {shortcut}", notice.trim())
+        } else if self.panel == Panel::Results
+            && !self.scanning
+            && !self.rows.is_empty()
+            && self.rows_generation == Some(self.search_generation)
+            && self.storage_notice.is_empty()
+        {
+            format!("{}  ·  回车打开 · 右键更多", notice.trim())
         } else {
             format!(
                 "{} · 索引 {} 项{updated} · {notice}",
