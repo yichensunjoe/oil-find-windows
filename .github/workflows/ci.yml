@@ -54,6 +54,12 @@ jobs:
       - name: Verify PE subsystem and embedded manifest
         shell: pwsh
         run: python ./rust/scripts/verify-pe.py ./outputs/windows-amd64/OilFind.exe --arch amd64
+      - name: Verify bounded PDF worker in the packaged executable
+        working-directory: rust
+        shell: pwsh
+        run: |
+          $env:OILFIND_PDF_WORKER_TEST_EXE = (Resolve-Path ../outputs/windows-amd64/OilFind.exe).Path
+          cargo test --locked -p oilfind-win pdf_worker::tests::real_executable_renders_a_highlight_through_the_job -- --exact
       - name: Test packaging scripts
         shell: pwsh
         run: python ./rust/scripts/test_build_scripts.py

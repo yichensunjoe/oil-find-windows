@@ -38,12 +38,20 @@ impl Fixture {
     }
 
     fn scan(&self) -> ContentIndex {
+        self.refresh(None)
+    }
+
+    fn refresh(&self, previous: Option<&ContentIndex>) -> ContentIndex {
+        self.try_refresh(previous).unwrap()
+    }
+
+    fn try_refresh(&self, previous: Option<&ContentIndex>) -> Result<ContentIndex, String> {
         let roots = std::slice::from_ref(&self.0);
         #[cfg(windows)]
         let volumes = crate::platform::volume_ids(roots).unwrap();
         #[cfg(not(windows))]
         let volumes = Default::default();
-        ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, None).unwrap()
+        ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, previous)
     }
 }
 
@@ -148,6 +156,46 @@ fn only_explicit_scope_is_read_and_links_are_ignored() {
     assert_eq!(index.len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn moving_an_indexed_folder_and_installing_a_link_drops_its_cached_bodies() {
+    let fixture = Fixture::new();
+    let outside = Fixture::new();
+    let folder = fixture.0.join("reports");
+    let destination = outside.0.join("reports");
+    fs::create_dir(&folder).unwrap();
+    fixture.write("reports/local.txt", "已索引的正文");
+    let previous = fixture.scan();
+    fs::rename(&folder, &destination).unwrap();
+    std::os::unix::fs::symlink(&destination, &folder).unwrap();
+
+    let refreshed = fixture.refresh(Some(&previous));
+    assert_eq!(refreshed.len(), 0);
+    assert_eq!(refreshed.report().unwrap().reused, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_indexed_subdirectory_does_not_drop_previous_results() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let folder = fixture.0.join("reports");
+    fs::create_dir(&folder).unwrap();
+    fixture.write("reports/local.txt", "已索引的正文");
+    let previous = fixture.scan();
+    let permissions = fs::metadata(&folder).unwrap().permissions();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o111)).unwrap();
+    let unreadable = fs::read_dir(&folder).is_err();
+    let refreshed = fixture.try_refresh(Some(&previous));
+    fs::set_permissions(&folder, permissions).unwrap();
+
+    if unreadable {
+        assert!(refreshed.is_err());
+        assert_eq!(previous.len(), 1);
+    }
+}
+
 #[test]
 fn cached_body_requires_the_same_approved_scope() {
     let folder = Fixture::new();
@@ -162,6 +210,155 @@ fn cached_body_requires_the_same_approved_scope() {
     for roots in [&[][..], std::slice::from_ref(&unrelated.0)] {
         assert!(ContentIndex::from_cache(&stored, roots).is_err());
     }
+}
+
+#[test]
+fn changing_roots_does_not_reuse_even_a_still_in_scope_file() {
+    let fixture = Fixture::new();
+    let child = fixture.0.join("scope");
+    fs::create_dir(&child).unwrap();
+    fixture.write("scope/present.txt", "正文");
+    let previous = fixture.scan();
+    let roots = &[child];
+    #[cfg(windows)]
+    let volumes = crate::platform::volume_ids(roots).unwrap();
+    #[cfg(not(windows))]
+    let volumes = Default::default();
+    let index =
+        ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, Some(&previous)).unwrap();
+    let report = index.report().unwrap();
+    assert_eq!((report.reused, report.extracted), (0, 1));
+}
+
+#[test]
+fn refresh_reuses_unchanged_text_from_disk_and_updates_the_snapshot() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "索引·不变");
+    fixture.write("b.txt", "索引·旧版");
+    fixture.write("c.txt", "索引·删除");
+    let bytes = serde_json::to_vec(&fixture.scan()).unwrap();
+    let previous = ContentIndex::from_cache(&bytes, std::slice::from_ref(&fixture.0)).unwrap();
+    fixture.write("b.txt", "索引·修改后");
+    fs::remove_file(fixture.0.join("c.txt")).unwrap();
+    fixture.write("d.txt", "索引·新增");
+
+    let refreshed = fixture.refresh(Some(&previous));
+    let report = refreshed.report().unwrap();
+    assert_eq!((report.reused, report.extracted), (1, 2));
+    assert_eq!(refreshed.skipped, 0);
+    let (hits, count) = refreshed.search("索引", 10, |_, _| std::cmp::Ordering::Equal);
+    assert_eq!(count, 3);
+    let names: Vec<_> = hits
+        .iter()
+        .map(|hit| refreshed.document(hit).name())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt", "d.txt"]);
+    assert_eq!(
+        refreshed
+            .search("旧版", 10, |_, _| std::cmp::Ordering::Equal)
+            .1,
+        0
+    );
+}
+
+#[test]
+fn same_length_and_modified_time_cannot_reuse_a_replacement_file() {
+    let fixture = Fixture::new();
+    fixture.write("document.txt", "before");
+    let previous = fixture.scan();
+    let path = fixture.0.join("document.txt");
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let replacement = fixture.0.join("replacement.tmp");
+    fixture.write("replacement.tmp", "update");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::rename(replacement, &path).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+    let (hits, _) = previous.search("before", 10, |_, _| std::cmp::Ordering::Equal);
+    assert!(!previous
+        .document(&hits[0])
+        .matches_file(&fs::File::open(&path).unwrap()));
+    let refreshed = fixture.refresh(Some(&previous));
+    let report = refreshed.report().unwrap();
+    assert_eq!((report.reused, report.extracted), (0, 1));
+    assert_eq!(
+        refreshed
+            .search("update", 10, |_, _| std::cmp::Ordering::Equal)
+            .1,
+        1
+    );
+}
+
+#[test]
+fn legacy_cache_without_identity_is_searchable_and_refreshes_once() {
+    let fixture = Fixture::new();
+    fixture.write("source.txt", "正文");
+    let mut value = serde_json::to_value(fixture.scan()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("report");
+    object.remove("skipped_sources");
+    object.get_mut("documents").unwrap()[0]["stamp"]
+        .as_object_mut()
+        .unwrap()
+        .remove("identity");
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let previous = ContentIndex::from_cache(&bytes, std::slice::from_ref(&fixture.0)).unwrap();
+    assert!(previous.report().is_none());
+    assert_eq!(
+        previous
+            .search("正文", 10, |_, _| std::cmp::Ordering::Equal)
+            .1,
+        1
+    );
+    let first = fixture.refresh(Some(&previous));
+    assert_eq!(first.report().unwrap().extracted, 1);
+    assert_eq!(fixture.refresh(Some(&first)).report().unwrap().reused, 1);
+}
+
+#[test]
+fn refresh_distinguishes_image_only_and_empty_text_from_limits_and_invalid_documents() {
+    let fixture = Fixture::new();
+    fixture.write("empty.txt", " \r\n\t");
+    fixture.write("photo.pdf", image_pdf());
+    fixture.write("invalid.pdf", "not a PDF");
+    fixture.write("invalid.docx", "not a DOCX");
+    fixture.write("over-text-limit.md", vec![b'a'; 2 * 1024 * 1024 + 1]);
+    fs::File::create(fixture.0.join("over-file-limit.pdf"))
+        .unwrap()
+        .set_len(32 * 1024 * 1024 + 1)
+        .unwrap();
+    fixture.write("contents.txt", "正文");
+
+    let index = fixture.scan();
+    let report = index.report().unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.skipped, 6);
+    assert_eq!(report.no_text, 2);
+    assert_eq!(report.extraction_failed, 2);
+    assert_eq!(report.too_large, 2);
+    assert_eq!(report.inaccessible, 0);
+    assert_eq!(report.unavailable, 0);
+
+    let bytes = serde_json::to_vec(&index).unwrap();
+    let restored = ContentIndex::from_cache(&bytes, std::slice::from_ref(&fixture.0)).unwrap();
+    assert_eq!(restored.report(), Some(report));
+    let refreshed = fixture.refresh(Some(&restored)).report().unwrap();
+    assert_eq!(refreshed.reused, 1);
+    assert_eq!(refreshed.extracted, 0);
+    assert_eq!(
+        (
+            refreshed.no_text,
+            refreshed.extraction_failed,
+            refreshed.too_large
+        ),
+        (2, 2, 2)
+    );
 }
 
 #[test]
@@ -190,7 +387,7 @@ fn edited_document_does_not_match_the_cached_snapshot() {
 
 #[cfg(windows)]
 #[test]
-fn opening_body_requires_the_expected_volume_guid() {
+fn rebuilding_the_index_requires_the_expected_volume_guid() {
     let fixture = Fixture::new();
     fixture.write("实验.txt", "海水淡化");
     let roots = std::slice::from_ref(&fixture.0);
@@ -198,9 +395,11 @@ fn opening_body_requires_the_expected_volume_guid() {
     for volume in volumes.values_mut() {
         *volume = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\".to_string();
     }
-    let index = ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, None).unwrap();
-    assert_eq!(index.len(), 0);
-    assert_eq!(index.skipped, 1);
+    let previous = fixture.scan();
+    assert!(
+        ContentIndex::refresh(&AtomicBool::new(false), roots, &volumes, Some(&previous)).is_err()
+    );
+    assert_eq!(previous.len(), 1);
 }
 
 #[cfg(windows)]
@@ -227,6 +426,24 @@ fn refresh_cannot_publish_an_empty_snapshot_when_an_indexed_file_is_locked() {
             .1,
         1
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_new_locked_file_has_its_own_skip_reason() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = Fixture::new();
+    fixture.write("locked.txt", "正文");
+    let _lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(fixture.0.join("locked.txt"))
+        .unwrap();
+    let index = fixture.scan();
+    assert_eq!(index.len(), 0);
+    assert_eq!(index.skipped, 1);
+    assert_eq!(index.report().unwrap().inaccessible, 1);
 }
 
 #[test]
@@ -259,6 +476,10 @@ fn pdf_hit_uses_the_page_number_and_highlights_decoded_chinese_text() {
     assert_eq!(hits[0].count, 1);
     assert_eq!(hits[0].location, 2);
     let doc = index.document(&hits[0]);
+    let (page, text, selection) = doc.pdf_match("海水淡化", 0).unwrap();
+    assert_eq!(page, 2);
+    assert_eq!(&text[selection], "海水淡化");
+    assert!(doc.pdf_match("海水淡化", 1).is_none());
     let preview = doc.preview("海水淡化", 0).unwrap();
     assert_eq!(preview.location, 2);
     assert_eq!(
@@ -270,6 +491,33 @@ fn pdf_hit_uses_the_page_number_and_highlights_decoded_chinese_text() {
         String::from_utf16(&units[preview.selection]).unwrap(),
         "海水淡化"
     );
+}
+
+fn image_pdf() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Stream};
+    let mut pdf = Document::with_version("1.5");
+    let pages = pdf.new_object_id();
+    let image = pdf.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "BitsPerComponent" => 8, "ColorSpace" => "DeviceGray",
+        },
+        vec![0],
+    ));
+    let contents = pdf.add_object(Stream::new(dictionary! {}, b"/Image Do".to_vec()));
+    let page = pdf.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "Contents" => contents,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image } },
+    });
+    pdf.set_object(
+        pages,
+        dictionary! { "Type" => "Pages", "Count" => 1, "Kids" => vec![page.into()] },
+    );
+    let root = pdf.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    pdf.trailer.set("Root", root);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+    bytes
 }
 
 fn chinese_pdf() -> Vec<u8> {

@@ -60,7 +60,9 @@ use crate::platform;
 use crate::quick_panel::{self, Panel};
 
 mod content_ui;
-use content_ui::ID_CONTENT;
+mod pdf_canvas;
+mod result_view;
+use content_ui::{ID_CONTENT, TIMER_CONTENT_REFRESH};
 
 const RESULT_LIMIT: usize = 2000;
 const MAX_ROOTS: usize = 64;
@@ -128,9 +130,13 @@ mod style {
     pub const LVS_REPORT: u32 = 0x0000_0001;
     pub const LVS_SINGLESEL: u32 = 0x0000_0004;
     pub const LVS_SHOWSELALWAYS: u32 = 0x0000_0008;
-    // No owner-data or owner-draw: the native control owns its item text.
-    pub const RESULTS_STYLE: u32 =
-        WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
+    // The app owns the image list used to size the taller body rows.
+    pub const RESULTS_STYLE: u32 = WS_TABSTOP
+        | WS_BORDER
+        | LVS_REPORT
+        | LVS_SINGLESEL
+        | LVS_SHOWSELALWAYS
+        | windows_sys::Win32::UI::Controls::LVS_SHAREIMAGELISTS;
     pub const LVS_EX_FULLROWSELECT: u32 = 0x0000_0020;
     pub const LVS_EX_DOUBLEBUFFER: u32 = 0x0001_0000;
     pub const LVCF_FMT: u32 = 0x0001;
@@ -423,6 +429,10 @@ enum Event {
         total: usize,
     },
     ContentReady(Result<content_ui::WorkResult, String>),
+    PdfReady {
+        ticket: u64,
+        result: Result<Arc<crate::pdf_preview::RenderedPage>, String>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -639,6 +649,7 @@ pub fn run() -> Result<(), String> {
     let app = APP.with(|slot| slot.borrow_mut().take());
     PENDING.with(|pending| pending.borrow_mut().clear());
     WINDOW_RESULTS.with(|handle| handle.set(std::ptr::null_mut()));
+    result_view::clear();
     WINDOW_HEADER.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_EMPTY.with(|handle| handle.set(std::ptr::null_mut()));
     WINDOW_STATUS.with(|handle| handle.set(std::ptr::null_mut()));
@@ -831,8 +842,8 @@ unsafe extern "system" fn window_proc(
             result
         }
         WM_NOTIFY => {
-            // Header button painting is synchronous. The list keeps its native
-            // drawing and notifications are copied before their pointers expire.
+            // Painting is synchronous. Copy other notifications before their
+            // native pointers expire.
             if matches!(wparam, ID_SETTINGS | ID_HIDE | ID_CONTENT) && !lparam_is_null(lparam) {
                 let header = unsafe { &*(lparam as *const NMHDR) };
                 if header.idFrom == wparam && header.code == NM_CUSTOMDRAW {
@@ -849,6 +860,13 @@ unsafe extern "system" fn window_proc(
             }
             let header = WINDOW_HEADER.with(Cell::get);
             let results = WINDOW_RESULTS.with(Cell::get);
+            if !results.is_null() && !lparam_is_null(lparam) {
+                let notice = unsafe { &*(lparam as *const NMHDR) };
+                if notice.hwndFrom == results && notice.code == NM_CUSTOMDRAW {
+                    let item = unsafe { &*(lparam as *const NMCUSTOMDRAW) };
+                    return result_view::custom_draw(item).unwrap_or(0);
+                }
+            }
             if let Some(notification) = unsafe { read_notification(lparam, header, results) } {
                 dispatch_deferred(Deferred::Notify(notification));
             }
@@ -1085,15 +1103,14 @@ impl App {
                 if timer == TIMER_SEARCH {
                     unsafe { KillTimer(self.hwnd, TIMER_SEARCH) };
                     self.search_now();
+                } else if timer == TIMER_CONTENT_REFRESH {
+                    self.refresh_content_if_due();
                 } else if timer == TIMER_SYNC
                     && self.auto_sync
                     && self.next_refresh.is_some_and(|due| Instant::now() >= due)
                 {
                     self.disarm_refresh();
                     self.begin_scan(true);
-                    if self.auto_sync {
-                        self.begin_content_scan(true);
-                    }
                 }
             }
             Deferred::Events => self.drain_events(),
@@ -1492,8 +1509,12 @@ impl App {
             content_width - 2,
             row,
         );
+        let tall_rows =
+            self.content
+                .row_height
+                .sync(self.results, self.content.searching, self.dpi);
         let columns = if self.content.searching {
-            quick_panel::content_columns(content_width, self.dpi)
+            quick_panel::content_columns(content_width, self.dpi, tall_rows)
         } else {
             quick_panel::result_columns(content_width, self.dpi)
         };
@@ -1544,9 +1565,9 @@ impl App {
     }
 
     fn toggle_settings(&mut self) {
-        let away_from_preview = self.panel == Panel::Preview;
         match self.panel {
-            Panel::Settings | Panel::Preview => {
+            Panel::Preview => self.return_to_body_results(false),
+            Panel::Settings => {
                 self.position_panel(Panel::for_query(false, &api::text(self.search)), false);
                 unsafe { SetFocus(self.search) };
             }
@@ -1558,9 +1579,6 @@ impl App {
                 self.position_panel(Panel::Settings, false);
                 unsafe { SetFocus(self.roots_list) };
             }
-        }
-        if away_from_preview {
-            self.search_now();
         }
         self.render_status();
     }
@@ -1575,14 +1593,18 @@ impl App {
         if unsafe { IsIconic(self.hwnd) } != 0 {
             unsafe { ShowWindow(self.hwnd, SW_RESTORE) };
         }
-        let panel = Panel::for_query(false, &api::text(self.search));
-        self.position_panel(panel, true);
+        if self.panel == Panel::Preview {
+            self.return_to_body_results(true);
+        } else {
+            let panel = Panel::for_query(false, &api::text(self.search));
+            self.position_panel(panel, true);
+        }
         unsafe {
             SetForegroundWindow(self.hwnd);
             SetFocus(self.search);
         }
         api::send_message(self.search, style::EM_SETSEL, 0, -1);
-        if self.content.searching {
+        if self.content.searching && !self.body_results_current() {
             self.search_now();
         }
         self.render_status();
@@ -1721,7 +1743,9 @@ impl App {
         let focus = unsafe { GetFocus() };
         (focus == self.search && quick_panel::composing(self.search))
             || (key == 0x1B
-                && (focus == self.types || focus == self.refresh_interval)
+                && (focus == self.types
+                    || focus == self.refresh_interval
+                    || focus == self.content.controls.interval)
                 && api::send_message(focus, style::CB_GETDROPPEDSTATE, 0, 0) != 0)
     }
 
@@ -2160,7 +2184,6 @@ impl App {
     }
 
     fn pause_scan(&mut self) {
-        self.content.cancel(true);
         self.auto_sync = false;
         self.config.refresh_enabled = false;
         self.disarm_refresh();
@@ -2490,10 +2513,12 @@ impl App {
                 }
             }
             Event::ContentReady(outcome) => self.finish_content_job(outcome),
+            Event::PdfReady { ticket, result } => self.finish_pdf_render(ticket, result),
         }
     }
 
     fn set_rows(&mut self, entries: Vec<Entry>) {
+        result_view::clear();
         self.rows = entries;
         populate_result_control(
             self.results,
@@ -2515,7 +2540,7 @@ impl App {
     }
 
     fn clear_rows(&mut self) {
-        self.content.hits.clear();
+        self.content.clear_results();
         self.set_rows(Vec::new());
     }
 
@@ -2704,7 +2729,7 @@ impl App {
         if self.content.searching {
             if action == ID_OPEN {
                 self.open_content_hit(position);
-            } else if let Some(index) = &self.content.index {
+            } else if let Some(index) = &self.content.result_index {
                 self.content_file_action(
                     &index.document(&self.content.hits[position]).path,
                     action,
@@ -2979,7 +3004,9 @@ impl App {
         if let Some(cancel) = self.scan_cancel.take() {
             cancel.store(true, Ordering::SeqCst);
         }
-        self.content.cancel(false);
+        self.disarm_content_refresh();
+        self.content.cancel();
+        self.clear_preview();
         let mut state = lock(&self.search_queue.state);
         state.closed = true;
         state.request = None;

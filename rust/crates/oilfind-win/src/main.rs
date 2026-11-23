@@ -11,6 +11,8 @@ mod app;
 mod content;
 #[cfg(test)]
 mod content_tests;
+mod pdf_preview;
+mod pdf_worker;
 mod platform;
 mod quick_panel;
 
@@ -42,6 +44,12 @@ fn licenses() -> String {
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == pdf_worker::WORKER_ARGUMENT)
+    {
+        return pdf_worker::worker_main();
+    }
     if license_requested() {
         api::info(std::ptr::null_mut(), &licenses());
         return ExitCode::SUCCESS;

@@ -285,12 +285,17 @@ pub(super) fn result_columns(width: i32, dpi: i32) -> [i32; 4] {
     [name, available - name - size - date, size, date]
 }
 
-pub(super) fn content_columns(width: i32, dpi: i32) -> [i32; 4] {
+pub(super) fn content_columns(width: i32, dpi: i32, tall_rows: bool) -> [i32; 4] {
     let available = (width - 20 * dpi / 96 - 2).max(4);
-    let name = (available * 28 / 100).max(1);
     let count = (available * 10 / 100).max(1);
     let location = (available * 15 / 100).max(1);
-    [name, available - name - count - location, count, location]
+    let text = available - count - location;
+    if tall_rows {
+        [text, 0, count, location]
+    } else {
+        let name = (available * 28 / 100).max(1);
+        [name, text - name, count, location]
+    }
 }
 
 #[cfg(test)]

@@ -3,58 +3,103 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use lopdf::{content::Content, Dictionary, Document, Encoding, Object, ObjectId};
+use lopdf::{content::Content, DecompressError, Dictionary, Document, Encoding, Object, ObjectId};
 
-use super::{normalize_text, MAX_DOC_BYTES};
+use super::{normalize_text, SkipReason, MAX_DOC_BYTES};
 
 const STREAM_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_PAGES: usize = 4096;
 const MAX_FORM_DEPTH: usize = 8;
 
-pub(super) fn units(bytes: &[u8], cancel: &AtomicBool) -> Option<Vec<String>> {
+pub(super) fn units(bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<String>, SkipReason> {
     let options = lopdf::LoadOptions::with_max_decompressed_size(STREAM_LIMIT);
-    let pdf = Document::load_mem_with_options(bytes, options).ok()?;
+    let pdf = Document::load_mem_with_options(bytes, options).map_err(pdf_error)?;
     if pdf.is_encrypted() {
-        return None;
+        return Err(SkipReason::ExtractionFailed);
     }
     let mut total = 0;
     let mut units = Vec::new();
+    let mut problem = None;
     for page in pdf.page_iter() {
-        if cancel.load(Relaxed) || units.len() >= MAX_PAGES {
-            return None;
+        if cancel.load(Relaxed) {
+            return Err(SkipReason::Unavailable);
+        }
+        if units.len() >= MAX_PAGES {
+            return Err(SkipReason::TooLarge);
         }
         // An undecodable page must not shift the numbering of later hits.
-        let text = page_text(&pdf, page).unwrap_or_default();
+        let text = match page_text(&pdf, page) {
+            Ok(text) => text,
+            Err(reason) => {
+                note_problem(&mut problem, reason);
+                String::new()
+            }
+        };
         total += text.len();
         if total > MAX_DOC_BYTES {
-            return None;
+            return Err(SkipReason::TooLarge);
         }
         units.push(text);
     }
-    Some(units)
+    if units.is_empty() {
+        return Err(SkipReason::ExtractionFailed);
+    }
+    if let Some(reason) = problem {
+        if units.iter().all(|unit| unit.trim().is_empty()) {
+            return Err(reason);
+        }
+    }
+    Ok(units)
 }
 
-fn page_text(pdf: &Document, page: ObjectId) -> Option<String> {
-    let (direct, references) = pdf.get_page_resources(page).ok()?;
+fn pdf_error(error: lopdf::Error) -> SkipReason {
+    match error {
+        lopdf::Error::Decompress(
+            DecompressError::MemoryLimitExceeded { .. } | DecompressError::TooManyFilters { .. },
+        )
+        | lopdf::Error::RecursionLimit
+        | lopdf::Error::ReferenceLimit => SkipReason::TooLarge,
+        _ => SkipReason::ExtractionFailed,
+    }
+}
+
+fn note_problem(problem: &mut Option<SkipReason>, reason: SkipReason) {
+    if problem.is_none() || matches!(reason, SkipReason::TooLarge) {
+        *problem = Some(reason);
+    }
+}
+
+fn page_text(pdf: &Document, page: ObjectId) -> Result<String, SkipReason> {
+    let (direct, references) = pdf.get_page_resources(page).map_err(pdf_error)?;
     let resources = direct.or_else(|| {
         references
             .into_iter()
             .find_map(|id| pdf.get_dictionary(id).ok())
     });
-    let bytes = pdf.get_page_content_with_limit(page, STREAM_LIMIT).ok()?;
+    let bytes = pdf
+        .get_page_content_with_limit(page, STREAM_LIMIT)
+        .map_err(pdf_error)?;
     let mut output = PageText {
         pdf,
         remaining: STREAM_LIMIT,
         text: String::new(),
+        problem: None,
     };
     output.capture(&bytes, resources, 0)?;
-    Some(normalize_text(&output.text))
+    let text = normalize_text(&output.text);
+    if let Some(reason) = output.problem {
+        if text.trim().is_empty() {
+            return Err(reason);
+        }
+    }
+    Ok(text)
 }
 
 struct PageText<'a> {
     pdf: &'a Document,
     remaining: usize,
     text: String,
+    problem: Option<SkipReason>,
 }
 
 impl<'a> PageText<'a> {
@@ -63,9 +108,12 @@ impl<'a> PageText<'a> {
         bytes: &[u8],
         resources: Option<&'a Dictionary>,
         depth: usize,
-    ) -> Option<()> {
-        self.remaining = self.remaining.checked_sub(bytes.len())?;
-        let content = Content::decode(bytes).ok()?;
+    ) -> Result<(), SkipReason> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or(SkipReason::TooLarge)?;
+        let content = Content::decode(bytes).map_err(pdf_error)?;
         let fonts = font_encodings(self.pdf, resources);
         let mut font = None;
         let mut baseline = Some(0.0);
@@ -120,7 +168,7 @@ impl<'a> PageText<'a> {
                         }
                     }
                 }
-                "Do" if depth < MAX_FORM_DEPTH => {
+                "Do" => {
                     if let Some(name) = args.first().and_then(|value| value.as_name().ok()) {
                         self.capture_form(name, resources, depth);
                     }
@@ -128,10 +176,10 @@ impl<'a> PageText<'a> {
                 _ => {}
             }
             if self.text.len() > MAX_DOC_BYTES {
-                return None;
+                return Err(SkipReason::TooLarge);
             }
         }
-        Some(())
+        Ok(())
     }
 
     fn capture_form(&mut self, name: &[u8], resources: Option<&'a Dictionary>, depth: usize) {
@@ -146,11 +194,18 @@ impl<'a> PageText<'a> {
         else {
             return;
         };
+        if depth >= MAX_FORM_DEPTH {
+            note_problem(&mut self.problem, SkipReason::TooLarge);
+            return;
+        }
         let bytes = if form.dict.has(b"Filter") {
-            let Ok(bytes) = form.decompressed_content_with_limit(self.remaining) else {
-                return;
-            };
-            Cow::Owned(bytes)
+            match form.decompressed_content_with_limit(self.remaining) {
+                Ok(bytes) => Cow::Owned(bytes),
+                Err(err) => {
+                    note_problem(&mut self.problem, pdf_error(err));
+                    return;
+                }
+            }
         } else {
             Cow::Borrowed(form.content.as_slice())
         };
@@ -161,18 +216,25 @@ impl<'a> PageText<'a> {
             .and_then(|value| value.as_dict().ok())
             .or(resources);
         self.break_line();
-        let _ = self.capture(&bytes, local, depth + 1);
+        if let Err(reason) = self.capture(&bytes, local, depth + 1) {
+            note_problem(&mut self.problem, reason);
+        }
         self.break_line();
     }
 
-    fn append(&mut self, value: &Object, font: Option<&Encoding<'_>>) {
-        let decoded = font
-            .zip(value.as_str().ok())
-            .and_then(|(font, bytes)| Document::decode_text(font, bytes).ok());
-        if let Some(text) = decoded {
-            self.text.push_str(&text);
-        } else {
-            self.space();
+    fn append(&mut self, value: &Object, font: Option<&Result<Encoding<'_>, SkipReason>>) {
+        let decoded = match (font, value.as_str()) {
+            (_, Ok([])) => return,
+            (Some(Ok(font)), Ok(bytes)) => Document::decode_text(font, bytes).map_err(pdf_error),
+            (Some(Err(reason)), _) => Err(*reason),
+            _ => Err(SkipReason::ExtractionFailed),
+        };
+        match decoded {
+            Ok(text) => self.text.push_str(&text),
+            Err(reason) => {
+                note_problem(&mut self.problem, reason);
+                self.space();
+            }
         }
     }
 
@@ -192,7 +254,7 @@ impl<'a> PageText<'a> {
 fn font_encodings<'a>(
     pdf: &'a Document,
     resources: Option<&'a Dictionary>,
-) -> BTreeMap<Vec<u8>, Encoding<'a>> {
+) -> BTreeMap<Vec<u8>, Result<Encoding<'a>, SkipReason>> {
     let Some(fonts) = resources
         .and_then(|dict| dict.get_deref(b"Font", pdf).ok())
         .and_then(|value| value.as_dict().ok())
@@ -201,10 +263,13 @@ fn font_encodings<'a>(
     };
     fonts
         .iter()
-        .filter_map(|(name, _)| {
-            let font = fonts.get_deref(name, pdf).ok()?.as_dict().ok()?;
-            let encoding = font.get_font_encoding_with_limit(pdf, STREAM_LIMIT).ok()?;
-            Some((name.clone(), encoding))
+        .map(|(name, _)| {
+            let encoding = fonts
+                .get_deref(name, pdf)
+                .and_then(Object::as_dict)
+                .and_then(|font| font.get_font_encoding_with_limit(pdf, STREAM_LIMIT))
+                .map_err(pdf_error);
+            (name.clone(), encoding)
         })
         .collect()
 }

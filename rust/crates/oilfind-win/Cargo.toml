@@ -14,7 +14,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Windows APIs for sizing, composition, keyboard input and local drive checks.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Com", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Com", "Win32_System_JobObjects", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+hayro = "=0.9.0"
 
 [build-dependencies]
 embed-resource = "3.0.12"
